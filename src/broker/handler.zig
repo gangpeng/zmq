@@ -15673,17 +15673,20 @@ pub const Broker = struct {
 
         if (!validateDescribeGroupsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DescribeGroups request", .{});
-            return null;
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeGroups request: {}", .{err});
-            return null;
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeGroupsRequest(&req);
 
-        const described_groups = self.collectDescribedGroups(req) catch return null;
+        const described_groups = self.collectDescribedGroups(req) catch |err| {
+            log.warn("DescribeGroups response materialization failed: {}", .{err});
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
             self.freeDescribedGroups(described_groups);
             if (described_groups.len > 0) self.allocator.free(described_groups);
@@ -15693,7 +15696,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .groups = described_groups,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeGroups response serialization failed", .{});
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeDescribeGroupsRequest(self: *Broker, req: *generated.describe_groups_request.DescribeGroupsRequest) void {
@@ -18537,17 +18543,20 @@ pub const Broker = struct {
 
         if (!validateConsumerGroupDescribeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ConsumerGroupDescribe request", .{});
-            return null;
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ConsumerGroupDescribe request", false);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ConsumerGroupDescribe request: {}", .{err});
-            return null;
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ConsumerGroupDescribe request", false);
         };
         defer self.freeConsumerGroupDescribeRequest(&req);
 
-        const described_groups = self.collectConsumerGroupDescriptions(req) catch return null;
+        const described_groups = self.collectConsumerGroupDescriptions(req) catch |err| {
+            log.warn("ConsumerGroupDescribe response materialization failed: {}", .{err});
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build ConsumerGroupDescribe response", req.include_authorized_operations);
+        };
         defer {
             self.freeConsumerGroupDescriptions(described_groups);
             if (described_groups.len > 0) self.allocator.free(described_groups);
@@ -18557,7 +18566,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .groups = described_groups,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ConsumerGroupDescribe response serialization failed", .{});
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ConsumerGroupDescribe response", req.include_authorized_operations);
+        };
     }
 
     fn freeConsumerGroupDescribeRequest(self: *Broker, req: *generated.consumer_group_describe_request.ConsumerGroupDescribeRequest) void {
@@ -30920,6 +30932,35 @@ fn expectDescribeTransactionsErrorResponseBytes(response: []const u8, correlatio
     try testing.expectEqual(@as(usize, 0), resp.transaction_states[0].topics.len);
 }
 
+fn freeDeserializedDescribeGroupsResponse(resp: *const generated.describe_groups_response.DescribeGroupsResponse) void {
+    for (resp.groups) |group| {
+        if (group.members.len > 0) testing.allocator.free(group.members);
+    }
+    if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn expectDescribeGroupsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.describe_groups_response.DescribeGroupsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(15, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedDescribeGroupsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.groups[0].error_code);
+    try testing.expect(resp.groups[0].group_id == null);
+    try testing.expectEqualStrings("", resp.groups[0].group_state.?);
+    try testing.expectEqualStrings("", resp.groups[0].protocol_type.?);
+    try testing.expectEqualStrings("", resp.groups[0].protocol_data.?);
+    try testing.expectEqual(@as(usize, 0), resp.groups[0].members.len);
+}
+
 fn freeDeserializedConsumerGroupDescribeResponse(resp: *const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse) void {
     for (resp.groups) |group| {
         for (group.members) |member| {
@@ -30936,6 +30977,30 @@ fn freeDeserializedConsumerGroupDescribeResponse(resp: *const generated.consumer
         if (group.members.len > 0) testing.allocator.free(group.members);
     }
     if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn expectConsumerGroupDescribeErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(69, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedConsumerGroupDescribeResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.groups[0].error_code);
+    try testing.expect(resp.groups[0].error_message != null);
+    try testing.expect(resp.groups[0].group_id == null);
+    try testing.expectEqualStrings("", resp.groups[0].group_state.?);
+    try testing.expectEqual(@as(i32, 0), resp.groups[0].group_epoch);
+    try testing.expectEqual(@as(i32, 0), resp.groups[0].assignment_epoch);
+    try testing.expectEqualStrings("", resp.groups[0].assignor_name.?);
+    try testing.expectEqual(@as(usize, 0), resp.groups[0].members.len);
 }
 
 fn freeDeserializedConsumerGroupHeartbeatResponse(resp: *const generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse) void {
@@ -59651,7 +59716,11 @@ test "Broker.handleRequest DescribeGroups rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 15, 5, 1506, header_mod.requestHeaderVersion(15, 5));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeGroupsErrorResponseBytes(response.?, 5, 1506, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DescribeGroups rejects trailing bytes" {
@@ -59670,7 +59739,72 @@ test "Broker.handleRequest DescribeGroups rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 15, 5, 1508, header_mod.requestHeaderVersion(15, 5));
     req.serialize(&buf, &pos, 5);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeGroupsErrorResponseBytes(response.?, 5, 1508, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeGroups fails closed when response materialization fails" {
+    const Req = generated.describe_groups_request.DescribeGroupsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const groups = [_]?[]const u8{"dg-materialize-fail-group"};
+    const req = Req{
+        .groups = &groups,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 15, 5, 1509, header_mod.requestHeaderVersion(15, 5));
+    req.serialize(&buf, &pos, 5);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeGroupsErrorResponseBytes(response.?, 5, 1509, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeGroups fails closed when response serialization fails" {
+    const Req = generated.describe_groups_request.DescribeGroupsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .groups = &.{},
+        .include_authorized_operations = false,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 15, 5, 1510, header_mod.requestHeaderVersion(15, 5));
+    req.serialize(&buf, &pos, 5);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeGroupsErrorResponseBytes(response.?, 5, 1510, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DescribeGroups authorization denial uses generated response" {
@@ -63345,7 +63479,70 @@ test "Broker.handleRequest ConsumerGroupDescribe rejects truncated request" {
     var buf: [128]u8 = undefined;
     var pos = buildTestRequest(&buf, 69, 0, 6901, header_mod.requestHeaderVersion(69, 0));
     ser.writeCompactArrayLen(&buf, &pos, 1); // one group declared, body truncated
-    try testing.expect(broker.handleRequest(buf[0..pos]) == null);
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectConsumerGroupDescribeErrorResponseBytes(response.?, 6901, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest ConsumerGroupDescribe fails closed when response materialization fails" {
+    const Req = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const group_ids = [_]?[]const u8{"cgd-materialize-fail-group"};
+    const req = Req{
+        .group_ids = &group_ids,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 69, 0, 6903, header_mod.requestHeaderVersion(69, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectConsumerGroupDescribeErrorResponseBytes(response.?, 6903, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest ConsumerGroupDescribe fails closed when response serialization fails" {
+    const Req = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_ids = &.{},
+        .include_authorized_operations = false,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 69, 0, 6904, header_mod.requestHeaderVersion(69, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectConsumerGroupDescribeErrorResponseBytes(response.?, 6904, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest ConsumerGroupDescribe authorization denial uses generated response" {
@@ -69336,7 +69533,13 @@ test "Broker.handleRequest ConsumerGroupDescribe rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 69, 0, 9405, header_mod.requestHeaderVersion(69, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectConsumerGroupDescribeErrorResponseBytes(response.?, 9405, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat rejects trailing bytes" {
