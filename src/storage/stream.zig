@@ -2191,6 +2191,34 @@ test "ObjectManager createStream" {
     try testing.expect(om.getStream(999) == null);
 }
 
+test "ObjectManager stream tags can be replaced and cleared" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    const initial_tags = [_]StreamTag{.{
+        .key = "phase",
+        .value = "created",
+    }};
+    const stream = try om.createStreamWithIdAndTags(100, 0, &initial_tags);
+    try testing.expectEqual(@as(usize, 1), stream.tags.len);
+    try testing.expectEqualStrings("phase", stream.tags[0].key);
+    try testing.expectEqualStrings("created", stream.tags[0].value);
+
+    const reopened_tags = [_]StreamTag{.{
+        .key = "phase",
+        .value = "reopened",
+    }};
+    try om.openStreamWithTags(100, 2, &reopened_tags);
+    const reopened = om.getStream(100).?;
+    try testing.expectEqual(@as(u64, 2), reopened.epoch);
+    try testing.expectEqual(@as(usize, 1), reopened.tags.len);
+    try testing.expectEqualStrings("phase", reopened.tags[0].key);
+    try testing.expectEqualStrings("reopened", reopened.tags[0].value);
+
+    try om.openStreamWithTags(100, 2, &.{});
+    try testing.expectEqual(@as(usize, 0), om.getStream(100).?.tags.len);
+}
+
 test "ObjectManager createStream does not advance ID when materialization fails" {
     var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var om = ObjectManager.init(failing_allocator.allocator(), 0);

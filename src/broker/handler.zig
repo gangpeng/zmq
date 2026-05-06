@@ -22362,7 +22362,7 @@ pub const Broker = struct {
                 continue;
             };
             const requested_epoch: u64 = @intCast(@max(item.stream_epoch, 0));
-            if (api_version >= 1 and item.tags.len > 0) {
+            if (api_version >= 1) {
                 const stream_tags = materializeRequestStreamTags(arena_alloc, item.tags) catch |err| {
                     log.warn("OpenStreams tag materialization failed: {}", .{err});
                     responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .start_offset = -1, .next_offset = -1 };
@@ -55505,6 +55505,33 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
     try testing.expectEqual(@as(usize, 1), describe_resp.stream_metadata_list[0].tags.len);
     try testing.expectEqualStrings("phase", describe_resp.stream_metadata_list[0].tags[0].key.?);
     try testing.expectEqualStrings("open", describe_resp.stream_metadata_list[0].tags[0].value.?);
+
+    pos = buildTestRequest(&buf, 502, 1, 5021, 2);
+    const clear_open_items = [_]OpenReq.OpenStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1, .tags = &.{} }};
+    const clear_open_req = OpenReq{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &clear_open_items };
+    clear_open_req.serialize(&buf, &pos, 1);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var clear_open_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer clear_open_header.deinit(testing.allocator);
+    const clear_open_resp = try OpenResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer testing.allocator.free(clear_open_resp.open_stream_responses);
+    try testing.expectEqual(@as(i16, 0), clear_open_resp.open_stream_responses[0].error_code);
+
+    pos = buildTestRequest(&buf, 601, 0, 6012, 2);
+    describe_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var clear_describe_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer clear_describe_header.deinit(testing.allocator);
+    const clear_describe_resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeStreamsResponse(&clear_describe_resp);
+    try testing.expectEqual(@as(usize, 1), clear_describe_resp.stream_metadata_list.len);
+    try testing.expectEqual(@as(usize, 0), clear_describe_resp.stream_metadata_list[0].tags.len);
 
     pos = buildTestRequest(&buf, 515, 1, 5150, 2);
     const zone_req = ZoneReq{ .metadata = "route-data", .route_epoch = 4, .version = 1 };

@@ -1013,7 +1013,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
   snapshots, committed register-node records, and full-snapshot-v2 compaction
   records while preserving replay compatibility with older untagged records.
   CreateStreams v1 now stores stream tags, OpenStreams v1 replaces current
-  stream tags when non-empty tags are supplied, and DescribeStreams returns the
+  stream tags with the supplied v1 tag set, and DescribeStreams returns the
   current tags. Stream tags are encoded in ObjectManager v3 snapshots,
   ObjectManager rollback snapshots, committed object snapshot records, and
   full-snapshot compaction records while preserving load compatibility with
