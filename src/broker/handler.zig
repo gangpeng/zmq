@@ -26364,15 +26364,18 @@ pub const Broker = struct {
         var pos = body_start;
         if (!validateListPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ListPartitionReassignments request", .{});
-            return null;
+            return self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ListPartitionReassignments request: {}", .{err});
-            return null;
+            return self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeListPartitionReassignmentsRequest(&req);
 
-        const topics = self.buildListPartitionReassignmentsTopics(&req) catch return null;
+        const topics = self.buildListPartitionReassignmentsTopics(&req) catch |err| {
+            log.warn("ListPartitionReassignments topic materialization failed: {}", .{err});
+            return self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize partition reassignment response");
+        };
         defer if (topics.len > 0) {
             self.freeListPartitionReassignmentsTopics(topics);
             self.allocator.free(topics);
@@ -26384,13 +26387,19 @@ pub const Broker = struct {
             .error_message = null,
             .topics = topics,
         };
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
-        var buf = self.allocator.alloc(u8, needed) catch return null;
-        var wpos: usize = 0;
-        rh.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, api_version);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version) orelse
+            self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize partition reassignment response");
+    }
+
+    fn listPartitionReassignmentsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .topics = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn freeListPartitionReassignmentsRequest(self: *Broker, req: *generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest) void {
@@ -48395,6 +48404,76 @@ test "Broker.handleRequest ListPartitionReassignments authorization denial uses 
     try testing.expectEqual(@as(usize, 0), resp.topics.len);
 }
 
+test "Broker.handleRequest ListPartitionReassignments rejects truncated request" {
+    const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 46, 0, 4615, header_mod.requestHeaderVersion(46, 0));
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 46, 0, 4615);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest ListPartitionReassignments fails closed when response materialization fails" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const ListResp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    try testing.expect(broker.ensureTopic("reassign-storage-fail"));
+
+    const remote_replicas = [_]i32{2};
+    const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    }};
+    const alter_topics = [_]AlterReq.ReassignableTopic{.{
+        .name = "reassign-storage-fail",
+        .partitions = &alter_partitions,
+    }};
+    const alter_req = AlterReq{
+        .timeout_ms = 1000,
+        .topics = &alter_topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4516, header_mod.requestHeaderVersion(45, 0));
+    alter_req.serialize(&buf, &pos, 0);
+    const alter_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(alter_response != null);
+    testing.allocator.free(alter_response.?);
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+
+    const list_req = ListReq{
+        .timeout_ms = 1000,
+        .topics = null,
+    };
+    pos = buildTestRequest(&buf, 46, 0, 4616, header_mod.requestHeaderVersion(46, 0));
+    list_req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(ListResp, response.?, 46, 0, 4616);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest ListPartitionReassignments distinguishes null and empty topics" {
     const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
     const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
@@ -49565,6 +49644,8 @@ test "Broker AlterPartitionReassignments fails closed when reassignment snapshot
 }
 
 test "Broker.handleRequest partition reassignment APIs reject truncated requests" {
+    const ListResp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
@@ -49574,12 +49655,18 @@ test "Broker.handleRequest partition reassignment APIs reject truncated requests
 
     var list_buf: [128]u8 = undefined;
     const list_len = buildTestRequest(&list_buf, 46, 0, 4601, header_mod.requestHeaderVersion(46, 0));
-    try testing.expect(broker.handleRequest(list_buf[0..list_len]) == null);
+    const list_response = broker.handleRequest(list_buf[0..list_len]);
+    try testing.expect(list_response != null);
+    defer testing.allocator.free(list_response.?);
+
+    const list_error_code = try readGeneratedTopLevelErrorCode(ListResp, list_response.?, 46, 0, 4601);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), list_error_code);
 }
 
 test "Broker.handleRequest partition reassignment APIs reject trailing bytes" {
     const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
     const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const ListResp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -49594,7 +49681,7 @@ test "Broker.handleRequest partition reassignment APIs reject trailing bytes" {
     var list_buf: [128]u8 = undefined;
     var list_pos = buildTestRequest(&list_buf, 46, 0, 4602, header_mod.requestHeaderVersion(46, 0));
     list_req.serialize(&list_buf, &list_pos, 0);
-    try expectTrailingByteRejected(&broker, list_buf[0..], list_pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(ListResp, &broker, list_buf[0..], list_pos, 46, 0, 4602);
 }
 
 test "Broker.handleRequest DescribeCluster uses generated endpoint-scoped response" {
@@ -61500,6 +61587,7 @@ test "Broker.handleRequest AlterPartitionReassignments rejects trailing bytes" {
 
 test "Broker.handleRequest ListPartitionReassignments rejects trailing bytes" {
     const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -61510,7 +61598,7 @@ test "Broker.handleRequest ListPartitionReassignments rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 46, 0, 9402, header_mod.requestHeaderVersion(46, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 46, 0, 9402);
 }
 
 test "Broker.handleRequest AlterReplicaLogDirs rejects trailing bytes" {

@@ -300,6 +300,9 @@ failures now surface storage errors instead of silent connection closes;
 ListClientMetricsResources malformed frames now return generated invalid-request
 responses, and resource materialization/serialization failures now surface
 storage errors instead of silent connection closes;
+ListPartitionReassignments malformed frames now return generated
+invalid-request responses, and topic materialization/serialization failures now
+surface storage errors instead of silent connection closes;
 DescribeCluster malformed frames now return generated invalid-request responses,
 and response serialization failures now surface storage errors instead of silent
 connection closes;
