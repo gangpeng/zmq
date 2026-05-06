@@ -11857,7 +11857,16 @@ pub const Broker = struct {
     ) ?[]u8 {
         const Resp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
         const resp = Resp{ .group_id = group_id, .error_code = err_code.toInt(), .error_message = message, .throttle_time_ms = 0 };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqUpdateGroup error response serialization failed", .{});
+            const storage_resp = Resp{
+                .group_id = group_id,
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .error_message = "Failed to serialize AutomqUpdateGroup response",
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleGenericAuthorizationError(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -23402,6 +23411,12 @@ pub const Broker = struct {
             };
         }
 
+        const success_resp = Resp{ .group_id = req.group_id, .error_code = 0, .error_message = null, .throttle_time_ms = 0 };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &success_resp, api_version) orelse {
+            log.warn("AutomqUpdateGroup response serialization failed before mutation", .{});
+            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize response");
+        };
+
         var mutated = false;
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
@@ -23409,6 +23424,7 @@ pub const Broker = struct {
             const replacing_existing = self.auto_mq_group_promotions.contains(group_id);
             const link_copy = self.allocator.dupe(u8, link_id) catch |err| {
                 log.warn("AutomqUpdateGroup link copy failed: {}", .{err});
+                self.allocator.free(success_response);
                 return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to materialize group link");
             };
             var group_copy: ?[]u8 = null;
@@ -23416,12 +23432,14 @@ pub const Broker = struct {
                 group_copy = self.allocator.dupe(u8, group_id) catch |err| {
                     log.warn("AutomqUpdateGroup group copy failed: {}", .{err});
                     self.allocator.free(link_copy);
+                    self.allocator.free(success_response);
                     return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to materialize group id");
                 };
                 self.auto_mq_group_promotions.ensureUnusedCapacity(1) catch |err| {
                     log.warn("AutomqUpdateGroup map capacity reservation failed: {}", .{err});
                     self.allocator.free(link_copy);
                     self.allocator.free(group_copy.?);
+                    self.allocator.free(success_response);
                     return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to reserve group metadata");
                 };
             }
@@ -23430,12 +23448,14 @@ pub const Broker = struct {
                     log.warn("AutomqUpdateGroup rollback snapshot failed: {}", .{err});
                     self.allocator.free(link_copy);
                     if (group_copy) |copy| self.allocator.free(copy);
+                    self.allocator.free(success_response);
                     return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to snapshot AutoMQ metadata");
                 };
             }
             self.commitAutoMqUpdateGroupRecord(group_id, link_id, true) catch |err| {
                 self.allocator.free(link_copy);
                 if (group_copy) |copy| self.allocator.free(copy);
+                self.allocator.free(success_response);
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                     log.warn("AutomqUpdateGroup error response serialization failed", .{});
@@ -23453,10 +23473,12 @@ pub const Broker = struct {
             if (self.raft_state == null) {
                 previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
                     log.warn("AutomqUpdateGroup rollback snapshot failed: {}", .{err});
+                    self.allocator.free(success_response);
                     return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to snapshot AutoMQ metadata");
                 };
             }
             self.commitAutoMqUpdateGroupRecord(group_id, "", false) catch |err| {
+                self.allocator.free(success_response);
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                     log.warn("AutomqUpdateGroup error response serialization failed", .{});
@@ -23469,22 +23491,16 @@ pub const Broker = struct {
             promotion.deinit(self.allocator);
             mutated = true;
         }
-        var response_error: i16 = 0;
-        var response_error_message: ?[]const u8 = null;
         if (mutated) {
             self.persistAutoMqMetadataAfterMutation() catch |err| {
                 log.warn("AutomqUpdateGroup metadata snapshot write failed: {}", .{err});
                 if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
-                response_error = errorCode(.kafka_storage_error);
-                response_error_message = "Failed to persist AutoMQ metadata";
+                self.allocator.free(success_response);
+                return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to persist AutoMQ metadata");
             };
         }
 
-        const resp = Resp{ .group_id = req.group_id, .error_code = response_error, .error_message = response_error_message, .throttle_time_ms = 0 };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("AutomqUpdateGroup response serialization failed", .{});
-            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize response");
-        };
+        return success_response;
     }
 
     // ---------------------------------------------------------------
@@ -53515,14 +53531,14 @@ test "Broker.handleRequest normal AutoMQ mutations fail closed when local mutati
         const promote_req = Req{ .link_id = "link-copy-fail", .group_id = "group-copy-fail", .promoted = true };
         var pos = buildTestRequest(&buf, 602, 0, 6031, header_mod.requestHeaderVersion(602, 0));
         promote_req.serialize(&buf, &pos, 0);
-        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6031, 0, ErrorCode.kafka_storage_error);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6031, 1, ErrorCode.kafka_storage_error);
         try testing.expect(!broker.auto_mq_group_promotions.contains("group-copy-fail"));
 
         try broker.updateAutoMqGroupFromRecord("group-demote-fail", "link-demote-fail", true);
         const demote_req = Req{ .link_id = "", .group_id = "group-demote-fail", .promoted = false };
         pos = buildTestRequest(&buf, 602, 0, 6032, header_mod.requestHeaderVersion(602, 0));
         demote_req.serialize(&buf, &pos, 0);
-        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6032, 0, ErrorCode.kafka_storage_error);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6032, 1, ErrorCode.kafka_storage_error);
         try testing.expect(broker.auto_mq_group_promotions.contains("group-demote-fail"));
     }
 }
@@ -53594,6 +53610,38 @@ test "Broker.handleRequest AutomqZoneRouter does not replace route when success 
     try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 515, 1, 5162, 2, ErrorCode.kafka_storage_error);
     try testing.expectEqualStrings("old-route", broker.auto_mq_zone_router_metadata.?);
     try testing.expectEqual(@as(i64, 7), broker.auto_mq_zone_router_epoch);
+}
+
+test "Broker.handleRequest AutomqUpdateGroup does not mutate when success serialization fails" {
+    const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.updateAutoMqGroupFromRecord("group-promote-response-fail", "old-link", true);
+
+        const req = Req{ .link_id = "new-link", .group_id = "group-promote-response-fail", .promoted = true };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 602, 0, 6033, header_mod.requestHeaderVersion(602, 0));
+        req.serialize(&buf, &pos, 0);
+
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6033, 0, ErrorCode.kafka_storage_error);
+        try testing.expectEqualStrings("old-link", broker.auto_mq_group_promotions.get("group-promote-response-fail").?.link_id);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.updateAutoMqGroupFromRecord("group-demote-response-fail", "old-link", true);
+
+        const req = Req{ .link_id = "", .group_id = "group-demote-response-fail", .promoted = false };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 602, 0, 6034, header_mod.requestHeaderVersion(602, 0));
+        req.serialize(&buf, &pos, 0);
+
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6034, 0, ErrorCode.kafka_storage_error);
+        try testing.expectEqualStrings("old-link", broker.auto_mq_group_promotions.get("group-demote-response-fail").?.link_id);
+    }
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
