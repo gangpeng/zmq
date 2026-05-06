@@ -7463,14 +7463,22 @@ pub const Broker = struct {
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeLogDirs request: {}", .{err});
-            return null;
+            return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeLogDirsRequest(&req);
+
+        if (pos != request_bytes.len) {
+            log.warn("Denied DescribeLogDirs request has {d} trailing bytes", .{request_bytes.len - pos});
+            return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        }
 
         var topics: []Topic = &.{};
         if (req.topics) |requested_topics| {
             if (requested_topics.len > 0) {
-                topics = self.allocator.alloc(Topic, requested_topics.len) catch return null;
+                topics = self.allocator.alloc(Topic, requested_topics.len) catch |err| {
+                    log.warn("DescribeLogDirs denied topic response materialization failed: {}", .{err});
+                    return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             for (requested_topics, 0..) |topic, idx| {
                 topics[idx] = .{
@@ -7494,7 +7502,10 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .results = &results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeLogDirs denied response serialization failed", .{});
+            return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleCreatePartitionsAuthorizationError(
@@ -7682,18 +7693,31 @@ pub const Broker = struct {
         const Result = Resp.ReplicaElectionResult;
         const PartitionResult = Result.PartitionResult;
 
+        if (!validateElectLeadersRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied ElectLeaders request", .{});
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        }
+
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ElectLeaders request: {}", .{err});
-            return null;
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeElectLeadersRequest(&req);
+
+        if (pos != request_bytes.len) {
+            log.warn("Denied ElectLeaders request has {d} trailing bytes", .{request_bytes.len - pos});
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        }
 
         var results: []Result = &.{};
         var results_init: usize = 0;
         if (req.topic_partitions) |topic_partitions| {
             if (topic_partitions.len > 0) {
-                results = self.allocator.alloc(Result, topic_partitions.len) catch return null;
+                results = self.allocator.alloc(Result, topic_partitions.len) catch |err| {
+                    log.warn("ElectLeaders denied response materialization failed: {}", .{err});
+                    return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             defer {
                 for (results[0..results_init]) |result| {
@@ -7705,7 +7729,10 @@ pub const Broker = struct {
             for (topic_partitions, 0..) |topic, idx| {
                 var partitions: []PartitionResult = &.{};
                 if (topic.partitions.len > 0) {
-                    partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+                    partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch |err| {
+                        log.warn("ElectLeaders denied partition response materialization failed: {}", .{err});
+                        return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                    };
                 }
                 for (topic.partitions, 0..) |partition_id, partition_idx| {
                     partitions[partition_idx] = .{
@@ -7726,9 +7753,25 @@ pub const Broker = struct {
                 .error_code = @intFromEnum(err_code),
                 .replica_election_results = results,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("ElectLeaders denied response serialization failed", .{});
+                return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .replica_election_results = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ElectLeaders denied response serialization failed", .{});
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn electLeadersErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.elect_leaders_response.ElectLeadersResponse;
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
@@ -25665,10 +25708,15 @@ pub const Broker = struct {
         const Result = Resp.ReplicaElectionResult;
         const PartitionResult = Result.PartitionResult;
 
+        if (!validateElectLeadersRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed ElectLeaders request", .{});
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        }
+
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ElectLeaders request: {}", .{err});
-            return null;
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeElectLeadersRequest(&req);
 
@@ -28282,6 +28330,25 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (!skipFixedBytes(buf, &pos, 5)) return false; // timeout_ms + validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateElectLeadersRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // election_type
+        const topic_partitions = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (!topic_partitions.is_null) {
+            for (0..topic_partitions.count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // topic
+                if (!skipKafkaI32Array(buf, &pos, flexible)) return false; // partitions
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        }
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return pos == buf.len;
     }
@@ -49456,6 +49523,79 @@ test "Broker.handleRequest DescribeLogDirs authorization denial uses generated r
     try testing.expectEqual(@as(usize, 0), resp.results[0].topics[0].partitions.len);
 }
 
+test "Broker.handleRequest DescribeLogDirs authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 35, 4, 3515, header_mod.requestHeaderVersion(35, 4));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeLogDirsErrorResponseBytes(response.?, 4, 3515, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeLogDirs authorization denial fails closed when response materialization fails" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const topics = [_]Req.DescribableLogDirTopic{.{
+        .topic = "log-denied-materialize-fail",
+        .partitions = &.{},
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 35, 4, 3516, header_mod.requestHeaderVersion(35, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeLogDirsErrorResponseBytes(response.?, 4, 3516, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeLogDirs authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{ .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 35, 4, 3517, header_mod.requestHeaderVersion(35, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeLogDirsErrorResponseBytes(response.?, 4, 3517, ErrorCode.kafka_storage_error);
+}
+
 test "Broker.handleRequest DescribeLogDirs distinguishes null and empty topics" {
     const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
     const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
@@ -52606,6 +52746,94 @@ test "Broker.handleRequest ElectLeaders authorization denial uses generated resp
     try testing.expectEqualStrings("Not authorized", resp.replica_election_results[0].partition_result[0].error_message.?);
     try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.replica_election_results[0].partition_result[1].error_code);
+}
+
+test "Broker.handleRequest ElectLeaders authorization denial rejects malformed request" {
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 43, 2, 4315, header_mod.requestHeaderVersion(43, 2));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 43, 2, 4315);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest ElectLeaders authorization denial fails closed when response materialization fails" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const topics = [_]Req.TopicPartitions{.{
+        .topic = "elect-denied-materialize-fail",
+        .partitions = &.{},
+    }};
+    const req = Req{
+        .election_type = 0,
+        .topic_partitions = &topics,
+        .timeout_ms = 1000,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 43, 2, 4316, header_mod.requestHeaderVersion(43, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 43, 2, 4316);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
+test "Broker.handleRequest ElectLeaders authorization denial fails closed when serialization fails" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const req = Req{
+        .election_type = 0,
+        .topic_partitions = null,
+        .timeout_ms = 1000,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 43, 2, 4317, header_mod.requestHeaderVersion(43, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 43, 2, 4317);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ElectLeaders distinguishes null and empty topic partitions" {

@@ -635,6 +635,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ListTransactions authorization-denial builders now also fail closed with
   generated invalid-request or storage-error responses when denied frames or
   denial response construction fail.
+  DescribeLogDirs and ElectLeaders authorization-denial builders now also
+  return generated invalid-request or storage-error responses when denied
+  frames are malformed or denial response materialization/serialization fails.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
