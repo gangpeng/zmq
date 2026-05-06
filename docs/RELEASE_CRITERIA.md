@@ -37,9 +37,10 @@ single-node demo are not sufficient by themselves.
   fail closed and roll back visible topic metadata when local partition-state
   allocation or failover ownership tracking fails, and DeleteTopics partition
   cleanup must not depend on heap allocation to remove already-known local
-  state. Partition-state lookups used by log-dir estimates and transaction
-  marker completion must not depend on fixed-size formatted keys that can miss
-  long but valid topic names. Consumer-group timeout eviction must not silently
+  state. Partition-state lookups used by Produce/Fetch/admin info, log-dir
+  estimates, and transaction marker completion must not depend on fixed-size
+  formatted keys that can miss long but valid topic names. Consumer-group
+  timeout eviction must not silently
   keep expired members active because an allocation failed while collecting expired
   member IDs. Raft/controller metadata replication and startup recovery must not
   acknowledge or apply entries that failed local log allocation or persistence,

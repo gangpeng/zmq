@@ -303,9 +303,7 @@ pub const PartitionStore = struct {
 
     fn shouldRefreshS3WalBeforeProduce(self: *PartitionStore, topic: []const u8, partition_id: i32) bool {
         if (!self.s3_wal_mode) return false;
-        var key_buf: [256]u8 = undefined;
-        const key = partitionKeyBuf(&key_buf, topic, partition_id);
-        const state = self.partitions.get(key) orelse return true;
+        const state = self.partitionState(topic, partition_id) orelse return true;
         return state.next_offset == 0 and state.high_watermark == 0;
     }
 
@@ -527,18 +525,28 @@ pub const PartitionStore = struct {
         return try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic, partition_id });
     }
 
-    /// Stack-based partition key for lookups (no heap allocation).
-    fn partitionKeyBuf(buf: []u8, topic: []const u8, partition_id: i32) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}-{d}", .{ topic, partition_id }) catch topic;
+    /// Stack-based partition key for tests and small-key assertions.
+    fn partitionKeyBuf(buf: []u8, topic: []const u8, partition_id: i32) ![]const u8 {
+        return try std.fmt.bufPrint(buf, "{s}-{d}", .{ topic, partition_id });
+    }
+
+    fn partitionStatePtr(self: *PartitionStore, topic: []const u8, partition_id: i32) ?*PartitionState {
+        var it = self.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            if (state.partition_id == partition_id and std.mem.eql(u8, state.topic, topic)) return state;
+        }
+        return null;
+    }
+
+    fn partitionState(self: *PartitionStore, topic: []const u8, partition_id: i32) ?PartitionState {
+        const state = self.partitionStatePtr(topic, partition_id) orelse return null;
+        return state.*;
     }
 
     pub fn ensurePartition(self: *PartitionStore, topic: []const u8, partition_id: i32) !void {
-        // Use stack buffer for the lookup to avoid heap allocation
-        var buf: [256]u8 = undefined;
-        const lookup_key = partitionKeyBuf(&buf, topic, partition_id);
-        if (self.partitions.contains(lookup_key)) {
-            return;
-        }
+        if (self.partitionStatePtr(topic, partition_id) != null) return;
+
         // Only allocate on the heap for the actual insertion
         const key = try self.partitionKey(topic, partition_id);
         var key_owned = true;
@@ -653,10 +661,7 @@ pub const PartitionStore = struct {
             _ = try self.refreshS3WalObjects(true);
         }
 
-        var key_buf: [256]u8 = undefined;
-        const key = partitionKeyBuf(&key_buf, topic, partition_id);
-
-        const state = self.partitions.getPtr(key) orelse return error.PartitionNotFound;
+        const state = self.partitionStatePtr(topic, partition_id) orelse return error.PartitionNotFound;
         const base_offset = state.next_offset;
 
         // Parse record_count from RecordBatch header (fix #1: offset semantics)
@@ -896,10 +901,7 @@ pub const PartitionStore = struct {
     /// Fetch with isolation level support.
     /// isolation_level: 0 = READ_UNCOMMITTED, 1 = READ_COMMITTED
     pub fn fetchWithIsolation(self: *PartitionStore, topic: []const u8, partition_id: i32, start_offset: u64, max_bytes: usize, isolation_level: i8) !FetchResult {
-        var key_buf: [256]u8 = undefined;
-        const key = partitionKeyBuf(&key_buf, topic, partition_id);
-
-        var state = self.partitions.get(key) orelse return .{
+        var state = self.partitionState(topic, partition_id) orelse return .{
             .error_code = 3,
             .records = &.{},
             .high_watermark = 0,
@@ -908,7 +910,7 @@ pub const PartitionStore = struct {
 
         if (self.s3_wal_mode) {
             _ = try self.refreshS3WalObjects(true);
-            state = self.partitions.get(key) orelse state;
+            state = self.partitionState(topic, partition_id) orelse state;
         }
 
         // For READ_COMMITTED, cap the visible offset range to last_stable_offset
@@ -1223,10 +1225,7 @@ pub const PartitionStore = struct {
         var s3 = &(self.s3_storage orelse return);
 
         // Gather all cached records for this stream
-        const key = try self.partitionKey(topic, partition_id);
-        defer self.allocator.free(key);
-
-        const state = self.partitions.get(key) orelse return;
+        const state = self.partitionState(topic, partition_id) orelse return;
 
         const cached = try self.cache.get(stream_id, 0, state.next_offset, self.allocator);
         defer self.allocator.free(cached);
@@ -1422,11 +1421,8 @@ pub const PartitionStore = struct {
     }
 
     /// Get partition info for monitoring/admin purposes.
-    pub fn getPartitionInfo(self: *const PartitionStore, topic: []const u8, partition_id: i32) ?PartitionInfo {
-        var key_buf: [256]u8 = undefined;
-        const key_str = partitionKeyBuf(&key_buf, topic, partition_id);
-
-        if (self.partitions.get(key_str)) |state| {
+    pub fn getPartitionInfo(self: *PartitionStore, topic: []const u8, partition_id: i32) ?PartitionInfo {
+        if (self.partitionState(topic, partition_id)) |state| {
             return .{
                 .topic = state.topic,
                 .partition_id = state.partition_id,
@@ -1548,7 +1544,7 @@ test "PartitionStore restores filesystem WAL records into fetch cache" {
         try store.ensurePartition("replay-topic", 0);
 
         var key_buf: [256]u8 = undefined;
-        const key = PartitionStore.partitionKeyBuf(&key_buf, "replay-topic", 0);
+        const key = try PartitionStore.partitionKeyBuf(&key_buf, "replay-topic", 0);
         const state = store.partitions.getPtr(key).?;
         state.next_offset = 2;
         state.high_watermark = 2;
@@ -1657,7 +1653,7 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     try store.ensurePartition("s3-recover-topic", 0);
     try testing.expect(store.repairPartitionStatesFromObjectManager());
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-recover-topic", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "s3-recover-topic", 0);
     const state = store.partitions.getPtr(key).?;
     try testing.expectEqual(@as(u64, 2), state.next_offset);
     try testing.expectEqual(@as(u64, 2), state.high_watermark);
@@ -1730,7 +1726,7 @@ test "PartitionStore rebuilds S3 WAL data after local store replacement" {
         try testing.expectEqual(@as(i64, 1), second.base_offset);
 
         var key_buf: [256]u8 = undefined;
-        const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-replacement-topic", 0);
+        const key = try PartitionStore.partitionKeyBuf(&key_buf, "s3-replacement-topic", 0);
         const state = producer_store.partitions.getPtr(key).?;
         try testing.expectEqual(@as(u64, 2), state.next_offset);
         try testing.expectEqual(@as(u64, 2), state.high_watermark);
@@ -1751,7 +1747,7 @@ test "PartitionStore rebuilds S3 WAL data after local store replacement" {
     try testing.expect(replacement_store.repairPartitionStatesFromObjectManager());
 
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-replacement-topic", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "s3-replacement-topic", 0);
     const state = replacement_store.partitions.getPtr(key).?;
     try testing.expectEqual(@as(u64, 2), state.next_offset);
     try testing.expectEqual(@as(u64, 2), state.high_watermark);
@@ -2173,7 +2169,7 @@ test "PartitionStore returns storage error for unreadable ObjectManager S3 objec
     try object_manager.commitStreamSetObject(100, 1, 1, &ranges, "wal/bad-object", 28);
 
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "bad-s3-topic", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "bad-s3-topic", 0);
     const state = store.partitions.getPtr(key).?;
     state.next_offset = 1;
     state.high_watermark = 1;
@@ -2239,7 +2235,7 @@ test "PartitionStore returns storage error when ObjectManager metadata lookup fa
     try object_manager.commitStreamSetObject(100, 1, 1, &ranges, "wal/metadata-lookup-object", 1);
 
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "metadata-lookup-fault-topic", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "metadata-lookup-fault-topic", 0);
     const state = store.partitions.getPtr(key).?;
     state.next_offset = 1;
     state.high_watermark = 1;
@@ -2274,7 +2270,7 @@ test "PartitionStore legacy S3 fallback returns storage error on get fault" {
     try s3_storage.putObject("data/legacy-get-fault-topic/0/obj-0000000000", obj_data);
 
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "legacy-get-fault-topic", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "legacy-get-fault-topic", 0);
     const state = store.partitions.getPtr(key).?;
     state.next_offset = 1;
     state.high_watermark = 1;
@@ -2301,7 +2297,7 @@ test "PartitionStore S3 WAL failed sync produce is not visible or retained" {
     try testing.expectError(error.S3WalFlushFailed, store.produce("s3-ack-topic", 0, "rec-a"));
 
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-ack-topic", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "s3-ack-topic", 0);
     const failed_state = store.partitions.getPtr(key).?;
     try testing.expectEqual(@as(u64, 0), failed_state.next_offset);
     try testing.expectEqual(@as(u64, 0), failed_state.high_watermark);
@@ -2639,7 +2635,7 @@ test "PartitionStore fetchWithIsolation READ_COMMITTED respects LSO" {
 
     // Set an unstable transaction at offset 1 to simulate an ongoing txn
     var key_buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&key_buf, "t", 0);
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "t", 0);
     const state = store.partitions.getPtr(key).?;
     state.first_unstable_txn_offset = 1;
     // Recompute LSO = min(first_unstable, HW) = min(1, 3) = 1
@@ -2697,6 +2693,36 @@ test "PartitionStore getPartitionInfo returns existing partition state" {
     try testing.expectEqual(@as(i64, 1), info.?.next_offset);
 }
 
+test "PartitionStore lookup paths handle max-length topic names" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    const topic_name = try testing.allocator.alloc(u8, 249);
+    defer testing.allocator.free(topic_name);
+    @memset(topic_name, 't');
+    topic_name[0] = 'm';
+
+    const partition_id: i32 = std.math.maxInt(i32);
+    var key_buf: [256]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, PartitionStore.partitionKeyBuf(&key_buf, topic_name, partition_id));
+
+    const first = try store.produce(topic_name, partition_id, "alpha");
+    try testing.expectEqual(@as(i64, 0), first.base_offset);
+    const second = try store.produce(topic_name, partition_id, "beta");
+    try testing.expectEqual(@as(i64, 1), second.base_offset);
+    try testing.expectEqual(@as(u32, 1), store.partitions.count());
+
+    const info = store.getPartitionInfo(topic_name, partition_id) orelse return error.ExpectedPartitionInfo;
+    try testing.expectEqualSlices(u8, topic_name, info.topic);
+    try testing.expectEqual(partition_id, info.partition_id);
+    try testing.expectEqual(@as(i64, 2), info.next_offset);
+
+    const fetched = try store.fetch(topic_name, partition_id, 0, 1024);
+    defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
+    try testing.expectEqual(@as(i16, 0), fetched.error_code);
+    try testing.expectEqualStrings("alphabeta", fetched.records);
+}
+
 test "PartitionStore ensurePartition creates distinct entries for different topic-partitions" {
     var store = PartitionStore.init(testing.allocator);
     defer store.deinit();
@@ -2710,15 +2736,15 @@ test "PartitionStore ensurePartition creates distinct entries for different topi
 
     // Verify each key exists
     var buf1: [256]u8 = undefined;
-    const k1 = PartitionStore.partitionKeyBuf(&buf1, "topic-a", 0);
+    const k1 = try PartitionStore.partitionKeyBuf(&buf1, "topic-a", 0);
     try testing.expect(store.partitions.contains(k1));
 
     var buf2: [256]u8 = undefined;
-    const k2 = PartitionStore.partitionKeyBuf(&buf2, "topic-b", 0);
+    const k2 = try PartitionStore.partitionKeyBuf(&buf2, "topic-b", 0);
     try testing.expect(store.partitions.contains(k2));
 
     var buf3: [256]u8 = undefined;
-    const k3 = PartitionStore.partitionKeyBuf(&buf3, "topic-a", 1);
+    const k3 = try PartitionStore.partitionKeyBuf(&buf3, "topic-a", 1);
     try testing.expect(store.partitions.contains(k3));
 }
 
@@ -2739,7 +2765,7 @@ test "PartitionStore ensurePartition idempotent preserves state" {
 
     // Verify the offset was preserved (not reset to 0)
     var buf: [256]u8 = undefined;
-    const key = PartitionStore.partitionKeyBuf(&buf, "t", 0);
+    const key = try PartitionStore.partitionKeyBuf(&buf, "t", 0);
     const state = store.partitions.get(key).?;
     try testing.expectEqual(@as(u64, 1), state.next_offset);
 }
@@ -2790,14 +2816,14 @@ test "PartitionStore applyDeferredHWUpdates advances HW" {
 
     // Verify initial HW (memory mode: HW == next_offset)
     var buf0: [256]u8 = undefined;
-    const key0 = PartitionStore.partitionKeyBuf(&buf0, "t", 0);
+    const key0 = try PartitionStore.partitionKeyBuf(&buf0, "t", 0);
     const state0_before = store.partitions.get(key0).?;
     try testing.expectEqual(@as(u64, 3), state0_before.high_watermark);
 
     // Manually lower HW to simulate S3 WAL mode where HW hasn't caught up
     store.partitions.getPtr(key0).?.high_watermark = 1;
     var buf1: [256]u8 = undefined;
-    const key1 = PartitionStore.partitionKeyBuf(&buf1, "t", 1);
+    const key1 = try PartitionStore.partitionKeyBuf(&buf1, "t", 1);
     store.partitions.getPtr(key1).?.high_watermark = 0;
 
     // Build HW update map: stream_id → new_hw
