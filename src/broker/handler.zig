@@ -10905,17 +10905,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied CreateStreams request: {}", .{err});
-            return null;
+            return self.createStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.create_stream_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.create_stream_requests.len) catch |err| {
+            log.warn("CreateStreams denied response materialization failed: {}", .{err});
+            return self.createStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code), .stream_id = -1 };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .create_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreateStreams denied response serialization failed", .{});
+            return self.createStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn createStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.create_streams_response.CreateStreamsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .create_stream_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10934,17 +10951,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied OpenStreams request: {}", .{err});
-            return null;
+            return self.openStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.open_stream_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.open_stream_requests.len) catch |err| {
+            log.warn("OpenStreams denied response materialization failed: {}", .{err});
+            return self.openStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code), .start_offset = -1, .next_offset = -1 };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .open_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OpenStreams denied response serialization failed", .{});
+            return self.openStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn openStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.open_streams_response.OpenStreamsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .open_stream_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10963,17 +10997,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied CloseStreams request: {}", .{err});
-            return null;
+            return self.closeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.close_stream_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.close_stream_requests.len) catch |err| {
+            log.warn("CloseStreams denied response materialization failed: {}", .{err});
+            return self.closeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code) };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .close_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CloseStreams denied response serialization failed", .{});
+            return self.closeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn closeStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.close_streams_response.CloseStreamsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .close_stream_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10992,17 +11043,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied DeleteStreams request: {}", .{err});
-            return null;
+            return self.deleteStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.delete_stream_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.delete_stream_requests.len) catch |err| {
+            log.warn("DeleteStreams denied response materialization failed: {}", .{err});
+            return self.deleteStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code) };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteStreams denied response serialization failed", .{});
+            return self.deleteStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn deleteStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.delete_streams_response.DeleteStreamsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .delete_stream_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11021,17 +11089,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied TrimStreams request: {}", .{err});
-            return null;
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.trim_stream_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.trim_stream_requests.len) catch |err| {
+            log.warn("TrimStreams denied response materialization failed: {}", .{err});
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code) };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("TrimStreams denied response serialization failed", .{});
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn trimStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.trim_streams_response.TrimStreamsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .trim_stream_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11049,12 +11134,25 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied PrepareS3Object request: {}", .{err});
-            return null;
+            return self.prepareS3ObjectErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .first_s3_object_id = -1 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("PrepareS3Object denied response serialization failed", .{});
+            return self.prepareS3ObjectErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn prepareS3ObjectErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .first_s3_object_id = -1,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11072,12 +11170,25 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied CommitStreamSetObject request: {}", .{err});
-            return null;
+            return self.commitStreamSetObjectErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .attributes = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CommitStreamSetObject denied response serialization failed", .{});
+            return self.commitStreamSetObjectErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn commitStreamSetObjectErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .attributes = 0,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11095,12 +11206,24 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied CommitStreamObject request: {}", .{err});
-            return null;
+            return self.commitStreamObjectErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CommitStreamObject denied response serialization failed", .{});
+            return self.commitStreamObjectErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn commitStreamObjectErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11118,12 +11241,25 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied GetOpeningStreams request: {}", .{err});
-            return null;
+            return self.getOpeningStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetOpeningStreams denied response serialization failed", .{});
+            return self.getOpeningStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn getOpeningStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .stream_metadata_list = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11142,17 +11278,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied GetKVs request: {}", .{err});
-            return null;
+            return self.getKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.get_key_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.get_key_requests.len) catch |err| {
+            log.warn("GetKVs denied response materialization failed: {}", .{err});
+            return self.getKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code), .value = null };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .get_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetKVs denied response serialization failed", .{});
+            return self.getKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn getKVsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.get_k_vs_response.GetKVsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .get_kv_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11171,17 +11324,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied PutKVs request: {}", .{err});
-            return null;
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.put_kv_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.put_kv_requests.len) catch |err| {
+            log.warn("PutKVs denied response materialization failed: {}", .{err});
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code), .value = null };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .put_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("PutKVs denied response serialization failed", .{});
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn putKVsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.put_k_vs_response.PutKVsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .put_kv_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11200,17 +11370,34 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied DeleteKVs request: {}", .{err});
-            return null;
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const responses = arena.allocator().alloc(ItemResp, req.delete_kv_requests.len) catch return null;
+        const responses = self.allocator.alloc(ItemResp, req.delete_kv_requests.len) catch |err| {
+            log.warn("DeleteKVs denied response materialization failed: {}", .{err});
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (responses.len > 0) self.allocator.free(responses);
         for (responses) |*response| {
             response.* = .{ .error_code = @intFromEnum(err_code), .value = null };
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteKVs denied response serialization failed", .{});
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn deleteKVsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.delete_k_vs_response.DeleteKVsResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .delete_kv_responses = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -30601,6 +30788,247 @@ fn expectShareStateAuthorizationDeniedWithFailingAllocator(
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
 }
 
+fn addAutoMqExtensionAuthorizationAcls(broker: *Broker) !void {
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .delete, .allow, "*");
+}
+
+const AutoMqStreamObjectKvAuthorizationProbe = struct {
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+};
+
+fn buildAutoMqStreamObjectKvEmptyAuthorizationRequest(buf: []u8, probe: AutoMqStreamObjectKvAuthorizationProbe) ![]const u8 {
+    var pos = buildTestRequest(buf, probe.api_key, probe.api_version, probe.correlation_id, header_mod.requestHeaderVersion(probe.api_key, probe.api_version));
+
+    switch (probe.api_key) {
+        501 => {
+            const Req = generated.create_streams_request.CreateStreamsRequest;
+            const req = Req{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        502 => {
+            const Req = generated.open_streams_request.OpenStreamsRequest;
+            const req = Req{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        503 => {
+            const Req = generated.close_streams_request.CloseStreamsRequest;
+            const req = Req{ .node_id = 1, .node_epoch = 1, .close_stream_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        504 => {
+            const Req = generated.delete_streams_request.DeleteStreamsRequest;
+            const req = Req{ .node_id = 1, .node_epoch = 1, .delete_stream_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        505 => {
+            const Req = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+            const req = Req{ .node_id = 1, .prepared_count = 1, .time_to_live_in_ms = 60_000 };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        506 => {
+            const Req = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+            const ranges = [_]Req.ObjectStreamRange{};
+            const stream_objects = [_]Req.StreamObject{};
+            const compacted_ids = [_]i64{};
+            const req = Req{
+                .node_id = 1,
+                .node_epoch = 1,
+                .object_id = 1,
+                .order_id = 1,
+                .object_size = 1,
+                .object_stream_ranges = &ranges,
+                .stream_objects = &stream_objects,
+                .compacted_object_ids = &compacted_ids,
+                .failover_mode = false,
+                .attributes = 0,
+            };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        507 => {
+            const Req = generated.commit_stream_object_request.CommitStreamObjectRequest;
+            const source_ids = [_]i64{};
+            const operations = [_]i8{};
+            const req = Req{
+                .node_id = 1,
+                .node_epoch = 1,
+                .object_id = 1,
+                .object_size = 1,
+                .stream_id = 1,
+                .start_offset = 0,
+                .end_offset = 1,
+                .source_object_ids = &source_ids,
+                .stream_epoch = 1,
+                .attributes = 0,
+                .operations = &operations,
+            };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        508 => {
+            const Req = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+            const req = Req{ .node_id = 1, .node_epoch = 1, .failover_mode = false };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        509 => {
+            const Req = generated.get_k_vs_request.GetKVsRequest;
+            const req = Req{ .get_key_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        510 => {
+            const Req = generated.put_k_vs_request.PutKVsRequest;
+            const req = Req{ .put_kv_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        511 => {
+            const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+            const req = Req{ .delete_kv_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        512 => {
+            const Req = generated.trim_streams_request.TrimStreamsRequest;
+            const req = Req{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        else => return error.UnsupportedApiKey,
+    }
+
+    return buf[0..pos];
+}
+
+fn buildAutoMqStreamObjectKvSingleItemAuthorizationRequest(buf: []u8, probe: AutoMqStreamObjectKvAuthorizationProbe) ![]const u8 {
+    var pos = buildTestRequest(buf, probe.api_key, probe.api_version, probe.correlation_id, header_mod.requestHeaderVersion(probe.api_key, probe.api_version));
+
+    switch (probe.api_key) {
+        501 => {
+            const Req = generated.create_streams_request.CreateStreamsRequest;
+            const items = [_]Req.CreateStreamRequest{.{ .node_id = 1, .tags = &.{} }};
+            const req = Req{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        502 => {
+            const Req = generated.open_streams_request.OpenStreamsRequest;
+            const items = [_]Req.OpenStreamRequest{.{ .stream_id = 1, .stream_epoch = 1, .tags = &.{} }};
+            const req = Req{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        503 => {
+            const Req = generated.close_streams_request.CloseStreamsRequest;
+            const items = [_]Req.CloseStreamRequest{.{ .stream_id = 1, .stream_epoch = 1 }};
+            const req = Req{ .node_id = 1, .node_epoch = 1, .close_stream_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        504 => {
+            const Req = generated.delete_streams_request.DeleteStreamsRequest;
+            const items = [_]Req.DeleteStreamRequest{.{ .stream_id = 1, .stream_epoch = 1 }};
+            const req = Req{ .node_id = 1, .node_epoch = 1, .delete_stream_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        509 => {
+            const Req = generated.get_k_vs_request.GetKVsRequest;
+            const items = [_]Req.GetKVRequest{.{ .key = "key" }};
+            const req = Req{ .get_key_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        510 => {
+            const Req = generated.put_k_vs_request.PutKVsRequest;
+            const items = [_]Req.PutKVRequest{.{ .key = "key", .value = "value", .overwrite = true }};
+            const req = Req{ .put_kv_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        511 => {
+            const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+            const items = [_]Req.DeleteKVRequest{.{ .key = "key" }};
+            const req = Req{ .delete_kv_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        512 => {
+            const Req = generated.trim_streams_request.TrimStreamsRequest;
+            const items = [_]Req.TrimStreamRequest{.{ .stream_id = 1, .stream_epoch = 1, .new_start_offset = 1 }};
+            const req = Req{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &items };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        else => return error.UnsupportedApiKey,
+    }
+
+    return buf[0..pos];
+}
+
+fn readAutoMqStreamObjectKvTopLevelErrorCode(comptime RespType: type, response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try RespType.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeAutoMqStreamObjectKvTopLevelArrays(RespType, &resp);
+    try testing.expectEqual(response.len, rpos);
+    return resp.error_code;
+}
+
+fn freeAutoMqStreamObjectKvTopLevelArrays(comptime RespType: type, resp: *const RespType) void {
+    inline for (.{
+        "create_stream_responses",
+        "open_stream_responses",
+        "close_stream_responses",
+        "delete_stream_responses",
+        "trim_stream_responses",
+        "stream_metadata_list",
+        "get_kv_responses",
+        "put_kv_responses",
+        "delete_kv_responses",
+    }) |field_name| {
+        if (@hasField(RespType, field_name)) {
+            const items = @field(resp.*, field_name);
+            if (items.len > 0) testing.allocator.free(items);
+        }
+    }
+}
+
+fn readAutoMqStreamKvAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    return switch (api_key) {
+        501 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.create_streams_response.CreateStreamsResponse, response, api_key, api_version, correlation_id),
+        502 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.open_streams_response.OpenStreamsResponse, response, api_key, api_version, correlation_id),
+        503 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.close_streams_response.CloseStreamsResponse, response, api_key, api_version, correlation_id),
+        504 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.delete_streams_response.DeleteStreamsResponse, response, api_key, api_version, correlation_id),
+        505 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.prepare_s3_object_response.PrepareS3ObjectResponse, response, api_key, api_version, correlation_id),
+        506 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.commit_stream_set_object_response.CommitStreamSetObjectResponse, response, api_key, api_version, correlation_id),
+        507 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.commit_stream_object_response.CommitStreamObjectResponse, response, api_key, api_version, correlation_id),
+        508 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.get_opening_streams_response.GetOpeningStreamsResponse, response, api_key, api_version, correlation_id),
+        509 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.get_k_vs_response.GetKVsResponse, response, api_key, api_version, correlation_id),
+        510 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.put_k_vs_response.PutKVsResponse, response, api_key, api_version, correlation_id),
+        511 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.delete_k_vs_response.DeleteKVsResponse, response, api_key, api_version, correlation_id),
+        512 => readAutoMqStreamObjectKvTopLevelErrorCode(generated.trim_streams_response.TrimStreamsResponse, response, api_key, api_version, correlation_id),
+        else => error.UnsupportedApiKey,
+    };
+}
+
+fn expectAutoMqStreamKvAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAutoMqStreamKvAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
 fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
     for (resp.topics) |topic| {
         for (topic.partitions) |partition| {
@@ -47395,6 +47823,107 @@ test "Broker.handleRequest AutoMQ KV authorization denial uses generated respons
     }
     try testing.expectEqual(kv_count_before, broker.auto_mq_kvs.count());
     try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
+}
+
+test "Broker.handleRequest AutoMQ stream object KV authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addAutoMqExtensionAuthorizationAcls(&broker);
+
+    const probes = [_]AutoMqStreamObjectKvAuthorizationProbe{
+        .{ .api_key = 501, .api_version = 1, .correlation_id = 5015 },
+        .{ .api_key = 502, .api_version = 1, .correlation_id = 5025 },
+        .{ .api_key = 503, .api_version = 0, .correlation_id = 5035 },
+        .{ .api_key = 504, .api_version = 0, .correlation_id = 5045 },
+        .{ .api_key = 505, .api_version = 0, .correlation_id = 5055 },
+        .{ .api_key = 506, .api_version = 1, .correlation_id = 5065 },
+        .{ .api_key = 507, .api_version = 1, .correlation_id = 5075 },
+        .{ .api_key = 508, .api_version = 0, .correlation_id = 5085 },
+        .{ .api_key = 509, .api_version = 0, .correlation_id = 5095 },
+        .{ .api_key = 510, .api_version = 0, .correlation_id = 5105 },
+        .{ .api_key = 511, .api_version = 0, .correlation_id = 5115 },
+        .{ .api_key = 512, .api_version = 0, .correlation_id = 5125 },
+    };
+
+    for (probes) |probe| {
+        var buf: [4096]u8 = undefined;
+        const request = try buildAutoMqStreamObjectKvEmptyAuthorizationRequest(&buf, probe);
+        try testing.expect(request.len < buf.len);
+        buf[request.len] = 0x7f;
+
+        const response = broker.handleRequest(buf[0 .. request.len + 1]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readAutoMqStreamKvAuthorizationErrorCode(response.?, probe.api_key, probe.api_version, probe.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+    }
+}
+
+test "Broker.handleRequest AutoMQ stream object KV authorization denial fails closed when serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addAutoMqExtensionAuthorizationAcls(&broker);
+
+    const probes = [_]AutoMqStreamObjectKvAuthorizationProbe{
+        .{ .api_key = 501, .api_version = 1, .correlation_id = 5016 },
+        .{ .api_key = 502, .api_version = 1, .correlation_id = 5026 },
+        .{ .api_key = 503, .api_version = 0, .correlation_id = 5036 },
+        .{ .api_key = 504, .api_version = 0, .correlation_id = 5046 },
+        .{ .api_key = 505, .api_version = 0, .correlation_id = 5056 },
+        .{ .api_key = 506, .api_version = 1, .correlation_id = 5066 },
+        .{ .api_key = 507, .api_version = 1, .correlation_id = 5076 },
+        .{ .api_key = 508, .api_version = 0, .correlation_id = 5086 },
+        .{ .api_key = 509, .api_version = 0, .correlation_id = 5096 },
+        .{ .api_key = 510, .api_version = 0, .correlation_id = 5106 },
+        .{ .api_key = 511, .api_version = 0, .correlation_id = 5116 },
+        .{ .api_key = 512, .api_version = 0, .correlation_id = 5126 },
+    };
+
+    for (probes) |probe| {
+        var buf: [4096]u8 = undefined;
+        const request = try buildAutoMqStreamObjectKvEmptyAuthorizationRequest(&buf, probe);
+        try expectAutoMqStreamKvAuthorizationDeniedWithFailingAllocator(
+            &broker,
+            request,
+            probe.api_key,
+            probe.api_version,
+            probe.correlation_id,
+            0,
+            ErrorCode.kafka_storage_error,
+        );
+    }
+}
+
+test "Broker.handleRequest AutoMQ stream KV authorization denial fails closed when response materialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addAutoMqExtensionAuthorizationAcls(&broker);
+
+    const probes = [_]AutoMqStreamObjectKvAuthorizationProbe{
+        .{ .api_key = 501, .api_version = 1, .correlation_id = 5017 },
+        .{ .api_key = 502, .api_version = 1, .correlation_id = 5027 },
+        .{ .api_key = 503, .api_version = 0, .correlation_id = 5037 },
+        .{ .api_key = 504, .api_version = 0, .correlation_id = 5047 },
+        .{ .api_key = 509, .api_version = 0, .correlation_id = 5097 },
+        .{ .api_key = 510, .api_version = 0, .correlation_id = 5107 },
+        .{ .api_key = 511, .api_version = 0, .correlation_id = 5117 },
+        .{ .api_key = 512, .api_version = 0, .correlation_id = 5127 },
+    };
+
+    for (probes) |probe| {
+        var buf: [4096]u8 = undefined;
+        const request = try buildAutoMqStreamObjectKvSingleItemAuthorizationRequest(&buf, probe);
+        try expectAutoMqStreamKvAuthorizationDeniedWithFailingAllocator(
+            &broker,
+            request,
+            probe.api_key,
+            probe.api_version,
+            probe.correlation_id,
+            1,
+            ErrorCode.kafka_storage_error,
+        );
+    }
 }
 
 test "Broker.handleRequest remaining AutoMQ extension authorization denial uses generated responses" {

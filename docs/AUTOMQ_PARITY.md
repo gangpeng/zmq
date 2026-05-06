@@ -680,6 +680,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ShareGroupDescribe, and the share-state APIs now return generated
   invalid-request/storage-error fallbacks for malformed denied frames and
   denial response materialization or serialization failures.
+  AutoMQ stream/object/KV authorization-denial builders for
+  Create/Open/Close/Delete/TrimStreams, PrepareS3Object,
+  CommitStreamSetObject, CommitStreamObject, GetOpeningStreams, and
+  Get/Put/DeleteKVs now do the same for malformed denied frames and denial
+  response materialization or serialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
