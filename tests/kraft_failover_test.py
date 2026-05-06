@@ -3743,6 +3743,7 @@ def wait_for_share_fetch_open(
             acquired = partition["acquired_records"][0]
             if acquired["first_offset"] > acquired["last_offset"]:
                 raise TestError(f"ShareFetch open invalid acquired range: {response}")
+            group_state["share_fetch_acquired"] = acquired
             group_state["share_session_epoch"] = 0
             return
         except Exception as exc:
@@ -3787,6 +3788,216 @@ def wait_for_share_fetch_session_checkpoint(port, group_state, timeout=30):
         time.sleep(0.25)
     raise TestError(
         f"ShareFetch session epoch {next_epoch} did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def write_share_acknowledge_topics(topic_partitions):
+    out = bytearray(write_compact_array_len(len(topic_partitions)))
+    for topic in topic_partitions:
+        topic_id = topic["topic_id"]
+        if len(topic_id) != 16:
+            raise TestError(f"invalid ShareAcknowledge topic id length {len(topic_id)}")
+        out += topic_id
+        partitions = topic.get("partitions", [])
+        out += write_compact_array_len(len(partitions))
+        for partition in partitions:
+            out += struct.pack(">i", partition.get("partition_index", 0))
+            acknowledgement_batches = partition.get("acknowledgement_batches", [])
+            out += write_compact_array_len(len(acknowledgement_batches))
+            for batch in acknowledgement_batches:
+                out += struct.pack(">qq", batch["first_offset"], batch["last_offset"])
+                acknowledge_types = batch.get("acknowledge_types", [])
+                out += write_compact_array_len(len(acknowledge_types))
+                for acknowledge_type in acknowledge_types:
+                    out += struct.pack(">b", acknowledge_type)
+                out += b"\x00"  # acknowledgement batch tagged fields
+            out += b"\x00"  # partition tagged fields
+        out += b"\x00"  # topic tagged fields
+    return bytes(out)
+
+
+def parse_share_acknowledge_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    response_count, pos = read_compact_array_len(response, pos)
+    responses = []
+    for _ in range(response_count):
+        if pos + 16 > len(response):
+            raise TestError("buffer underflow while reading ShareAcknowledge topic id")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            partition_error, pos = read_i16(response, pos)
+            partition_message, pos = read_compact_string(response, pos)
+            leader_id, pos = read_i32(response, pos)
+            leader_epoch, pos = read_i32(response, pos)
+            pos = skip_tags(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "error_code": partition_error,
+                    "error_message": partition_message,
+                    "leader_id": leader_id,
+                    "leader_epoch": leader_epoch,
+                }
+            )
+        pos = skip_tags(response, pos)
+        responses.append({"topic_id": topic_id, "partitions": partitions})
+    node_endpoint_count, pos = read_compact_array_len(response, pos)
+    node_endpoints = []
+    for _ in range(node_endpoint_count):
+        node_id, pos = read_i32(response, pos)
+        host, pos = read_compact_string(response, pos)
+        endpoint_port, pos = read_i32(response, pos)
+        rack, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        node_endpoints.append(
+            {
+                "node_id": node_id,
+                "host": host,
+                "port": endpoint_port,
+                "rack": rack,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ShareAcknowledge response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "error_code": error_code,
+        "error_message": error_message,
+        "responses": responses,
+        "node_endpoints": node_endpoints,
+    }
+
+
+def share_acknowledge(
+    port,
+    group_state,
+    share_session_epoch,
+    correlation_id,
+    topic_partitions=None,
+):
+    if topic_partitions is None:
+        topic_partitions = []
+    body = write_compact_string(group_state["group_id"])
+    body += write_compact_string(group_state["member_id"])
+    body += struct.pack(">i", share_session_epoch)
+    body += write_share_acknowledge_topics(topic_partitions)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 79, 0, correlation_id, body)
+    return parse_share_acknowledge_response(response, correlation_id)
+
+
+def wait_for_share_acknowledge_acquired(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8000
+    last_error = None
+    acquired = group_state.get("share_fetch_acquired")
+    if acquired is None:
+        raise TestError("ShareAcknowledge requested before ShareFetch acquisition")
+    ack_count = acquired["last_offset"] - acquired["first_offset"] + 1
+    if ack_count <= 0 or ack_count > 1000:
+        raise TestError(f"ShareAcknowledge acquired range is not sane: {acquired}")
+    next_epoch = group_state["share_session_epoch"] + 1
+    topic_partitions = [
+        {
+            "topic_id": group_state["topic_id"],
+            "partitions": [
+                {
+                    "partition_index": 0,
+                    "acknowledgement_batches": [
+                        {
+                            "first_offset": acquired["first_offset"],
+                            "last_offset": acquired["last_offset"],
+                            "acknowledge_types": [1] * ack_count,
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    while time.time() < deadline:
+        try:
+            response = share_acknowledge(
+                port,
+                group_state,
+                next_epoch,
+                correlation_id,
+                topic_partitions=topic_partitions,
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ShareAcknowledge acquired range error_code="
+                    f"{response['error_code']} message={response['error_message']!r}"
+                )
+            if len(response["responses"]) != 1:
+                raise TestError(
+                    f"ShareAcknowledge acquired topic count mismatch: {response}"
+                )
+            topic = response["responses"][0]
+            if topic["topic_id"] != group_state["topic_id"]:
+                raise TestError(f"ShareAcknowledge acquired topic id mismatch: {response}")
+            if len(topic["partitions"]) != 1:
+                raise TestError(
+                    f"ShareAcknowledge acquired partition count mismatch: {response}"
+                )
+            partition = topic["partitions"][0]
+            if partition["partition_index"] != 0 or partition["error_code"] != 0:
+                raise TestError(f"ShareAcknowledge acquired partition error: {response}")
+            group_state["share_acknowledged_acquired"] = dict(acquired)
+            group_state["share_session_epoch"] = next_epoch
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ShareAcknowledge acquired range did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_acknowledge_session_checkpoint(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8010
+    last_error = None
+    next_epoch = group_state["share_session_epoch"] + 1
+    while time.time() < deadline:
+        try:
+            response = share_acknowledge(
+                port,
+                group_state,
+                next_epoch,
+                correlation_id,
+                topic_partitions=[],
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ShareAcknowledge session epoch {next_epoch} error_code="
+                    f"{response['error_code']} message={response['error_message']!r}"
+                )
+            if response["responses"]:
+                raise TestError(
+                    f"ShareAcknowledge session checkpoint returned partitions: "
+                    f"{response}"
+                )
+            group_state["share_session_epoch"] = next_epoch
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ShareAcknowledge session epoch {next_epoch} did not recover for "
         f"{group_state['group_id']!r}: {last_error}"
     )
 
@@ -6210,6 +6421,10 @@ def main():
             share_group_state,
             expected_payloads[0],
         )
+        wait_for_share_acknowledge_acquired(
+            broker["port"],
+            share_group_state,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -6274,6 +6489,10 @@ def main():
             topic,
         )
         wait_for_share_fetch_session_checkpoint(
+            broker["port"],
+            share_group_state,
+        )
+        wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
         )
@@ -6372,6 +6591,10 @@ def main():
             topic,
         )
         wait_for_share_fetch_session_checkpoint(
+            broker["port"],
+            share_group_state,
+        )
+        wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
         )
@@ -6474,6 +6697,10 @@ def main():
             topic,
         )
         wait_for_share_fetch_session_checkpoint(
+            broker["port"],
+            share_group_state,
+        )
+        wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
         )
@@ -6586,6 +6813,10 @@ def main():
             topic,
         )
         wait_for_share_fetch_session_checkpoint(
+            broker["port"],
+            share_group_state,
+        )
+        wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
         )
@@ -6703,6 +6934,10 @@ def main():
             topic,
         )
         wait_for_share_fetch_session_checkpoint(
+            broker["port"],
+            share_group_state,
+        )
+        wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
         )
@@ -6832,6 +7067,10 @@ def main():
             topic,
         )
         wait_for_share_fetch_session_checkpoint(
+            broker["port"],
+            share_group_state,
+        )
+        wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
         )
@@ -6995,6 +7234,7 @@ def main():
             f"share_group_heartbeat_checked=true, "
             f"share_group_describe_checked=true, "
             f"share_fetch_session_checked=true, "
+            f"share_acknowledge_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
             f"kip848_rejoin_checked=true, "
@@ -7542,6 +7782,30 @@ def self_test():
             != 0
         ):
             raise TestError(f"ShareFetch fixture parser failed: {share_fetched}")
+
+        share_ack_fixture = struct.pack(">i", 158)
+        share_ack_fixture += b"\x00"  # response header tagged fields
+        share_ack_fixture += struct.pack(">ih", 0, 0)
+        share_ack_fixture += write_compact_string(None)
+        share_ack_fixture += write_compact_array_len(1)
+        share_ack_fixture += share_describe_topic_id
+        share_ack_fixture += write_compact_array_len(1)
+        share_ack_fixture += struct.pack(">ih", 0, 0)
+        share_ack_fixture += write_compact_string(None)
+        share_ack_fixture += struct.pack(">ii", 1, 0)
+        share_ack_fixture += b"\x00"  # current_leader tagged fields
+        share_ack_fixture += b"\x00"  # partition tagged fields
+        share_ack_fixture += b"\x00"  # topic tagged fields
+        share_ack_fixture += write_compact_array_len(0)
+        share_ack_fixture += b"\x00"  # response tagged fields
+        share_acked = parse_share_acknowledge_response(share_ack_fixture, 158)
+        if (
+            share_acked["error_code"] != 0
+            or share_acked["responses"][0]["topic_id"] != share_describe_topic_id
+            or share_acked["responses"][0]["partitions"][0]["partition_index"] != 0
+            or share_acked["responses"][0]["partitions"][0]["error_code"] != 0
+        ):
+            raise TestError(f"ShareAcknowledge fixture parser failed: {share_acked}")
 
         leave_fixture = struct.pack(">ih", 50, 0)
         parse_leave_group_response(leave_fixture, 50)
