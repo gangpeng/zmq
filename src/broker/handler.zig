@@ -6266,10 +6266,10 @@ pub const Broker = struct {
             54 => self.handleEndQuorumEpochAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
             57 => self.handleUpdateFeaturesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
-            60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            60 => self.handleDescribeClusterAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             65 => self.handleDescribeTransactionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
-            66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            66 => self.handleListTransactionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             68 => self.handleConsumerGroupHeartbeatAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             71 => self.handleGetTelemetrySubscriptionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -8748,8 +8748,22 @@ pub const Broker = struct {
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn handleDescribeClusterAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+    fn handleDescribeClusterAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
         const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+        if (!validateDescribeClusterRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DescribeCluster request", .{});
+            return self.describeClusterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request", 1);
+        }
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
@@ -8760,7 +8774,10 @@ pub const Broker = struct {
             .brokers = &.{},
             .cluster_authorized_operations = std.math.minInt(i32),
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeCluster denied response serialization failed", .{});
+            return self.describeClusterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeCluster authorization response", 1);
+        };
     }
 
     fn handleConsumerGroupHeartbeatAuthorizationError(
@@ -9553,19 +9570,22 @@ pub const Broker = struct {
 
         if (!validateDescribeProducersRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied DescribeProducers request", .{});
-            return null;
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeProducers request: {}", .{err});
-            return null;
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeProducersRequest(&req);
 
         var topics: []TopicResponse = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+                log.warn("DescribeProducers denied topic response materialization failed: {}", .{err});
+                return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeProducers authorization response");
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -9576,7 +9596,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResponse = &.{};
             if (topic_req.partition_indexes.len > 0) {
-                partitions = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch |err| {
+                    log.warn("DescribeProducers denied partition response materialization failed: {}", .{err});
+                    return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeProducers authorization response");
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -9602,18 +9625,46 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeProducers denied response serialization failed", .{});
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeProducers authorization response");
+        };
     }
 
-    fn handleListTransactionsAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+    fn handleListTransactionsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.list_transactions_request.ListTransactionsRequest;
         const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+        if (!validateListTransactionsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied ListTransactions request", .{});
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ListTransactions request: {}", .{err});
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        };
+        defer self.freeListTransactionsRequest(&req);
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
             .unknown_state_filters = &.{},
             .transaction_states = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListTransactions denied response serialization failed", .{});
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleDescribeTransactionsAuthorizationError(
@@ -9631,19 +9682,22 @@ pub const Broker = struct {
 
         if (!validateDescribeTransactionsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied DescribeTransactions request", .{});
-            return null;
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeTransactions request: {}", .{err});
-            return null;
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeTransactionsRequest(&req);
 
         var states: []TransactionState = &.{};
         if (req.transactional_ids.len > 0) {
-            states = self.allocator.alloc(TransactionState, req.transactional_ids.len) catch return null;
+            states = self.allocator.alloc(TransactionState, req.transactional_ids.len) catch |err| {
+                log.warn("DescribeTransactions denied response materialization failed: {}", .{err});
+                return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer if (states.len > 0) self.allocator.free(states);
 
@@ -9664,7 +9718,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .transaction_states = states,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeTransactions denied response serialization failed", .{});
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleGetTelemetrySubscriptionsAuthorizationError(
@@ -34789,6 +34846,52 @@ test "Broker.handleRequest ListTransactions authorization denial uses generated 
     try testing.expectEqual(@as(usize, 0), resp.transaction_states.len);
 }
 
+test "Broker.handleRequest ListTransactions authorization denial rejects malformed request" {
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 66, 1, 6614, header_mod.requestHeaderVersion(66, 1));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 66, 1, 6614);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest ListTransactions authorization denial fails closed when serialization fails" {
+    const Req = generated.list_transactions_request.ListTransactionsRequest;
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 66, 1, 6615, header_mod.requestHeaderVersion(66, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 66, 1, 6615);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest DescribeTransactions v0 returns partition details and missing ids" {
     const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
     const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
@@ -34886,6 +34989,75 @@ test "Broker.handleRequest DescribeTransactions authorization denial uses genera
         try testing.expectEqual(@as(i16, -1), state.producer_epoch);
         try testing.expectEqual(@as(usize, 0), state.topics.len);
     }
+}
+
+test "Broker.handleRequest DescribeTransactions authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 65, 0, 6515, header_mod.requestHeaderVersion(65, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6515, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeTransactions authorization denial fails closed when response materialization fails" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    const transactional_ids = [_]?[]const u8{"denied-txn-materialize-fail"};
+    const req = Req{ .transactional_ids = &transactional_ids };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6516, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6516, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeTransactions authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{ .transactional_ids = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6517, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6517, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest transaction introspection survives local broker restart" {
@@ -51207,6 +51379,56 @@ test "Broker.handleRequest DescribeCluster authorization denial uses generated r
     try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.cluster_authorized_operations);
 }
 
+test "Broker.handleRequest DescribeCluster authorization denial rejects malformed request" {
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 19092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 60, 1, 6014, header_mod.requestHeaderVersion(60, 1));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 60, 1, 6014);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+}
+
+test "Broker.handleRequest DescribeCluster authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_cluster_request.DescribeClusterRequest;
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 19092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{
+        .include_cluster_authorized_operations = true,
+        .endpoint_type = 2,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 60, 1, 6015, header_mod.requestHeaderVersion(60, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 60, 1, 6015);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+}
+
 test "Broker.handleRequest DescribeQuorum returns request-scoped generated quorum state" {
     const Req = generated.describe_quorum_request.DescribeQuorumRequest;
     const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
@@ -52655,6 +52877,78 @@ test "Broker.handleRequest DescribeProducers authorization denial uses generated
     try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions[0].active_producers.len);
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[1].partition_index);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.topics[0].partitions[1].error_code);
+}
+
+test "Broker.handleRequest DescribeProducers authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 61, 0, 6114, header_mod.requestHeaderVersion(61, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeProducersErrorResponseBytes(response.?, 6114, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeProducers authorization denial fails closed when response materialization fails" {
+    const Req = generated.describe_producers_request.DescribeProducersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+
+    const topics = [_]Req.TopicRequest{.{
+        .name = "producer-denied-materialize-fail",
+        .partition_indexes = &.{},
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 61, 0, 6115, header_mod.requestHeaderVersion(61, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeProducersErrorResponseBytes(response.?, 6115, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeProducers authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_producers_request.DescribeProducersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{ .topics = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 61, 0, 6116, header_mod.requestHeaderVersion(61, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeProducersErrorResponseBytes(response.?, 6116, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DescribeTopicPartitions returns generated metadata and unknown topics" {

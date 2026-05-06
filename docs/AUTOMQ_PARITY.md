@@ -631,6 +631,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   authorization-denial builders now follow the same generated fail-closed
   behavior for malformed denied frames and response serialization or
   materialization failures.
+  DescribeCluster, DescribeProducers, DescribeTransactions, and
+  ListTransactions authorization-denial builders now also fail closed with
+  generated invalid-request or storage-error responses when denied frames or
+  denial response construction fail.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
