@@ -45,7 +45,9 @@ BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 ERROR_GROUP_ID_NOT_FOUND = 69
 ERROR_UNKNOWN_MEMBER_ID = 25
+ERROR_INVALID_REQUEST = 42
 ERROR_FENCED_MEMBER_EPOCH = 110
+ERROR_UNSUPPORTED_ASSIGNOR = 112
 
 
 class TestError(Exception):
@@ -2906,6 +2908,97 @@ def wait_for_consumer_group_heartbeat_subscription_update(
     )
 
 
+def assert_consumer_group_heartbeat_negative_join(
+    port,
+    group_id,
+    topic,
+    expected_error,
+    correlation_id,
+    subscribed_topics,
+    server_assignor,
+    message_fragment=None,
+):
+    response = consumer_group_heartbeat(
+        port,
+        group_id,
+        f"{group_id}-member",
+        0,
+        correlation_id,
+        subscribed_topics=subscribed_topics,
+        server_assignor=server_assignor,
+    )
+    if response["error_code"] != expected_error:
+        raise TestError(
+            f"ConsumerGroupHeartbeat negative join {group_id!r} error_code="
+            f"{response['error_code']} expected={expected_error} "
+            f"message={response['error_message']!r}"
+        )
+    if message_fragment is not None:
+        error_message = response["error_message"] or ""
+        if message_fragment not in error_message:
+            raise TestError(
+                f"ConsumerGroupHeartbeat negative join {group_id!r} "
+                f"message={response['error_message']!r} missing "
+                f"{message_fragment!r}"
+            )
+    if response["heartbeat_interval_ms"] != 0 or response["assignment"] is not None:
+        raise TestError(
+            f"ConsumerGroupHeartbeat negative join returned active state: {response}"
+        )
+
+    described = consumer_group_describe(port, group_id, correlation_id + 100)
+    if described["error_code"] != ERROR_GROUP_ID_NOT_FOUND:
+        raise TestError(
+            f"ConsumerGroupHeartbeat negative join materialized group {group_id!r}: "
+            f"{described}"
+        )
+    if described["members"]:
+        raise TestError(
+            f"ConsumerGroupHeartbeat negative join returned members for "
+            f"{group_id!r}: {described}"
+        )
+
+
+def wait_for_consumer_group_heartbeat_negative_joins(
+    port, group_prefix, topic, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7860
+    last_error = None
+    duplicate_group = f"{group_prefix}-duplicate-subscription"
+    unsupported_group = f"{group_prefix}-unsupported-assignor"
+    while time.time() < deadline:
+        try:
+            assert_consumer_group_heartbeat_negative_join(
+                port,
+                duplicate_group,
+                topic,
+                ERROR_INVALID_REQUEST,
+                correlation_id,
+                subscribed_topics=[topic, topic],
+                server_assignor="range",
+                message_fragment="invalid ConsumerGroupHeartbeat subscription",
+            )
+            assert_consumer_group_heartbeat_negative_join(
+                port,
+                unsupported_group,
+                topic,
+                ERROR_UNSUPPORTED_ASSIGNOR,
+                correlation_id + 1,
+                subscribed_topics=[topic],
+                server_assignor="roundrobin",
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat negative joins did not recover for "
+        f"{group_prefix!r}: {last_error}"
+    )
+
+
 def wait_for_consumer_group_heartbeat_leave(port, group_state, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 7850
@@ -3147,6 +3240,10 @@ def wait_for_kip848_subscription_checkpoint(port, group_state, topic):
     wait_for_consumer_group_heartbeat(port, group_state)
     wait_for_consumer_group_heartbeat_owned_assignment(port, group_state)
     wait_for_kip848_consumer_group_description(port, group_state, topic)
+
+
+def wait_for_kip848_negative_checkpoint(port, group_prefix, topic):
+    wait_for_consumer_group_heartbeat_negative_joins(port, group_prefix, topic)
 
 
 def parse_leave_group_response(response, correlation_id):
@@ -5425,6 +5522,7 @@ def main():
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
         kip848_subscription_topic = f"{topic}-kip848-subscription"
+        kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
         wait_for_topic(broker["port"], topic)
         wait_for_topic(broker["port"], txn_topic)
@@ -5542,6 +5640,11 @@ def main():
             kip848_subscription_group_state,
             kip848_subscription_topic,
         )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -5594,6 +5697,11 @@ def main():
             broker["port"],
             kip848_subscription_group_state,
             kip848_subscription_topic,
+        )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5678,6 +5786,11 @@ def main():
             broker["port"],
             kip848_subscription_group_state,
             kip848_subscription_topic,
+        )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5766,6 +5879,11 @@ def main():
             broker["port"],
             kip848_subscription_group_state,
             kip848_subscription_topic,
+        )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5864,6 +5982,11 @@ def main():
             broker["port"],
             kip848_subscription_group_state,
             kip848_subscription_topic,
+        )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5967,6 +6090,11 @@ def main():
             broker["port"],
             kip848_subscription_group_state,
             kip848_subscription_topic,
+        )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6082,6 +6210,11 @@ def main():
             broker["port"],
             kip848_subscription_group_state,
             kip848_subscription_topic,
+        )
+        wait_for_kip848_negative_checkpoint(
+            broker["port"],
+            kip848_negative_group_prefix,
+            topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6246,6 +6379,7 @@ def main():
             f"kip848_rack_checked=true, "
             f"kip848_owned_assignment_checked=true, "
             f"kip848_subscription_update_checked=true, "
+            f"kip848_negative_join_checked=true, "
             f"kip848_static_rejoin_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
