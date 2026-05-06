@@ -2539,12 +2539,21 @@ def parse_describe_configs_response(response, correlation_id):
 
 
 def describe_topic_configs(port, topic, correlation_id):
+    return describe_topic_selected_configs(
+        port,
+        topic,
+        ["cleanup.policy", "min.insync.replicas"],
+        correlation_id,
+    )
+
+
+def describe_topic_selected_configs(port, topic, config_names, correlation_id):
     body = write_compact_array_len(1)
     body += struct.pack(">b", 2)  # resource_type=TOPIC
     body += write_compact_string(topic)
-    body += write_compact_array_len(2)
-    body += write_compact_string("cleanup.policy")
-    body += write_compact_string("min.insync.replicas")
+    body += write_compact_array_len(len(config_names))
+    for config_name in config_names:
+        body += write_compact_string(config_name)
     body += b"\x00"  # resource tagged fields
     body += b"\x00"  # include_synonyms=false
     body += b"\x01"  # include_documentation=true
@@ -2587,6 +2596,211 @@ def wait_for_describe_configs_checkpoint(port, topic, timeout=30):
         correlation_id += 1
         time.sleep(0.25)
     raise TestError(f"DescribeConfigs did not recover for {topic!r}: {last_error}")
+
+
+def parse_alter_configs_response(response, correlation_id, label):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    response_count, pos = read_compact_array_len(response, pos)
+    responses = []
+    for _ in range(response_count):
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        resource_type, pos = read_i8(response, pos)
+        resource_name, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        responses.append(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+                "resource_type": resource_type,
+                "resource_name": resource_name,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"{label} response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "responses": responses}
+
+
+def alter_configs(port, topic, configs, validate_only, correlation_id):
+    body = write_compact_array_len(1)
+    body += b"\x02"  # resource_type=TOPIC
+    body += write_compact_string(topic)
+    body += write_compact_array_len(len(configs))
+    for name, value in configs:
+        body += write_compact_string(name)
+        body += write_compact_string(value)
+        body += b"\x00"  # config tagged fields
+    body += b"\x00"  # resource tagged fields
+    body += b"\x01" if validate_only else b"\x00"
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 33, 2, correlation_id, body)
+    return parse_alter_configs_response(response, correlation_id, "AlterConfigs")
+
+
+def incremental_alter_configs(port, topic, configs, validate_only, correlation_id):
+    body = write_compact_array_len(1)
+    body += b"\x02"  # resource_type=TOPIC
+    body += write_compact_string(topic)
+    body += write_compact_array_len(len(configs))
+    for name, operation, value in configs:
+        body += write_compact_string(name)
+        body += struct.pack(">b", operation)
+        body += write_compact_string(value)
+        body += b"\x00"  # config tagged fields
+    body += b"\x00"  # resource tagged fields
+    body += b"\x01" if validate_only else b"\x00"
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 44, 1, correlation_id, body)
+    return parse_alter_configs_response(
+        response,
+        correlation_id,
+        "IncrementalAlterConfigs",
+    )
+
+
+def require_alter_configs_success(response, topic, label):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"{label} throttle mismatch: {response}")
+    responses = response["responses"]
+    if len(responses) != 1:
+        raise TestError(f"{label} response count mismatch: {response}")
+    item = responses[0]
+    if (
+        item["error_code"] != 0
+        or item["error_message"] is not None
+        or item["resource_type"] != 2
+        or item["resource_name"] != topic
+    ):
+        raise TestError(f"{label} resource mismatch: {response}")
+
+
+def require_topic_config_values(response, topic, expected_values):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"DescribeConfigs throttle mismatch: {response}")
+    results = response["results"]
+    if len(results) != 1:
+        raise TestError(f"DescribeConfigs result count mismatch: {response}")
+    result = results[0]
+    if (
+        result["error_code"] != 0
+        or result["resource_type"] != 2
+        or result["resource_name"] != topic
+    ):
+        raise TestError(f"DescribeConfigs resource mismatch: {response}")
+    configs = {item["name"]: item for item in result["configs"]}
+    for name, expected_value in expected_values.items():
+        config = configs.get(name)
+        if config is None or config["value"] != expected_value:
+            raise TestError(
+                f"DescribeConfigs {name} mismatch: expected={expected_value!r} "
+                f"response={response}"
+            )
+        if config["documentation"] is None:
+            raise TestError(f"DescribeConfigs {name} documentation missing: {response}")
+
+
+def wait_for_config_admin_seed(
+    port,
+    topic,
+    alter_configs_values,
+    incremental_configs_values,
+    final_values,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8910
+    last_error = None
+    while time.time() < deadline:
+        try:
+            altered = alter_configs(
+                port,
+                topic,
+                alter_configs_values,
+                False,
+                correlation_id,
+            )
+            require_alter_configs_success(altered, topic, "AlterConfigs")
+            correlation_id += 1
+            incremented = incremental_alter_configs(
+                port,
+                topic,
+                incremental_configs_values,
+                False,
+                correlation_id,
+            )
+            require_alter_configs_success(
+                incremented,
+                topic,
+                "IncrementalAlterConfigs",
+            )
+            correlation_id += 1
+            described = describe_topic_selected_configs(
+                port,
+                topic,
+                list(final_values.keys()),
+                correlation_id,
+            )
+            require_topic_config_values(described, topic, final_values)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"Config admin seed did not recover for {topic!r}: {last_error}")
+
+
+def wait_for_config_admin_checkpoint(
+    port,
+    topic,
+    alter_configs_values,
+    incremental_configs_values,
+    final_values,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8950
+    last_error = None
+    while time.time() < deadline:
+        try:
+            altered = alter_configs(
+                port,
+                topic,
+                alter_configs_values,
+                True,
+                correlation_id,
+            )
+            require_alter_configs_success(altered, topic, "AlterConfigs")
+            correlation_id += 1
+            incremented = incremental_alter_configs(
+                port,
+                topic,
+                incremental_configs_values,
+                True,
+                correlation_id,
+            )
+            require_alter_configs_success(
+                incremented,
+                topic,
+                "IncrementalAlterConfigs",
+            )
+            correlation_id += 1
+            described = describe_topic_selected_configs(
+                port,
+                topic,
+                list(final_values.keys()),
+                correlation_id,
+            )
+            require_topic_config_values(described, topic, final_values)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"Config admin checkpoint did not recover for {topic!r}: {last_error}"
+    )
 
 
 def parse_describe_log_dirs_response(response, correlation_id):
@@ -9515,6 +9729,7 @@ def main():
         idempotent_topic = f"{topic}-idempotent"
         delete_records_topic = f"{topic}-delete-records"
         create_partitions_topic = f"{topic}-create-partitions"
+        config_admin_topic = f"{topic}-config-admin"
         quota_client_id = f"{group}-quota-client"
         validate_only_quota_client_id = f"{group}-quota-validate-only"
         quota_values = {
@@ -9555,6 +9770,20 @@ def main():
             "operation": ACL_OPERATION_DESCRIBE,
             "permission_type": ACL_PERMISSION_ALLOW,
         }
+        alter_configs_values = [
+            ("cleanup.policy", "compact"),
+            ("min.insync.replicas", "1"),
+            ("segment.bytes", "131072"),
+        ]
+        incremental_configs_values = [
+            ("cleanup.policy", 0, "compact,delete"),
+            ("segment.bytes", 0, "262144"),
+        ]
+        final_config_values = {
+            "cleanup.policy": "compact,delete",
+            "min.insync.replicas": "1",
+            "segment.bytes": "262144",
+        }
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -9563,6 +9792,7 @@ def main():
         wait_for_topic(broker["port"], idempotent_topic)
         wait_for_topic(broker["port"], delete_records_topic)
         wait_for_topic(broker["port"], create_partitions_topic)
+        wait_for_topic(broker["port"], config_admin_topic)
         wait_for_topic(broker["port"], kip848_subscription_topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -9665,6 +9895,15 @@ def main():
                 deleted_acl,
             )
 
+        def wait_for_config_admin_probe():
+            wait_for_config_admin_checkpoint(
+                broker["port"],
+                config_admin_topic,
+                alter_configs_values,
+                incremental_configs_values,
+                final_config_values,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
@@ -9674,6 +9913,7 @@ def main():
             wait_for_delegation_token_probe()
             wait_for_finalized_features_probe()
             wait_for_acl_admin_probe()
+            wait_for_config_admin_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -9736,6 +9976,13 @@ def main():
             broker["port"],
             broad_allow_acl,
             deleted_acl,
+        )
+        wait_for_config_admin_seed(
+            broker["port"],
+            config_admin_topic,
+            alter_configs_values,
+            incremental_configs_values,
+            final_config_values,
         )
         wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
@@ -10851,6 +11098,7 @@ def main():
             f"delegation_tokens_checked=true, "
             f"finalized_features_checked=true, "
             f"acl_admin_checked=true, "
+            f"config_admin_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -11504,6 +11752,48 @@ def self_test():
             raise TestError(
                 f"DescribeConfigs fixture parser failed: {described_configs}"
             )
+
+        alter_configs_fixture = struct.pack(">i", 182)
+        alter_configs_fixture += b"\x00"  # response header tagged fields
+        alter_configs_fixture += struct.pack(">i", 0)
+        alter_configs_fixture += write_compact_array_len(1)
+        alter_configs_fixture += struct.pack(">h", 0)
+        alter_configs_fixture += write_compact_string(None)
+        alter_configs_fixture += b"\x02"  # resource_type=TOPIC
+        alter_configs_fixture += write_compact_string("alter-cfg-self-test")
+        alter_configs_fixture += b"\x00"  # resource response tagged fields
+        alter_configs_fixture += b"\x00"  # response tagged fields
+        altered_configs = parse_alter_configs_response(
+            alter_configs_fixture,
+            182,
+            "AlterConfigs",
+        )
+        require_alter_configs_success(
+            altered_configs,
+            "alter-cfg-self-test",
+            "AlterConfigs",
+        )
+
+        incremental_configs_fixture = struct.pack(">i", 183)
+        incremental_configs_fixture += b"\x00"  # response header tagged fields
+        incremental_configs_fixture += struct.pack(">i", 0)
+        incremental_configs_fixture += write_compact_array_len(1)
+        incremental_configs_fixture += struct.pack(">h", 0)
+        incremental_configs_fixture += write_compact_string(None)
+        incremental_configs_fixture += b"\x02"  # resource_type=TOPIC
+        incremental_configs_fixture += write_compact_string("inc-cfg-self-test")
+        incremental_configs_fixture += b"\x00"  # resource response tagged fields
+        incremental_configs_fixture += b"\x00"  # response tagged fields
+        incremented_configs = parse_alter_configs_response(
+            incremental_configs_fixture,
+            183,
+            "IncrementalAlterConfigs",
+        )
+        require_alter_configs_success(
+            incremented_configs,
+            "inc-cfg-self-test",
+            "IncrementalAlterConfigs",
+        )
 
         describe_log_dirs_fixture = struct.pack(">i", 167)
         describe_log_dirs_fixture += b"\x00"  # response header tagged fields
