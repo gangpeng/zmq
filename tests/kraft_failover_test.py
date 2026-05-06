@@ -43,6 +43,8 @@ ZMQ_BIN = os.environ.get("ZMQ_BIN", "./zig-out/bin/zmq")
 PORT_BASE = int(os.environ.get("ZMQ_KRAFT_CONTROLLER_PORT_BASE", "39093"))
 BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
+ERROR_NONE = 0
+ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3
 ERROR_GROUP_ID_NOT_FOUND = 69
 ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
@@ -526,6 +528,62 @@ def wait_for_topic(port, name):
             correlation_id += 1
             time.sleep(0.25)
     raise TestError(f"topic {name!r} was not created: {last_error}")
+
+
+def parse_delete_topics_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    response_count, pos = read_compact_array_len(response, pos)
+    responses = []
+    for _ in range(response_count):
+        name, pos = read_compact_string(response, pos)
+        if pos + 16 > len(response):
+            raise TestError("buffer underflow while reading DeleteTopics topic id")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        responses.append(
+            {
+                "name": name,
+                "topic_id": topic_id,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"DeleteTopics response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "responses": responses}
+
+
+def delete_topic(port, topic, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += b"\x00" * 16  # topic_id omitted; delete by name
+    body += b"\x00"  # topic tagged fields
+    body += struct.pack(">i", 30000)  # timeout_ms
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 20, 6, correlation_id, body)
+    return parse_delete_topics_response(response, correlation_id)
+
+
+def require_delete_topics_result(response, topic, expected_error_codes, label):
+    if isinstance(expected_error_codes, int):
+        expected_error_codes = (expected_error_codes,)
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"{label} throttle mismatch: {response}")
+    responses = response["responses"]
+    if len(responses) != 1:
+        raise TestError(f"{label} response count mismatch: {response}")
+    item = responses[0]
+    if (
+        item["name"] != topic
+        or item["error_code"] not in expected_error_codes
+        or item["error_message"] is not None
+    ):
+        raise TestError(f"{label} result mismatch: {response}")
 
 
 def produce(port, topic, payload, correlation_id):
@@ -3368,6 +3426,67 @@ def wait_for_describe_topic_partitions_count_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"DescribeTopicPartitions count did not recover for {topic!r}: {last_error}"
+    )
+
+
+def require_deleted_topic_absent(response, topic):
+    if response["next_cursor"] is not None:
+        raise TestError(f"Deleted topic DescribeTopicPartitions cursor: {response}")
+    topics = response["topics"]
+    if len(topics) != 1 or topics[0]["name"] != topic:
+        raise TestError(f"Deleted topic DescribeTopicPartitions mismatch: {response}")
+    topic_result = topics[0]
+    if topic_result["error_code"] != ERROR_UNKNOWN_TOPIC_OR_PARTITION:
+        raise TestError(f"Deleted topic still visible: {response}")
+    if topic_result["partitions"]:
+        raise TestError(f"Deleted topic partitions still visible: {response}")
+
+
+def wait_for_delete_topics_seed(port, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8460
+    last_error = None
+    while time.time() < deadline:
+        try:
+            deleted = delete_topic(port, topic, correlation_id)
+            require_delete_topics_result(
+                deleted,
+                topic,
+                (ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                "DeleteTopics",
+            )
+            described = describe_topic_partitions(port, topic, correlation_id + 1)
+            require_deleted_topic_absent(described, topic)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(f"DeleteTopics seed did not recover for {topic!r}: {last_error}")
+
+
+def wait_for_deleted_topic_checkpoint(port, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8480
+    last_error = None
+    while time.time() < deadline:
+        try:
+            described = describe_topic_partitions(port, topic, correlation_id)
+            require_deleted_topic_absent(described, topic)
+            deleted = delete_topic(port, topic, correlation_id + 1)
+            require_delete_topics_result(
+                deleted,
+                topic,
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                "DeleteTopics deleted-topic checkpoint",
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"Deleted topic checkpoint did not recover for {topic!r}: {last_error}"
     )
 
 
@@ -9728,6 +9847,7 @@ def main():
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
         delete_records_topic = f"{topic}-delete-records"
+        delete_topics_topic = f"{topic}-delete-topics"
         create_partitions_topic = f"{topic}-create-partitions"
         config_admin_topic = f"{topic}-config-admin"
         quota_client_id = f"{group}-quota-client"
@@ -9791,6 +9911,7 @@ def main():
         wait_for_topic(broker["port"], txn_topic)
         wait_for_topic(broker["port"], idempotent_topic)
         wait_for_topic(broker["port"], delete_records_topic)
+        wait_for_topic(broker["port"], delete_topics_topic)
         wait_for_topic(broker["port"], create_partitions_topic)
         wait_for_topic(broker["port"], config_admin_topic)
         wait_for_topic(broker["port"], kip848_subscription_topic)
@@ -9821,6 +9942,11 @@ def main():
             )
         delete_records_low_watermark = delete_records_first_offset + 1
         delete_records_end_offset = delete_records_second_offset + 1
+        wait_for_produce(
+            broker["port"],
+            delete_topics_topic,
+            b"delete-topics-before-delete",
+        )
 
         def wait_for_delete_records_probe():
             wait_for_delete_records_checkpoint(
@@ -9828,6 +9954,12 @@ def main():
                 delete_records_topic,
                 delete_records_low_watermark,
                 delete_records_end_offset,
+            )
+
+        def wait_for_delete_topics_probe():
+            wait_for_deleted_topic_checkpoint(
+                broker["port"],
+                delete_topics_topic,
             )
 
         def wait_for_topic_partitions_probe():
@@ -9906,6 +10038,7 @@ def main():
 
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
+            wait_for_delete_topics_probe()
             wait_for_create_partitions_probe()
             wait_for_client_quotas_probe()
             wait_for_scram_credentials_probe()
@@ -9945,6 +10078,10 @@ def main():
 
         wait_for_topic_partitions_probe()
         wait_for_delete_records_probe()
+        wait_for_delete_topics_seed(
+            broker["port"],
+            delete_topics_topic,
+        )
         wait_for_create_partitions_mutation(
             broker["port"],
             create_partitions_topic,
@@ -11091,6 +11228,7 @@ def main():
             f"offset_fetch_v8_grouped_checked=true, "
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
+            f"delete_topics_checked=true, "
             f"create_partitions_checked=true, "
             f"client_quotas_checked=true, "
             f"scram_credentials_checked=true, "
@@ -11330,6 +11468,24 @@ def self_test():
         delete_groups_fixture += struct.pack(">h", 0)
         if parse_delete_groups_response(delete_groups_fixture, 145, "delete-groups-self-test") != 0:
             raise TestError("DeleteGroups fixture parser failed")
+
+        delete_topics_fixture = struct.pack(">i", 146)
+        delete_topics_fixture += b"\x00"  # response header tagged fields
+        delete_topics_fixture += struct.pack(">i", 0)
+        delete_topics_fixture += write_compact_array_len(1)
+        delete_topics_fixture += write_compact_string("delete-topics-self-test")
+        delete_topics_fixture += bytes(range(16))
+        delete_topics_fixture += struct.pack(">h", ERROR_NONE)
+        delete_topics_fixture += write_compact_string(None)
+        delete_topics_fixture += b"\x00"  # topic tagged fields
+        delete_topics_fixture += b"\x00"  # response tagged fields
+        deleted_topics = parse_delete_topics_response(delete_topics_fixture, 146)
+        require_delete_topics_result(
+            deleted_topics,
+            "delete-topics-self-test",
+            ERROR_NONE,
+            "DeleteTopics fixture",
+        )
 
         init_fixture = struct.pack(">iihqh", 44, 0, 0, 1000, 0)
         identity = parse_init_producer_id_response(init_fixture, 44)
@@ -11931,6 +12087,33 @@ def self_test():
             raise TestError(
                 f"DescribeTopicPartitions fixture parser failed: {topic_partitions}"
             )
+
+        deleted_topic_partitions_fixture = struct.pack(">i", 184)
+        deleted_topic_partitions_fixture += b"\x00"  # response header tagged fields
+        deleted_topic_partitions_fixture += struct.pack(">i", 0)
+        deleted_topic_partitions_fixture += write_compact_array_len(1)
+        deleted_topic_partitions_fixture += struct.pack(
+            ">h",
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        )
+        deleted_topic_partitions_fixture += write_compact_string(
+            "deleted-dtp-self-test"
+        )
+        deleted_topic_partitions_fixture += b"\x00" * 16
+        deleted_topic_partitions_fixture += b"\x00"  # is_internal=false
+        deleted_topic_partitions_fixture += write_compact_array_len(0)
+        deleted_topic_partitions_fixture += struct.pack(">i", -2147483648)
+        deleted_topic_partitions_fixture += b"\x00"  # topic tagged fields
+        deleted_topic_partitions_fixture += b"\x00"  # next_cursor=null
+        deleted_topic_partitions_fixture += b"\x00"  # response tagged fields
+        deleted_topic_partitions = parse_describe_topic_partitions_response(
+            deleted_topic_partitions_fixture,
+            184,
+        )
+        require_deleted_topic_absent(
+            deleted_topic_partitions,
+            "deleted-dtp-self-test",
+        )
 
         describe_cluster_fixture = struct.pack(">i", 165)
         describe_cluster_fixture += b"\x00"  # response header tagged fields
