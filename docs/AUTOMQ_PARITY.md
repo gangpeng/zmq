@@ -673,6 +673,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   invalid-request or storage-error responses when client frames are malformed
   or response materialization/serialization fails, instead of silently dropping
   the connection.
+  Normal AutoMQ read paths for GetKVs, AutomqGetNodes,
+  AutomqGetPartitionSnapshot, DescribeLicense, ExportClusterManifest, and
+  DescribeStreams now use the same generated invalid-request/storage-error
+  fallbacks for malformed frames and response materialization or serialization
+  failures.
   Committed-offset authorization-denial builders for OffsetCommit,
   OffsetFetch, and OffsetDelete now also fail closed with generated
   invalid-request or storage-error responses when denied frames are malformed or
