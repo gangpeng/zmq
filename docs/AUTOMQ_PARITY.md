@@ -661,6 +661,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DeleteGroups now also fail closed with generated invalid-request or
   storage-error responses when denied frames are malformed or denial response
   construction fails.
+  Topic/data authorization-denial builders for Metadata, Produce, Fetch,
+  ListOffsets, DeleteRecords, and OffsetForLeaderEpoch now likewise fail closed
+  with generated invalid-request or storage-error responses when denied frames
+  are malformed or denial response construction fails.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

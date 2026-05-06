@@ -6327,20 +6327,23 @@ pub const Broker = struct {
 
         if (!validateMetadataRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied Metadata request", .{});
-            return null;
+            return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied Metadata request: {}", .{err});
-            return null;
+            return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeMetadataRequest(&req);
 
         const requested_topics = req.topics orelse &.{};
         var topics: []TopicResult = &.{};
         if (requested_topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, requested_topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, requested_topics.len) catch |err| {
+                log.warn("Metadata denied response allocation failed: {}", .{err});
+                return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer if (topics.len > 0) self.allocator.free(topics);
 
@@ -6363,7 +6366,10 @@ pub const Broker = struct {
             .topics = topics,
             .cluster_authorized_operations = std.math.minInt(i32),
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Metadata denied response serialization failed", .{});
+            return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleProduceAuthorizationError(
@@ -6382,13 +6388,13 @@ pub const Broker = struct {
 
         if (!validateProduceRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied Produce request", .{});
-            return null;
+            return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied Produce request: {}", .{err});
-            return null;
+            return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeProduceRequest(&req);
 
@@ -6397,7 +6403,10 @@ pub const Broker = struct {
 
         var responses: []TopicResult = &.{};
         if (req.topic_data.len > 0) {
-            responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch return null;
+            responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch |err| {
+                log.warn("Produce denied topic response allocation failed: {}", .{err});
+                return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize Produce authorization response");
+            };
         }
         var responses_init: usize = 0;
         defer {
@@ -6408,7 +6417,10 @@ pub const Broker = struct {
         for (req.topic_data) |topic_req| {
             var partitions: []PartitionResult = &.{};
             if (topic_req.partition_data.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic_req.partition_data.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partition_data.len) catch |err| {
+                    log.warn("Produce denied partition response allocation failed: {}", .{err});
+                    return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize Produce authorization response");
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -6438,6 +6450,34 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .node_endpoints = &.{},
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Produce denied response serialization failed", .{});
+            return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize Produce authorization response");
+        };
+    }
+
+    fn produceErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.produce_response.ProduceResponse;
+        const TopicResult = Resp.TopicProduceResponse;
+        const PartitionResult = TopicResult.PartitionProduceResponse;
+        const partitions = [_]PartitionResult{.{
+            .index = -1,
+            .error_code = @intFromEnum(err_code),
+            .base_offset = -1,
+            .log_append_time_ms = -1,
+            .log_start_offset = -1,
+            .record_errors = &.{},
+            .error_message = message,
+        }};
+        const responses = [_]TopicResult{.{
+            .name = "",
+            .partition_responses = &partitions,
+        }};
+        const resp = Resp{
+            .responses = &responses,
+            .throttle_time_ms = 0,
+            .node_endpoints = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -6457,19 +6497,22 @@ pub const Broker = struct {
 
         if (!validateFetchRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied Fetch request", .{});
-            return null;
+            return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied Fetch request: {}", .{err});
-            return null;
+            return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeFetchRequest(&req);
 
         var responses: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            responses = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            responses = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("Fetch denied topic response allocation failed: {}", .{err});
+                return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var responses_init: usize = 0;
         defer {
@@ -6480,7 +6523,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResult = &.{};
             if (topic_req.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch |err| {
+                    log.warn("Fetch denied partition response allocation failed: {}", .{err});
+                    return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -6512,6 +6558,38 @@ pub const Broker = struct {
             .error_code = if (req.topics.len == 0) @intFromEnum(err_code) else @intFromEnum(ErrorCode.none),
             .session_id = 0,
             .responses = responses[0..responses_init],
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Fetch denied response serialization failed", .{});
+            return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn fetchErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.fetch_response.FetchResponse;
+        const TopicResult = Resp.FetchableTopicResponse;
+        const PartitionResult = TopicResult.PartitionData;
+        const partitions = [_]PartitionResult{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+            .high_watermark = 0,
+            .last_stable_offset = -1,
+            .log_start_offset = -1,
+            .aborted_transactions = null,
+            .preferred_read_replica = -1,
+            .records = null,
+        }};
+        const responses = [_]TopicResult{.{
+            .topic = "",
+            .topic_id = zeroUuid(),
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .session_id = 0,
+            .responses = &responses,
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -6669,19 +6747,22 @@ pub const Broker = struct {
 
         if (!validateListOffsetsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied ListOffsets request", .{});
-            return null;
+            return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ListOffsets request: {}", .{err});
-            return null;
+            return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeListOffsetsRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("ListOffsets denied topic response allocation failed: {}", .{err});
+                return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -6692,7 +6773,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResult = &.{};
             if (topic_req.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch |err| {
+                    log.warn("ListOffsets denied partition response allocation failed: {}", .{err});
+                    return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -6720,6 +6804,32 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListOffsets denied response serialization failed", .{});
+            return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn listOffsetsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.list_offsets_response.ListOffsetsResponse;
+        const TopicResult = Resp.ListOffsetsTopicResponse;
+        const PartitionResult = TopicResult.ListOffsetsPartitionResponse;
+        const partitions = [_]PartitionResult{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+            .old_style_offsets = &.{},
+            .timestamp = -1,
+            .offset = -1,
+            .leader_epoch = -1,
+        }};
+        const topics = [_]TopicResult{.{
+            .name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -6739,19 +6849,22 @@ pub const Broker = struct {
 
         if (!validateDeleteRecordsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied DeleteRecords request", .{});
-            return null;
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DeleteRecords request: {}", .{err});
-            return null;
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDeleteRecordsRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("DeleteRecords denied topic response allocation failed: {}", .{err});
+                return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -6762,7 +6875,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResult = &.{};
             if (topic_req.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch |err| {
+                    log.warn("DeleteRecords denied partition response allocation failed: {}", .{err});
+                    return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -6787,6 +6903,29 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteRecords denied response serialization failed", .{});
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn deleteRecordsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.delete_records_response.DeleteRecordsResponse;
+        const TopicResult = Resp.DeleteRecordsTopicResult;
+        const PartitionResult = TopicResult.DeleteRecordsPartitionResult;
+        const partitions = [_]PartitionResult{.{
+            .partition_index = -1,
+            .low_watermark = -1,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const topics = [_]TopicResult{.{
+            .name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -6806,19 +6945,22 @@ pub const Broker = struct {
 
         if (!validateOffsetForLeaderEpochRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied OffsetForLeaderEpoch request", .{});
-            return null;
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied OffsetForLeaderEpoch request: {}", .{err});
-            return null;
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetForLeaderEpochRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("OffsetForLeaderEpoch denied topic response allocation failed: {}", .{err});
+                return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -6829,7 +6971,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResult = &.{};
             if (topic_req.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch |err| {
+                    log.warn("OffsetForLeaderEpoch denied partition response allocation failed: {}", .{err});
+                    return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -6855,7 +7000,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetForLeaderEpoch denied response serialization failed", .{});
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleOffsetCommitAuthorizationError(
@@ -30165,6 +30313,112 @@ fn readGeneratedTopLevelErrorCode(comptime RespType: type, response: []const u8,
     return resp.error_code;
 }
 
+fn addTopicDataAuthorizationAcls(broker: *Broker) !void {
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .write, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .read, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .delete, .allow, "*");
+}
+
+fn readTopicDataAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    switch (api_key) {
+        0 => {
+            const Resp = generated.produce_response.ProduceResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedProduceResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.responses.len);
+            try testing.expectEqual(@as(usize, 1), resp.responses[0].partition_responses.len);
+            return resp.responses[0].partition_responses[0].error_code;
+        },
+        1 => {
+            const Resp = generated.fetch_response.FetchResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedFetchResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.responses.len);
+            try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
+            return resp.responses[0].partitions[0].error_code;
+        },
+        2 => {
+            const Resp = generated.list_offsets_response.ListOffsetsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedListOffsetsResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+            return resp.topics[0].partitions[0].error_code;
+        },
+        3 => {
+            const Resp = generated.metadata_response.MetadataResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedMetadataResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            return resp.topics[0].error_code;
+        },
+        21 => {
+            const Resp = generated.delete_records_response.DeleteRecordsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer {
+                for (resp.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+            }
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+            return resp.topics[0].partitions[0].error_code;
+        },
+        23 => {
+            const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer {
+                for (resp.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+            }
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+            return resp.topics[0].partitions[0].error_code;
+        },
+        else => return error.UnsupportedApiKey,
+    }
+}
+
+fn expectTopicDataAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readTopicDataAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
 fn readGroupCoordinatorAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
     var rpos: usize = 0;
     var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
@@ -34885,6 +35139,287 @@ test "Broker.handleRequest OffsetForLeaderEpoch authorization denial uses genera
     try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition);
     try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
     try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].end_offset);
+}
+
+test "Broker.handleRequest topic data authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addTopicDataAuthorizationAcls(&broker);
+
+    const cases = [_]struct {
+        api_key: i16,
+        api_version: i16,
+        correlation_id: i32,
+    }{
+        .{ .api_key = 3, .api_version = 12, .correlation_id = 3015 },
+        .{ .api_key = 0, .api_version = 9, .correlation_id = 15 },
+        .{ .api_key = 1, .api_version = 12, .correlation_id = 1015 },
+        .{ .api_key = 2, .api_version = 6, .correlation_id = 2015 },
+        .{ .api_key = 21, .api_version = 2, .correlation_id = 2115 },
+        .{ .api_key = 23, .api_version = 4, .correlation_id = 2315 },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, case.api_key, case.api_version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.api_version));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readTopicDataAuthorizationErrorCode(response.?, case.api_key, case.api_version, case.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+    }
+}
+
+test "Broker.handleRequest topic data authorization denial fails closed when serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addTopicDataAuthorizationAcls(&broker);
+
+    {
+        const Req = generated.metadata_request.MetadataRequest;
+        const req = Req{
+            .topics = &.{},
+            .allow_auto_topic_creation = false,
+            .include_topic_authorized_operations = false,
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 3, 12, 3016, header_mod.requestHeaderVersion(3, 12));
+        req.serialize(&buf, &pos, 12);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 3, 12, 3016, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.produce_request.ProduceRequest;
+        const req = Req{
+            .transactional_id = null,
+            .acks = 1,
+            .timeout_ms = 30000,
+            .topic_data = &.{},
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 0, 9, 16, header_mod.requestHeaderVersion(0, 9));
+        req.serialize(&buf, &pos, 9);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 0, 9, 16, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.fetch_request.FetchRequest;
+        const req = Req{
+            .replica_id = -1,
+            .max_wait_ms = 500,
+            .min_bytes = 1,
+            .max_bytes = 1048576,
+            .isolation_level = 0,
+            .session_id = 0,
+            .session_epoch = 0,
+            .topics = &.{},
+            .rack_id = "",
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 1, 12, 1016, header_mod.requestHeaderVersion(1, 12));
+        req.serialize(&buf, &pos, 12);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 1, 12, 1016, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.list_offsets_request.ListOffsetsRequest;
+        const req = Req{
+            .replica_id = -1,
+            .isolation_level = 0,
+            .topics = &.{},
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 2, 6, 2016, header_mod.requestHeaderVersion(2, 6));
+        req.serialize(&buf, &pos, 6);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 2, 6, 2016, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.delete_records_request.DeleteRecordsRequest;
+        const req = Req{
+            .topics = &.{},
+            .timeout_ms = 30000,
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 21, 2, 2116, header_mod.requestHeaderVersion(21, 2));
+        req.serialize(&buf, &pos, 2);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 21, 2, 2116, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+        const req = Req{
+            .replica_id = -1,
+            .topics = &.{},
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 23, 4, 2316, header_mod.requestHeaderVersion(23, 4));
+        req.serialize(&buf, &pos, 4);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 23, 4, 2316, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest topic data authorization denial fails closed when response construction fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addTopicDataAuthorizationAcls(&broker);
+
+    {
+        const Req = generated.metadata_request.MetadataRequest;
+        const Topic = Req.MetadataRequestTopic;
+        const topics = [_]Topic{.{
+            .name = "metadata-denied-storage-topic",
+        }};
+        const req = Req{
+            .topics = &topics,
+            .allow_auto_topic_creation = false,
+            .include_topic_authorized_operations = false,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 3, 12, 3017, header_mod.requestHeaderVersion(3, 12));
+        req.serialize(&buf, &pos, 12);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 3, 12, 3017, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.produce_request.ProduceRequest;
+        const Topic = Req.TopicProduceData;
+        const Partition = Topic.PartitionProduceData;
+        const partitions = [_]Partition{.{
+            .index = 0,
+            .records = "construction-fail-records",
+        }};
+        const topics = [_]Topic{.{
+            .name = "produce-denied-storage-topic",
+            .partition_data = &partitions,
+        }};
+        const req = Req{
+            .transactional_id = null,
+            .acks = 1,
+            .timeout_ms = 30000,
+            .topic_data = &topics,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 0, 9, 17, header_mod.requestHeaderVersion(0, 9));
+        req.serialize(&buf, &pos, 9);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 0, 9, 17, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.fetch_request.FetchRequest;
+        const Topic = Req.FetchTopic;
+        const Partition = Topic.FetchPartition;
+        const partitions = [_]Partition{.{
+            .partition = 0,
+            .current_leader_epoch = -1,
+            .fetch_offset = 0,
+            .last_fetched_epoch = -1,
+            .log_start_offset = 0,
+            .partition_max_bytes = 1048576,
+        }};
+        const topics = [_]Topic{.{
+            .topic = "fetch-denied-storage-topic",
+            .partitions = &partitions,
+        }};
+        const req = Req{
+            .replica_id = -1,
+            .max_wait_ms = 500,
+            .min_bytes = 1,
+            .max_bytes = 1048576,
+            .isolation_level = 0,
+            .session_id = 0,
+            .session_epoch = 0,
+            .topics = &topics,
+            .rack_id = "",
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 1, 12, 1017, header_mod.requestHeaderVersion(1, 12));
+        req.serialize(&buf, &pos, 12);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 1, 12, 1017, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.list_offsets_request.ListOffsetsRequest;
+        const Topic = Req.ListOffsetsTopic;
+        const Partition = Topic.ListOffsetsPartition;
+        const partitions = [_]Partition{.{
+            .partition_index = 0,
+            .current_leader_epoch = -1,
+            .timestamp = -1,
+        }};
+        const topics = [_]Topic{.{
+            .name = "list-offsets-denied-storage-topic",
+            .partitions = &partitions,
+        }};
+        const req = Req{
+            .replica_id = -1,
+            .isolation_level = 0,
+            .topics = &topics,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 2, 6, 2017, header_mod.requestHeaderVersion(2, 6));
+        req.serialize(&buf, &pos, 6);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 2, 6, 2017, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.delete_records_request.DeleteRecordsRequest;
+        const Topic = Req.DeleteRecordsTopic;
+        const Partition = Topic.DeleteRecordsPartition;
+        const partitions = [_]Partition{.{
+            .partition_index = 0,
+            .offset = 5,
+        }};
+        const topics = [_]Topic{.{
+            .name = "delete-records-denied-storage-topic",
+            .partitions = &partitions,
+        }};
+        const req = Req{
+            .topics = &topics,
+            .timeout_ms = 30000,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 21, 2, 2117, header_mod.requestHeaderVersion(21, 2));
+        req.serialize(&buf, &pos, 2);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 21, 2, 2117, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+        const Topic = Req.OffsetForLeaderTopic;
+        const Partition = Topic.OffsetForLeaderPartition;
+        const partitions = [_]Partition{.{
+            .partition = 0,
+            .current_leader_epoch = -1,
+            .leader_epoch = 0,
+        }};
+        const topics = [_]Topic{.{
+            .topic = "leader-epoch-denied-storage-topic",
+            .partitions = &partitions,
+        }};
+        const req = Req{
+            .replica_id = -1,
+            .topics = &topics,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 23, 4, 2317, header_mod.requestHeaderVersion(23, 4));
+        req.serialize(&buf, &pos, 4);
+
+        try expectTopicDataAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 23, 4, 2317, 2, ErrorCode.kafka_storage_error);
+    }
 }
 
 test "Broker.handleRequest WriteTxnMarkers v1 returns generated response and writes control batch" {
