@@ -26369,7 +26369,10 @@ pub const Broker = struct {
         };
         defer self.freeDescribeAclsResources(resp.resources);
 
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeAcls response serialization failed", .{});
+            return self.describeAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeAcls response");
+        };
     }
 
     fn describeAclsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
@@ -39918,6 +39921,42 @@ test "Broker.handleRequest DescribeAcls fails closed when response materializati
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
     try testing.expectEqual(@as(usize, 0), resp.resources.len);
+}
+
+test "Broker.handleRequest DescribeAcls fails closed when response serialization fails" {
+    const Req = generated.describe_acls_request.DescribeAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-serialize-fail-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:alice",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 29, 2, 2908, header_mod.requestHeaderVersion(29, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 29, 2, 2908);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest DescribeAcls authorization denial uses generated response" {
