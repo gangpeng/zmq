@@ -1327,7 +1327,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
   health, and passes all 37 checks including restart recovery and cross-node
   produce/fetch visibility.
   The local `test-kraft-failover` gate has been re-executed successfully after
-  the single-node startup readiness fix.
+  adding AutoMQ stream/node tag-clearing coverage.
   Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load. Status:
   rack-aware planning has unit coverage for cross-rack target preference,
