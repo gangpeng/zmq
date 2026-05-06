@@ -8410,20 +8410,23 @@ pub const Broker = struct {
 
         if (!validateVoteRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied Vote request", .{});
-            return null;
+            return self.voteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied Vote request: {}", .{err});
-            return null;
+            return self.voteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeVoteRequest(&req);
 
         var topics: []TopicResult = &.{};
         var topics_init: usize = 0;
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("Vote denied topic response allocation failed: {}", .{err});
+                return self.voteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer {
             for (topics[0..topics_init]) |topic| {
@@ -8435,7 +8438,10 @@ pub const Broker = struct {
         for (req.topics) |topic| {
             var partitions: []PartitionResult = &.{};
             if (topic.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch |err| {
+                    log.warn("Vote denied partition response allocation failed: {}", .{err});
+                    return self.voteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -8463,6 +8469,19 @@ pub const Broker = struct {
             .topics = topics[0..topics_init],
             .node_endpoints = &.{},
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Vote denied response serialization failed", .{});
+            return self.voteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn voteErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.vote_response.VoteResponse;
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .topics = &.{},
+            .node_endpoints = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -8482,20 +8501,23 @@ pub const Broker = struct {
 
         if (!validateBeginQuorumEpochRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied BeginQuorumEpoch request", .{});
-            return null;
+            return self.beginQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied BeginQuorumEpoch request: {}", .{err});
-            return null;
+            return self.beginQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeBeginQuorumEpochRequest(&req);
 
         var topics: []TopicResult = &.{};
         var topics_init: usize = 0;
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("BeginQuorumEpoch denied topic response allocation failed: {}", .{err});
+                return self.beginQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer {
             for (topics[0..topics_init]) |topic| {
@@ -8507,7 +8529,10 @@ pub const Broker = struct {
         for (req.topics) |topic| {
             var partitions: []PartitionResult = &.{};
             if (topic.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch |err| {
+                    log.warn("BeginQuorumEpoch denied partition response allocation failed: {}", .{err});
+                    return self.beginQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -8534,6 +8559,19 @@ pub const Broker = struct {
             .topics = topics[0..topics_init],
             .node_endpoints = &.{},
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("BeginQuorumEpoch denied response serialization failed", .{});
+            return self.beginQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn beginQuorumEpochErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .topics = &.{},
+            .node_endpoints = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -8553,20 +8591,23 @@ pub const Broker = struct {
 
         if (!validateEndQuorumEpochRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied EndQuorumEpoch request", .{});
-            return null;
+            return self.endQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied EndQuorumEpoch request: {}", .{err});
-            return null;
+            return self.endQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeEndQuorumEpochRequest(&req);
 
         var topics: []TopicResult = &.{};
         var topics_init: usize = 0;
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("EndQuorumEpoch denied topic response allocation failed: {}", .{err});
+                return self.endQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer {
             for (topics[0..topics_init]) |topic| {
@@ -8578,7 +8619,10 @@ pub const Broker = struct {
         for (req.topics) |topic| {
             var partitions: []PartitionResult = &.{};
             if (topic.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch |err| {
+                    log.warn("EndQuorumEpoch denied partition response allocation failed: {}", .{err});
+                    return self.endQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -8603,6 +8647,19 @@ pub const Broker = struct {
         const resp = Resp{
             .error_code = @intFromEnum(err_code),
             .topics = topics[0..topics_init],
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("EndQuorumEpoch denied response serialization failed", .{});
+            return self.endQuorumEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn endQuorumEpochErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .topics = &.{},
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -53196,6 +53253,220 @@ test "Broker.handleRequest EndQuorumEpoch authorization denial uses generated re
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[1].error_code);
     try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
     try testing.expectEqual(@as(i32, 3), raft.current_epoch);
+}
+
+test "Broker.handleRequest quorum authorization denial rejects malformed requests" {
+    const VoteResp = generated.vote_response.VoteResponse;
+    const BeginResp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+    const EndResp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .cluster_action, .allow, "*");
+
+    const cases = [_]struct {
+        api_key: i16,
+        version: i16,
+        correlation_id: i32,
+    }{
+        .{ .api_key = 52, .version = 1, .correlation_id = 5215 },
+        .{ .api_key = 53, .version = 1, .correlation_id = 5317 },
+        .{ .api_key = 54, .version = 1, .correlation_id = 5415 },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, case.api_key, case.version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.version));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = switch (case.api_key) {
+            52 => try readGeneratedTopLevelErrorCode(VoteResp, response.?, case.api_key, case.version, case.correlation_id),
+            53 => try readGeneratedTopLevelErrorCode(BeginResp, response.?, case.api_key, case.version, case.correlation_id),
+            54 => try readGeneratedTopLevelErrorCode(EndResp, response.?, case.api_key, case.version, case.correlation_id),
+            else => unreachable,
+        };
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+    }
+}
+
+test "Broker.handleRequest quorum authorization denial fails closed when response materialization fails" {
+    const VoteReq = generated.vote_request.VoteRequest;
+    const VoteResp = generated.vote_response.VoteResponse;
+    const BeginReq = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+    const BeginResp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+    const EndReq = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const EndResp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+    const zero_uuid = [_]u8{0} ** 16;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .cluster_action, .allow, "*");
+
+    {
+        const partitions = [_]VoteReq.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .candidate_epoch = 1,
+            .candidate_id = 2,
+            .candidate_directory_id = zero_uuid,
+            .voter_directory_id = zero_uuid,
+            .last_offset_epoch = 0,
+            .last_offset = 0,
+        }};
+        const topics = [_]VoteReq.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = VoteReq{ .cluster_id = "vote-denied-oom", .voter_id = 1, .topics = &topics };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 52, 1, 5216, header_mod.requestHeaderVersion(52, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(VoteResp, response.?, 52, 1, 5216);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+    }
+
+    {
+        const partitions = [_]BeginReq.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .voter_directory_id = zero_uuid,
+            .leader_id = 2,
+            .leader_epoch = 1,
+        }};
+        const topics = [_]BeginReq.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = BeginReq{ .cluster_id = "begin-denied-oom", .voter_id = 1, .topics = &topics };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 53, 1, 5318, header_mod.requestHeaderVersion(53, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(BeginResp, response.?, 53, 1, 5318);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+    }
+
+    {
+        const partitions = [_]EndReq.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .leader_id = 2,
+            .leader_epoch = 1,
+            .preferred_candidates = &.{},
+        }};
+        const topics = [_]EndReq.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = EndReq{ .cluster_id = "end-denied-oom", .topics = &topics };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 54, 1, 5416, header_mod.requestHeaderVersion(54, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(EndResp, response.?, 54, 1, 5416);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+    }
+}
+
+test "Broker.handleRequest quorum authorization denial fails closed when serialization fails" {
+    const VoteReq = generated.vote_request.VoteRequest;
+    const VoteResp = generated.vote_response.VoteResponse;
+    const BeginReq = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+    const BeginResp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+    const EndReq = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const EndResp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .cluster_action, .allow, "*");
+
+    {
+        const req = VoteReq{ .cluster_id = "vote-denied-serialize", .voter_id = 1, .topics = &.{} };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 52, 1, 5217, header_mod.requestHeaderVersion(52, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(VoteResp, response.?, 52, 1, 5217);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+    }
+
+    {
+        const req = BeginReq{ .cluster_id = "begin-denied-serialize", .voter_id = 1, .topics = &.{} };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 53, 1, 5319, header_mod.requestHeaderVersion(53, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(BeginResp, response.?, 53, 1, 5319);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+    }
+
+    {
+        const req = EndReq{ .cluster_id = "end-denied-serialize", .topics = &.{} };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 54, 1, 5417, header_mod.requestHeaderVersion(54, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(EndResp, response.?, 54, 1, 5417);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+    }
 }
 
 test "Broker.handleRequest BeginQuorumEpoch and EndQuorumEpoch reject truncated requests" {
