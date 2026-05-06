@@ -7959,13 +7959,13 @@ pub const Broker = struct {
 
         if (!validateListPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ListPartitionReassignments request", .{});
-            return null;
+            return self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ListPartitionReassignments request: {}", .{err});
-            return null;
+            return self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeListPartitionReassignmentsRequest(&req);
 
@@ -7975,7 +7975,10 @@ pub const Broker = struct {
             .error_message = "Not authorized",
             .topics = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListPartitionReassignments denied response serialization failed", .{});
+            return self.listPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize reassignment authorization response");
+        };
     }
 
     fn handleDescribeClientQuotasAuthorizationError(
@@ -8418,19 +8421,22 @@ pub const Broker = struct {
 
         if (!validateUpdateFeaturesRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied UpdateFeatures request", .{});
-            return null;
+            return self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied UpdateFeatures request: {}", .{err});
-            return null;
+            return self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeUpdateFeaturesRequest(&req);
 
         var results: []Result = &.{};
         if (req.feature_updates.len > 0) {
-            results = self.allocator.alloc(Result, req.feature_updates.len) catch return null;
+            results = self.allocator.alloc(Result, req.feature_updates.len) catch |err| {
+                log.warn("UpdateFeatures denied response materialization failed: {}", .{err});
+                return self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize feature authorization response");
+            };
         }
         defer if (results.len > 0) self.allocator.free(results);
 
@@ -8448,7 +8454,10 @@ pub const Broker = struct {
             .error_message = "Not authorized",
             .results = results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("UpdateFeatures denied response serialization failed", .{});
+            return self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize feature authorization response");
+        };
     }
 
     fn handleInitProducerIdAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -41591,6 +41600,41 @@ test "Broker.handleRequest UpdateFeatures authorization denial uses generated re
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[1].error_code);
 }
 
+test "Broker.handleRequest UpdateFeatures authorization denial fails closed when response materialization fails" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5720, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 57, 1, 5720);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expect(broker.finalized_features.get("metadata.version") == null);
+}
+
 test "Broker.handleRequest UpdateFeatures rejects truncated request" {
     const Resp = generated.update_features_response.UpdateFeaturesResponse;
 
@@ -49207,6 +49251,34 @@ test "Broker.handleRequest ListPartitionReassignments authorization denial uses 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
     try testing.expectEqualStrings("Not authorized", resp.error_message.?);
     try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest ListPartitionReassignments authorization denial fails closed when serialization fails" {
+    const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 46, 0, 4617, header_mod.requestHeaderVersion(46, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 46, 0, 4617);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ListPartitionReassignments rejects truncated request" {
