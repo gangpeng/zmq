@@ -23016,36 +23016,63 @@ pub const Broker = struct {
 
         if (!validateAlterUserScramCredentialsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed AlterUserScramCredentials request", .{});
-            return null;
+            return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AlterUserScramCredentials request: {}", .{err});
-            return null;
+            return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterUserScramCredentialsRequest(&req);
 
         const result_count = req.deletions.len + req.upsertions.len;
         var results: []Result = &.{};
         if (result_count > 0) {
-            results = self.allocator.alloc(Result, result_count) catch return null;
+            results = self.allocator.alloc(Result, result_count) catch |err| {
+                log.warn("AlterUserScramCredentials response materialization failed: {}", .{err});
+                return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize SCRAM credential response");
+            };
         }
         var results_init: usize = 0;
         defer if (results.len > 0) self.allocator.free(results);
 
         for (req.deletions) |deletion| {
-            results[results_init] = self.applyScramCredentialDeletion(deletion) catch return null;
+            results[results_init] = self.applyScramCredentialDeletion(deletion) catch |err| {
+                log.warn("AlterUserScramCredentials deletion failed: {}", .{err});
+                return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to apply SCRAM credential mutation");
+            };
             results_init += 1;
         }
         for (req.upsertions) |upsertion| {
-            results[results_init] = self.applyScramCredentialUpsertion(upsertion) catch return null;
+            results[results_init] = self.applyScramCredentialUpsertion(upsertion) catch |err| {
+                log.warn("AlterUserScramCredentials upsertion failed: {}", .{err});
+                return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to apply SCRAM credential mutation");
+            };
             results_init += 1;
         }
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results[0..results_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterUserScramCredentials response serialization failed", .{});
+            return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize SCRAM credential response");
+        };
+    }
+
+    fn alterUserScramCredentialsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+        const Result = Resp.AlterUserScramCredentialsResult;
+        const results = [_]Result{.{
+            .user = "",
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = &results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -29341,6 +29368,25 @@ fn freeDeserializedDescribeUserScramCredentialsResponse(resp: *const generated.d
 
 fn freeDeserializedAlterUserScramCredentialsResponse(resp: *const generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse) void {
     if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn expectAlterUserScramCredentialsErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(51, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedAlterUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("", resp.results[0].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].error_code);
+    try testing.expect(resp.results[0].error_message != null);
 }
 
 fn freeDeserializedUpdateFeaturesResponse(resp: *const generated.update_features_response.UpdateFeaturesResponse) void {
@@ -40607,7 +40653,11 @@ test "Broker.handleRequest AlterUserScramCredentials rejects truncated request" 
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 51, 0, 5103, header_mod.requestHeaderVersion(51, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterUserScramCredentialsErrorResponseBytes(response.?, 5103, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest AlterUserScramCredentials rejects trailing bytes" {
@@ -40621,7 +40671,76 @@ test "Broker.handleRequest AlterUserScramCredentials rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 51, 0, 5107, header_mod.requestHeaderVersion(51, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterUserScramCredentialsErrorResponseBytes(response.?, 5107, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest AlterUserScramCredentials fails closed when response materialization fails" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const salt = [_]u8{1} ** 32;
+    const salted_password = [_]u8{2} ** 32;
+    const upsertions = [_]Req.ScramCredentialUpsertion{.{
+        .name = "scram-materialize-fail",
+        .mechanism = 1,
+        .iterations = 4096,
+        .salt = &salt,
+        .salted_password = &salted_password,
+    }};
+    const req = Req{ .upsertions = &upsertions };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5108, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterUserScramCredentialsErrorResponseBytes(response.?, 5108, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.scram_authenticator.getCredential("scram-materialize-fail") == null);
+}
+
+test "Broker.handleRequest AlterUserScramCredentials fails closed when response serialization fails" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5109, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterUserScramCredentialsErrorResponseBytes(response.?, 5109, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest UpdateFeatures v0 finalizes supported feature" {

@@ -294,6 +294,9 @@ instead of silent connection closes;
 DescribeUserScramCredentials malformed frames now return generated
 invalid-request responses, and result materialization failures now surface
 storage errors instead of silent connection closes;
+AlterUserScramCredentials malformed frames now return generated
+invalid-request responses, and result materialization/serialization failures now
+surface storage errors instead of silent connection closes;
 UpdateFeatures malformed frames now return generated invalid-request responses,
 and response materialization/serialization failures now surface storage errors
 instead of silent connection closes;
