@@ -11594,13 +11594,13 @@ pub const Broker = struct {
 
         if (!validateMetadataRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed Metadata request", .{});
-            return null;
+            return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed Metadata request: {}", .{err});
-            return null;
+            return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeMetadataRequest(&req);
 
@@ -11612,9 +11612,15 @@ pub const Broker = struct {
         const requested_topics = req.topics orelse &.{};
         var topics: []TopicResult = &.{};
         if (requested_all) {
-            topics = self.allocator.alloc(TopicResult, self.topics.count()) catch return null;
+            topics = self.allocator.alloc(TopicResult, self.topics.count()) catch |err| {
+                log.warn("Metadata all-topic response allocation failed: {}", .{err});
+                return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         } else {
-            topics = self.allocator.alloc(TopicResult, requested_topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, requested_topics.len) catch |err| {
+                log.warn("Metadata requested-topic response allocation failed: {}", .{err});
+                return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -11625,12 +11631,18 @@ pub const Broker = struct {
         if (requested_all) {
             var topics_iter = self.topics.iterator();
             while (topics_iter.next()) |entry| {
-                topics[topics_init] = self.buildMetadataTopicResponse(entry.value_ptr) catch return null;
+                topics[topics_init] = self.buildMetadataTopicResponse(entry.value_ptr) catch |err| {
+                    log.warn("Metadata topic response materialization failed for {s}: {}", .{ entry.value_ptr.name, err });
+                    return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 topics_init += 1;
             }
         } else {
             for (requested_topics) |topic_req| {
-                topics[topics_init] = self.buildRequestedMetadataTopicResponse(topic_req, req.allow_auto_topic_creation, api_version) catch return null;
+                topics[topics_init] = self.buildRequestedMetadataTopicResponse(topic_req, req.allow_auto_topic_creation, api_version) catch |err| {
+                    log.warn("Metadata requested-topic response materialization failed: {}", .{err});
+                    return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 topics_init += 1;
             }
         }
@@ -11641,6 +11653,28 @@ pub const Broker = struct {
             .cluster_id = "zmq-cluster",
             .controller_id = self.node_id,
             .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn metadataErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.metadata_response.MetadataResponse;
+
+        const topics = [_]Resp.MetadataResponseTopic{.{
+            .error_code = @intFromEnum(err_code),
+            .name = "",
+            .topic_id = zeroUuid(),
+            .is_internal = false,
+            .partitions = &.{},
+            .topic_authorized_operations = std.math.minInt(i32),
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .brokers = &.{},
+            .cluster_id = "zmq-cluster",
+            .controller_id = -1,
+            .topics = &topics,
+            .cluster_authorized_operations = std.math.minInt(i32),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -12607,18 +12641,21 @@ pub const Broker = struct {
 
         if (!validateFindCoordinatorRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed FindCoordinator request", .{});
-            return null;
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode FindCoordinator request: {}", .{err});
-            return null;
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeFindCoordinatorRequest(&req);
 
         const coordinator = self.findCoordinatorOutcome(req.key, req.key_type, api_version);
-        const coordinators = self.findCoordinatorResults(req, api_version) catch return null;
+        const coordinators = self.findCoordinatorResults(req, api_version) catch |err| {
+            log.warn("FindCoordinator response materialization failed: {}", .{err});
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize coordinator response");
+        };
         defer if (coordinators.len > 0) self.allocator.free(coordinators);
 
         const resp = Resp{
@@ -12629,6 +12666,42 @@ pub const Broker = struct {
             .host = coordinator.host,
             .port = coordinator.port,
             .coordinators = coordinators,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn findCoordinatorErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+        if (api_version >= 4) {
+            const coordinators = [_]Resp.Coordinator{.{
+                .key = "",
+                .node_id = -1,
+                .host = "",
+                .port = -1,
+                .error_code = @intFromEnum(err_code),
+                .error_message = message,
+            }};
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(err_code),
+                .error_message = message,
+                .node_id = -1,
+                .host = "",
+                .port = -1,
+                .coordinators = &coordinators,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .node_id = -1,
+            .host = "",
+            .port = -1,
+            .coordinators = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -28917,6 +28990,55 @@ fn freeDeserializedMetadataResponse(resp: *const generated.metadata_response.Met
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
+fn expectMetadataErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.metadata_response.MetadataResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(3, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedMetadataResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 0), resp.brokers.len);
+    try testing.expectEqual(@as(i32, -1), resp.controller_id);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].error_code);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions.len);
+}
+
+fn expectFindCoordinatorErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(10, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer if (resp.coordinators.len > 0) testing.allocator.free(resp.coordinators);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    if (api_version >= 4) {
+        try testing.expectEqual(@as(usize, 1), resp.coordinators.len);
+        try testing.expectEqualStrings("", resp.coordinators[0].key.?);
+        try testing.expectEqual(@as(i32, -1), resp.coordinators[0].node_id);
+        try testing.expectEqualStrings("", resp.coordinators[0].host.?);
+        try testing.expectEqual(@as(i32, -1), resp.coordinators[0].port);
+        try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.coordinators[0].error_code);
+    } else {
+        try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+        try testing.expectEqual(@as(i32, -1), resp.node_id);
+        try testing.expectEqualStrings("", resp.host.?);
+        try testing.expectEqual(@as(i32, -1), resp.port);
+    }
+}
+
 fn freeDeserializedProduceResponse(resp: *const generated.produce_response.ProduceResponse) void {
     for (resp.responses) |topic| {
         for (topic.partition_responses) |partition| {
@@ -29402,7 +29524,11 @@ test "Broker.handleRequest Metadata v0 rejects null topics" {
     var pos = buildTestRequest(&buf, 3, 0, 57, header_mod.requestHeaderVersion(3, 0));
     ser.writeArrayLen(&buf, &pos, null);
 
-    try testing.expect(broker.handleRequest(buf[0..pos]) == null);
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectMetadataErrorResponseBytes(response.?, 0, 57, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest Metadata v12 returns generated flexible topic metadata" {
@@ -29502,7 +29628,11 @@ test "Broker.handleRequest Metadata rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 3, 12, 313, header_mod.requestHeaderVersion(3, 12));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectMetadataErrorResponseBytes(response.?, 12, 313, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest Metadata rejects trailing bytes" {
@@ -29525,7 +29655,47 @@ test "Broker.handleRequest Metadata rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 3, 12, 315, header_mod.requestHeaderVersion(3, 12));
     req.serialize(&buf, &pos, 12);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectMetadataErrorResponseBytes(response.?, 12, 315, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest Metadata fails closed when topic response allocation fails" {
+    const Req = generated.metadata_request.MetadataRequest;
+    const Topic = Req.MetadataRequestTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "metadata-storage-fail-topic",
+    }};
+    const req = Req{
+        .topics = &topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 12, 316, header_mod.requestHeaderVersion(3, 12));
+    req.serialize(&buf, &pos, 12);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectMetadataErrorResponseBytes(response.?, 12, 316, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest unsupported API returns error response" {
@@ -29932,7 +30102,11 @@ test "Broker.handleRequest FindCoordinator rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 10, 4, 1005, header_mod.requestHeaderVersion(10, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectFindCoordinatorErrorResponseBytes(response.?, 4, 1005, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest FindCoordinator rejects trailing bytes" {
@@ -29951,7 +30125,43 @@ test "Broker.handleRequest FindCoordinator rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 10, 4, 1010, header_mod.requestHeaderVersion(10, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectFindCoordinatorErrorResponseBytes(response.?, 4, 1010, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest FindCoordinator fails closed when coordinator response allocation fails" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const keys = [_]?[]const u8{ "storage-fail-group-a", "storage-fail-group-b" };
+    const req = Req{
+        .key_type = 0,
+        .coordinator_keys = &keys,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 4, 1011, header_mod.requestHeaderVersion(10, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectFindCoordinatorErrorResponseBytes(response.?, 4, 1011, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest FindCoordinator v4 authorization denial uses generated response" {
