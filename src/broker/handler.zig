@@ -2956,7 +2956,7 @@ pub const Broker = struct {
 
     fn restorePartitionStates(self: *Broker, entries: []const MetadataPersistence.PartitionStateEntry) !void {
         for (entries) |entry| {
-            if (entry.partition_id < 0) return error.InvalidPartitionStateSnapshot;
+            if (entry.topic.len == 0 or entry.partition_id < 0) return error.InvalidPartitionStateSnapshot;
             if (!self.topics.contains(entry.topic)) continue;
 
             try self.store.ensurePartition(entry.topic, entry.partition_id);
@@ -2985,11 +2985,15 @@ pub const Broker = struct {
     }
 
     fn restoreReplicaDirectoryAssignments(self: *Broker, entries: []const MetadataPersistence.ReplicaDirectoryAssignmentEntry) !void {
+        for (entries) |entry| {
+            if (entry.partition_index < 0 or isZeroUuid(entry.topic_id) or isZeroUuid(entry.directory_id)) {
+                return error.InvalidReplicaDirectoryAssignmentSnapshot;
+            }
+        }
+
         self.clearReplicaDirectoryAssignments();
 
         for (entries) |entry| {
-            if (entry.partition_index < 0) continue;
-            if (isZeroUuid(entry.topic_id) or isZeroUuid(entry.directory_id)) continue;
             const topic_name = self.findTopicNameById(entry.topic_id) orelse continue;
             if (!self.topicPartitionExists(topic_name, entry.partition_index)) continue;
 
@@ -3010,30 +3014,29 @@ pub const Broker = struct {
     }
 
     fn restoreShareGroupStates(self: *Broker, entries: []const MetadataPersistence.ShareGroupStateEntry) !void {
+        for (entries) |entry| {
+            if (!validShareGroupStateKey(entry.key) or entry.state_epoch < 0 or entry.start_offset < -1) {
+                return error.InvalidShareGroupStateSnapshot;
+            }
+            for (entry.batches) |batch| {
+                if (validateShareStateBatch(batch.first_offset, batch.last_offset, batch.delivery_state, batch.delivery_count) != .none) {
+                    return error.InvalidShareGroupStateSnapshot;
+                }
+            }
+        }
+
         self.clearShareGroupStates();
 
         for (entries) |entry| {
-            if (entry.state_epoch < 0) continue;
-            if (entry.start_offset < -1) continue;
-
             const batches: []ShareStateBatch = if (entry.batches.len > 0) try self.allocator.alloc(ShareStateBatch, entry.batches.len) else &.{};
             errdefer if (batches.len > 0) self.allocator.free(batches);
-            var valid_batches = true;
             for (entry.batches, 0..) |batch, index| {
-                if (validateShareStateBatch(batch.first_offset, batch.last_offset, batch.delivery_state, batch.delivery_count) != .none) {
-                    valid_batches = false;
-                    break;
-                }
                 batches[index] = .{
                     .first_offset = batch.first_offset,
                     .last_offset = batch.last_offset,
                     .delivery_state = batch.delivery_state,
                     .delivery_count = batch.delivery_count,
                 };
-            }
-            if (!valid_batches) {
-                if (batches.len > 0) self.allocator.free(batches);
-                continue;
             }
 
             const key = try self.allocator.dupe(u8, entry.key);
@@ -3054,11 +3057,20 @@ pub const Broker = struct {
     }
 
     fn restoreShareGroupSessions(self: *Broker, entries: []const MetadataPersistence.ShareGroupSessionEntry) !void {
+        for (entries) |entry| {
+            if (entry.epoch < 0) return error.InvalidShareGroupSessionSnapshot;
+            const parts = parseShareGroupMemberKey(entry.key) orelse return error.InvalidShareGroupSessionSnapshot;
+            if (parts.group_id.len == 0 or parts.member_id.len == 0) return error.InvalidShareGroupSessionSnapshot;
+            const member_error = self.validateShareGroupMember(parts.group_id, parts.member_id);
+            if (member_error != ErrorCode.none and member_error != ErrorCode.unknown_member_id) {
+                return error.InvalidShareGroupSessionSnapshot;
+            }
+        }
+
         self.clearShareGroupSessions();
 
         for (entries) |entry| {
-            if (entry.epoch < 0) continue;
-            const parts = parseShareGroupMemberKey(entry.key) orelse continue;
+            const parts = parseShareGroupMemberKey(entry.key).?;
             if (self.validateShareGroupMember(parts.group_id, parts.member_id) != ErrorCode.none) continue;
 
             const key = try self.allocator.dupe(u8, entry.key);
@@ -3095,14 +3107,22 @@ pub const Broker = struct {
     }
 
     fn restorePartitionReassignments(self: *Broker, entries: []const MetadataPersistence.PartitionReassignmentEntry) !void {
+        for (entries) |entry| {
+            if (entry.topic.len == 0 or entry.partition_index < 0 or entry.replicas.len == 0 or
+                !validReplicaAssignment(entry.replicas) or
+                !validReplicaAssignment(entry.adding_replicas) or
+                !validReplicaAssignment(entry.removing_replicas))
+            {
+                return error.InvalidPartitionReassignmentSnapshot;
+            }
+        }
+
         self.restoreLocalOwnershipForCurrentReassignments();
         self.clearPartitionReassignments();
 
         for (entries) |entry| {
-            if (entry.partition_index < 0) continue;
             const info = self.topics.get(entry.topic) orelse continue;
             if (entry.partition_index >= info.num_partitions) continue;
-            if (!validReplicaAssignment(entry.replicas)) continue;
             if (isLocalReplicaAssignment(entry.replicas, self.node_id)) continue;
 
             var key_buf: [256]u8 = undefined;
@@ -3604,10 +3624,13 @@ pub const Broker = struct {
         const last_colon = std.mem.lastIndexOfScalar(u8, key, ':') orelse return false;
         if (last_colon < 33 or last_colon + 1 >= key.len) return false;
         const topic_hex_start = last_colon - 32;
-        if (topic_hex_start == 0 or key[topic_hex_start - 1] != ':') return false;
+        if (topic_hex_start <= 1 or key[topic_hex_start - 1] != ':') return false;
+        var non_zero_topic_id = false;
         for (key[topic_hex_start..last_colon]) |byte| {
             if (!isShareStateHexByte(byte)) return false;
+            non_zero_topic_id = non_zero_topic_id or byte != '0';
         }
+        if (!non_zero_topic_id) return false;
         const partition = std.fmt.parseInt(i32, key[last_colon + 1 ..], 10) catch return false;
         return partition >= 0;
     }
@@ -43789,6 +43812,72 @@ test "Broker open fails closed on invalid local partition state entries" {
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
     defer broker.deinit();
     try testing.expectError(error.InvalidPartitionStateSnapshot, broker.open());
+}
+
+test "Broker local metadata restore fails closed on malformed semantic entries" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("semantic-restore-topic"));
+    const topic_info = broker.topics.get("semantic-restore-topic").?;
+
+    const empty_topic = try testing.allocator.dupe(u8, "");
+    defer testing.allocator.free(empty_topic);
+    var partition_state_entries = [_]MetadataPersistence.PartitionStateEntry{.{
+        .topic = empty_topic,
+        .partition_id = 0,
+        .next_offset = 0,
+        .log_start_offset = 0,
+        .high_watermark = 0,
+        .last_stable_offset = 0,
+        .first_unstable_txn_offset = null,
+    }};
+    try testing.expectError(error.InvalidPartitionStateSnapshot, broker.restorePartitionStates(partition_state_entries[0..]));
+
+    const directory_id = [_]u8{7} ** 16;
+    var replica_dir_entries = [_]MetadataPersistence.ReplicaDirectoryAssignmentEntry{.{
+        .topic_id = [_]u8{0} ** 16,
+        .partition_index = 0,
+        .directory_id = directory_id,
+    }};
+    try testing.expectError(error.InvalidReplicaDirectoryAssignmentSnapshot, broker.restoreReplicaDirectoryAssignments(replica_dir_entries[0..]));
+
+    const reassignment_topic = try testing.allocator.dupe(u8, "semantic-restore-topic");
+    defer testing.allocator.free(reassignment_topic);
+    var duplicate_replicas = [_]i32{ 2, 2 };
+    var no_replicas: [0]i32 = .{};
+    var reassignment_entries = [_]MetadataPersistence.PartitionReassignmentEntry{.{
+        .topic = reassignment_topic,
+        .partition_index = 0,
+        .replicas = duplicate_replicas[0..],
+        .adding_replicas = no_replicas[0..],
+        .removing_replicas = no_replicas[0..],
+    }};
+    try testing.expectError(error.InvalidPartitionReassignmentSnapshot, broker.restorePartitionReassignments(reassignment_entries[0..]));
+
+    const state_key = try broker.shareGroupStateKey("semantic-share-group", topic_info.topic_id, 0);
+    defer testing.allocator.free(state_key);
+    var invalid_batches = [_]MetadataPersistence.ShareStateBatchEntry{.{
+        .first_offset = 8,
+        .last_offset = 7,
+        .delivery_state = 0,
+        .delivery_count = 1,
+    }};
+    var share_state_entries = [_]MetadataPersistence.ShareGroupStateEntry{.{
+        .key = state_key,
+        .state_epoch = 1,
+        .start_offset = 0,
+        .batches = invalid_batches[0..],
+    }};
+    try testing.expectError(error.InvalidShareGroupStateSnapshot, broker.restoreShareGroupStates(share_state_entries[0..]));
+
+    const malformed_session_key = try testing.allocator.dupe(u8, "not-a-share-session-key");
+    defer testing.allocator.free(malformed_session_key);
+    var share_session_entries = [_]MetadataPersistence.ShareGroupSessionEntry{.{
+        .key = malformed_session_key,
+        .epoch = 0,
+    }};
+    try testing.expectError(error.InvalidShareGroupSessionSnapshot, broker.restoreShareGroupSessions(share_session_entries[0..]));
 }
 
 test "Broker fetches filesystem WAL records after restart" {

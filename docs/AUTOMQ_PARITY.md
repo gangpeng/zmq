@@ -45,7 +45,8 @@ operator-facing behavior.
   snapshotted for local restart, and filesystem WAL segments replay into the
   fetch cache after broker restart while malformed WAL segment names and
   malformed or corrupt partition WAL records fail broker open instead of being
-  skipped. Existing malformed broker-local metadata snapshots for topics,
+  skipped. Existing syntactically or semantically malformed broker-local
+  metadata snapshots for topics,
   offsets, consumer groups, transactions, producer sequences, partition state,
   reassignments, replica-directory assignments, share-group state/session
   epochs, delegation tokens, finalized features, ACLs, AutoMQ metadata, and
