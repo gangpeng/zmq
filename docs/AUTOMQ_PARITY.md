@@ -267,6 +267,9 @@ connection closes;
 broker ApiVersions malformed flexible requests and finalized-feature
 materialization failures now return generated invalid-request or storage-error
 responses instead of silent connection closes;
+SaslHandshake and SaslAuthenticate malformed frames now return generated
+invalid-request responses, and SaslHandshake fails closed if mechanism response
+or selected-mechanism session storage allocation fails;
 generated VoteRequest decode now frees partially materialized topic arrays when
 nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint
