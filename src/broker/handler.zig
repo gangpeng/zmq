@@ -14066,7 +14066,10 @@ pub const Broker = struct {
             .port = coordinator.port,
             .coordinators = coordinators,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("FindCoordinator response serialization failed", .{});
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize coordinator response");
+        };
     }
 
     fn findCoordinatorErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
@@ -33521,6 +33524,35 @@ test "Broker.handleRequest FindCoordinator fails closed when coordinator respons
     defer response_allocator.free(response.?);
 
     try expectFindCoordinatorErrorResponseBytes(response.?, 4, 1011, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest FindCoordinator fails closed when response serialization fails" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .key = "serialize-fail-group",
+        .key_type = 0,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 1, 1012, header_mod.requestHeaderVersion(10, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectFindCoordinatorErrorResponseBytes(response.?, 1, 1012, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest FindCoordinator v4 authorization denial uses generated response" {
