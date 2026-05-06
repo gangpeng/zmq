@@ -666,7 +666,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ListOffsets, DeleteRecords, and OffsetForLeaderEpoch now likewise fail closed
   with generated invalid-request or storage-error responses when denied frames
   are malformed or denial response construction fails.
-  Normal ListOffsets, FindCoordinator, ListGroups, DescribeGroups,
+  Normal Metadata, ListOffsets, FindCoordinator, ListGroups, DescribeGroups,
   ConsumerGroupDescribe, Heartbeat, DescribeConfigs, DescribeAcls, and
   DescribeTransactions/ListTransactions request paths now also return generated
   invalid-request or storage-error responses when client frames are malformed or

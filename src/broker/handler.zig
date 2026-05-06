@@ -13044,7 +13044,10 @@ pub const Broker = struct {
             .controller_id = self.node_id,
             .topics = topics[0..topics_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Metadata response serialization failed", .{});
+            return self.metadataErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn metadataErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -33058,6 +33061,36 @@ test "Broker.handleRequest Metadata fails closed when topic response allocation 
     defer response_allocator.free(response.?);
 
     try expectMetadataErrorResponseBytes(response.?, 12, 316, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest Metadata fails closed when response serialization fails" {
+    const Req = generated.metadata_request.MetadataRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .topics = &.{},
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 12, 317, header_mod.requestHeaderVersion(3, 12));
+    req.serialize(&buf, &pos, 12);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectMetadataErrorResponseBytes(response.?, 12, 317, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest unsupported API returns error response" {
