@@ -27310,28 +27310,37 @@ pub const Broker = struct {
 
         if (!validateCreateAclsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed CreateAcls request", .{});
-            return null;
+            return self.createAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode CreateAcls request: {}", .{err});
-            return null;
+            return self.createAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeCreateAclsRequest(&req);
 
-        const results = self.allocator.alloc(Result, req.creations.len) catch return null;
+        const results = self.allocator.alloc(Result, req.creations.len) catch |err| {
+            log.warn("CreateAcls response allocation failed: {}", .{err});
+            return self.createAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build CreateAcls response");
+        };
         defer if (results.len > 0) self.allocator.free(results);
 
         for (req.creations, 0..) |creation, i| {
-            results[i] = self.createAclResult(creation, api_version) catch return null;
+            results[i] = self.createAclResult(creation, api_version) catch |err| {
+                log.warn("CreateAcls result materialization failed: {}", .{err});
+                return self.createAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build CreateAcls response");
+            };
         }
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreateAcls response serialization failed", .{});
+            return self.createAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreateAcls response");
+        };
     }
 
     fn freeCreateAclsRequest(self: *Broker, req: *generated.create_acls_request.CreateAclsRequest) void {
@@ -27344,7 +27353,13 @@ pub const Broker = struct {
         const operation = aclOperation(creation.operation) orelse return invalidAclCreationResult("Invalid ACL operation");
         const permission = aclPermission(creation.permission_type) orelse return invalidAclCreationResult("Invalid ACL permission type");
 
-        const previous_snapshot = try self.encodeAclSnapshotRecordValue();
+        const previous_snapshot = self.encodeAclSnapshotRecordValue() catch |err| {
+            log.warn("CreateAcls rollback snapshot materialization failed: {}", .{err});
+            return .{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to snapshot ACL metadata",
+            };
+        };
         defer self.allocator.free(previous_snapshot);
 
         self.authorizer.addAcl(
@@ -27467,17 +27482,20 @@ pub const Broker = struct {
 
         if (!validateDeleteAclsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DeleteAcls request", .{});
-            return null;
+            return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DeleteAcls request: {}", .{err});
-            return null;
+            return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDeleteAclsRequest(&req);
 
-        const filter_results = self.allocator.alloc(FilterResult, req.filters.len) catch return null;
+        const filter_results = self.allocator.alloc(FilterResult, req.filters.len) catch |err| {
+            log.warn("DeleteAcls response allocation failed: {}", .{err});
+            return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build DeleteAcls response");
+        };
         var filter_results_init: usize = 0;
         defer {
             self.freeDeleteAclsFilterResults(filter_results[0..filter_results_init]);
@@ -27485,7 +27503,10 @@ pub const Broker = struct {
         }
 
         for (req.filters) |filter| {
-            filter_results[filter_results_init] = self.deleteAclsFilterResult(filter, api_version) catch return null;
+            filter_results[filter_results_init] = self.deleteAclsFilterResult(filter, api_version) catch |err| {
+                log.warn("DeleteAcls result materialization failed: {}", .{err});
+                return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build DeleteAcls response");
+            };
             filter_results_init += 1;
         }
 
@@ -27493,7 +27514,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .filter_results = filter_results[0..filter_results_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteAcls response serialization failed", .{});
+            return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteAcls response");
+        };
     }
 
     fn freeDeleteAclsRequest(self: *Broker, req: *generated.delete_acls_request.DeleteAclsRequest) void {
@@ -27506,7 +27530,7 @@ pub const Broker = struct {
         const operation = aclOperation(filter.operation) orelse return invalidDeleteAclsFilterResult("Invalid ACL operation");
         const permission = aclPermission(filter.permission_type) orelse return invalidDeleteAclsFilterResult("Invalid ACL permission type");
 
-        const matching_acls = try self.collectDeleteAclsMatchingAcls(
+        const matching_acls = self.collectDeleteAclsMatchingAcls(
             resource_type,
             filter.resource_name_filter,
             pattern_type,
@@ -27514,7 +27538,10 @@ pub const Broker = struct {
             filter.host_filter,
             operation,
             permission,
-        );
+        ) catch |err| {
+            log.warn("DeleteAcls matching ACL materialization failed: {}", .{err});
+            return storageDeleteAclsFilterResult("Failed to build matching ACL response", &.{});
+        };
         var matching_acls_owned = matching_acls.len > 0;
         errdefer if (matching_acls_owned) self.freeDeleteAclsMatchingAcls(matching_acls);
         if (matching_acls.len == 0) {
@@ -27525,7 +27552,11 @@ pub const Broker = struct {
             };
         }
 
-        const previous_snapshot = try self.encodeAclSnapshotRecordValue();
+        const previous_snapshot = self.encodeAclSnapshotRecordValue() catch |err| {
+            log.warn("DeleteAcls rollback snapshot materialization failed: {}", .{err});
+            matching_acls_owned = false;
+            return storageDeleteAclsFilterResult("Failed to snapshot ACL metadata", matching_acls);
+        };
         errdefer self.allocator.free(previous_snapshot);
 
         _ = self.authorizer.removeMatchingAcls(
@@ -27579,6 +27610,17 @@ pub const Broker = struct {
             .error_code = @intFromEnum(ErrorCode.invalid_request),
             .error_message = message,
             .matching_acls = &.{},
+        };
+    }
+
+    fn storageDeleteAclsFilterResult(
+        message: []const u8,
+        matching_acls: []const generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult.DeleteAclsMatchingAcl,
+    ) generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult {
+        return .{
+            .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+            .error_message = message,
+            .matching_acls = matching_acls,
         };
     }
 
@@ -41372,7 +41414,12 @@ test "Broker.handleRequest CreateAcls rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 30, 2, 3004, header_mod.requestHeaderVersion(30, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 30, 2, 3004);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
 }
 
 test "Broker.handleRequest CreateAcls rejects trailing bytes" {
@@ -41396,7 +41443,115 @@ test "Broker.handleRequest CreateAcls rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 30, 2, 3006, header_mod.requestHeaderVersion(30, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 30, 2, 3006);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest CreateAcls fails closed when response construction fails" {
+    const Req = generated.create_acls_request.CreateAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const creations = [_]Req.AclCreation{.{
+        .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name = "acl-create-oom-topic",
+        .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+        .principal = "User:alice",
+        .host = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .creations = &creations };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3010, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 30, 2, 3010);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expectEqual(@as(usize, 0), broker.authorizer.aclCount());
+}
+
+test "Broker.handleRequest CreateAcls fails closed when rollback snapshot materialization fails" {
+    const Req = generated.create_acls_request.CreateAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const creations = [_]Req.AclCreation{.{
+        .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name = "acl-create-snapshot-oom-topic",
+        .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+        .principal = "User:alice",
+        .host = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .creations = &creations };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3011, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 30, 2, 3011);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expectEqual(@as(usize, 0), broker.authorizer.aclCount());
+}
+
+test "Broker.handleRequest CreateAcls fails closed when response serialization fails" {
+    const Req = generated.create_acls_request.CreateAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .creations = &.{} };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3012, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 30, 2, 3012);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest CreateAcls authorization denial uses generated response" {
@@ -41603,7 +41758,12 @@ test "Broker.handleRequest DeleteAcls rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3104);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
 }
 
 test "Broker.handleRequest DeleteAcls rejects trailing bytes" {
@@ -41627,7 +41787,116 @@ test "Broker.handleRequest DeleteAcls rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 31, 2, 3106, header_mod.requestHeaderVersion(31, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3106);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest DeleteAcls fails closed when response construction fails" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-oom-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:bob",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3110, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3110);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
+test "Broker.handleRequest DeleteAcls fails closed when matching ACL materialization fails" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    try broker.authorizer.addAcl("User:bob", .topic, "acl-delete-match-oom-topic", .literal, .read, .allow, "*");
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-match-oom-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:bob",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3111, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3111);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+}
+
+test "Broker.handleRequest DeleteAcls fails closed when response serialization fails" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .filters = &.{} };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3112, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3112);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest DeleteAcls authorization denial uses generated response" {
