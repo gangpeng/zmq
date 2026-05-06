@@ -48,6 +48,13 @@ ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
 ERROR_FENCED_MEMBER_EPOCH = 110
 ERROR_UNSUPPORTED_ASSIGNOR = 112
+ACL_RESOURCE_TYPE_ANY = 1
+ACL_RESOURCE_TYPE_TOPIC = 2
+ACL_PATTERN_TYPE_MATCH = 2
+ACL_PATTERN_TYPE_LITERAL = 3
+ACL_OPERATION_ALL = 2
+ACL_OPERATION_DESCRIBE = 8
+ACL_PERMISSION_ALLOW = 3
 
 
 class TestError(Exception):
@@ -1309,6 +1316,300 @@ def wait_for_finalized_features_checkpoint(
     raise TestError(
         f"Finalized feature checkpoint did not recover for {feature!r}: {last_error}"
     )
+
+
+def parse_create_acls_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"CreateAcls response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "results": results}
+
+
+def acl_fields_body(binding):
+    body = struct.pack(">b", binding["resource_type"])
+    body += write_compact_string(binding["resource_name"])
+    body += struct.pack(">b", binding["pattern_type"])
+    body += write_compact_string(binding["principal"])
+    body += write_compact_string(binding["host"])
+    body += struct.pack(">bb", binding["operation"], binding["permission_type"])
+    return body
+
+
+def write_acl_binding(binding):
+    return acl_fields_body(binding) + b"\x00"  # ACL tagged fields
+
+
+def create_acls(port, bindings, correlation_id):
+    body = write_compact_array_len(len(bindings))
+    for binding in bindings:
+        body += write_acl_binding(binding)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 30, 2, correlation_id, body)
+    return parse_create_acls_response(response, correlation_id)
+
+
+def require_create_acls_success(response, expected_count):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"CreateAcls throttle mismatch: {response}")
+    if len(response["results"]) != expected_count:
+        raise TestError(f"CreateAcls result count mismatch: {response}")
+    for result in response["results"]:
+        if result["error_code"] != 0 or result["error_message"] is not None:
+            raise TestError(f"CreateAcls result mismatch: {response}")
+
+
+def parse_describe_acls_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    resource_count, pos = read_compact_array_len(response, pos)
+    resources = []
+    for _ in range(resource_count):
+        resource_type, pos = read_i8(response, pos)
+        resource_name, pos = read_compact_string(response, pos)
+        pattern_type, pos = read_i8(response, pos)
+        acl_count, pos = read_compact_array_len(response, pos)
+        acls = []
+        for _ in range(acl_count):
+            principal, pos = read_compact_string(response, pos)
+            host, pos = read_compact_string(response, pos)
+            operation, pos = read_i8(response, pos)
+            permission_type, pos = read_i8(response, pos)
+            pos = skip_tags(response, pos)
+            acls.append(
+                {
+                    "principal": principal,
+                    "host": host,
+                    "operation": operation,
+                    "permission_type": permission_type,
+                }
+            )
+        pos = skip_tags(response, pos)
+        resources.append(
+            {
+                "resource_type": resource_type,
+                "resource_name": resource_name,
+                "pattern_type": pattern_type,
+                "acls": acls,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeAcls response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+        "resources": resources,
+    }
+
+
+def acl_filter_body(binding):
+    return acl_fields_body(binding) + b"\x00"  # filter tagged fields
+
+
+def describe_acls(port, binding_filter, correlation_id):
+    body = acl_fields_body(binding_filter)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 29, 2, correlation_id, body)
+    return parse_describe_acls_response(response, correlation_id)
+
+
+def acl_matches(binding, resource, acl):
+    return (
+        resource["resource_type"] == binding["resource_type"]
+        and resource["resource_name"] == binding["resource_name"]
+        and resource["pattern_type"] == binding["pattern_type"]
+        and acl["principal"] == binding["principal"]
+        and acl["host"] == binding["host"]
+        and acl["operation"] == binding["operation"]
+        and acl["permission_type"] == binding["permission_type"]
+    )
+
+
+def require_describe_acls_success(response):
+    if (
+        response["throttle_time_ms"] != 0
+        or response["error_code"] != 0
+        or response["error_message"] is not None
+    ):
+        raise TestError(f"DescribeAcls top-level mismatch: {response}")
+
+
+def require_acl_visible(response, binding):
+    require_describe_acls_success(response)
+    matches = [
+        (resource, acl)
+        for resource in response["resources"]
+        for acl in resource["acls"]
+        if acl_matches(binding, resource, acl)
+    ]
+    if not matches:
+        raise TestError(f"DescribeAcls ACL missing: {response}")
+
+
+def require_acl_absent(response, binding):
+    require_describe_acls_success(response)
+    matches = [
+        (resource, acl)
+        for resource in response["resources"]
+        for acl in resource["acls"]
+        if acl_matches(binding, resource, acl)
+    ]
+    if matches:
+        raise TestError(f"DescribeAcls deleted ACL still visible: {response}")
+
+
+def parse_delete_acls_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    filter_results = []
+    for _ in range(result_count):
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        match_count, pos = read_compact_array_len(response, pos)
+        matching_acls = []
+        for _ in range(match_count):
+            match_error_code, pos = read_i16(response, pos)
+            match_error_message, pos = read_compact_string(response, pos)
+            resource_type, pos = read_i8(response, pos)
+            resource_name, pos = read_compact_string(response, pos)
+            pattern_type, pos = read_i8(response, pos)
+            principal, pos = read_compact_string(response, pos)
+            host, pos = read_compact_string(response, pos)
+            operation, pos = read_i8(response, pos)
+            permission_type, pos = read_i8(response, pos)
+            pos = skip_tags(response, pos)
+            matching_acls.append(
+                {
+                    "error_code": match_error_code,
+                    "error_message": match_error_message,
+                    "resource_type": resource_type,
+                    "resource_name": resource_name,
+                    "pattern_type": pattern_type,
+                    "principal": principal,
+                    "host": host,
+                    "operation": operation,
+                    "permission_type": permission_type,
+                }
+            )
+        pos = skip_tags(response, pos)
+        filter_results.append(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+                "matching_acls": matching_acls,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"DeleteAcls response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "filter_results": filter_results}
+
+
+def delete_acls(port, binding_filter, correlation_id):
+    body = write_compact_array_len(1)
+    body += acl_filter_body(binding_filter)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 31, 2, correlation_id, body)
+    return parse_delete_acls_response(response, correlation_id)
+
+
+def require_delete_acls_success(response, binding):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"DeleteAcls throttle mismatch: {response}")
+    results = response["filter_results"]
+    if len(results) != 1:
+        raise TestError(f"DeleteAcls result count mismatch: {response}")
+    result = results[0]
+    if result["error_code"] != 0 or result["error_message"] is not None:
+        raise TestError(f"DeleteAcls result mismatch: {response}")
+    if not result["matching_acls"]:
+        raise TestError(f"DeleteAcls did not match ACL: {response}")
+    for acl in result["matching_acls"]:
+        if acl["error_code"] != 0 or acl["error_message"] is not None:
+            raise TestError(f"DeleteAcls matching ACL error: {response}")
+        resource = {
+            "resource_type": acl["resource_type"],
+            "resource_name": acl["resource_name"],
+            "pattern_type": acl["pattern_type"],
+        }
+        if not acl_matches(binding, resource, acl):
+            raise TestError(f"DeleteAcls matching ACL mismatch: {response}")
+
+
+def wait_for_acl_admin_seed(port, broad_allow_acl, deleted_acl, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8840
+    last_error = None
+    while time.time() < deadline:
+        try:
+            created = create_acls(
+                port,
+                [broad_allow_acl, deleted_acl],
+                correlation_id,
+            )
+            require_create_acls_success(created, 2)
+            correlation_id += 1
+            require_acl_visible(
+                describe_acls(port, broad_allow_acl, correlation_id),
+                broad_allow_acl,
+            )
+            correlation_id += 1
+            deleted = delete_acls(port, deleted_acl, correlation_id)
+            require_delete_acls_success(deleted, deleted_acl)
+            correlation_id += 1
+            require_acl_absent(
+                describe_acls(port, deleted_acl, correlation_id),
+                deleted_acl,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"ACL admin seed did not recover: {last_error}")
+
+
+def wait_for_acl_admin_checkpoint(port, broad_allow_acl, deleted_acl, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8880
+    last_error = None
+    while time.time() < deadline:
+        try:
+            require_acl_visible(
+                describe_acls(port, broad_allow_acl, correlation_id),
+                broad_allow_acl,
+            )
+            correlation_id += 1
+            require_acl_absent(
+                describe_acls(port, deleted_acl, correlation_id),
+                deleted_acl,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"ACL admin checkpoint did not recover: {last_error}")
 
 
 def parse_alter_client_quotas_response(response, correlation_id):
@@ -9236,6 +9537,24 @@ def main():
         delegation_token_lifetime_ms = 60 * 60 * 1000
         finalized_feature_name = "metadata.version"
         finalized_feature_level = 1
+        broad_allow_acl = {
+            "resource_type": ACL_RESOURCE_TYPE_ANY,
+            "resource_name": "*",
+            "pattern_type": ACL_PATTERN_TYPE_MATCH,
+            "principal": "*",
+            "host": "*",
+            "operation": ACL_OPERATION_ALL,
+            "permission_type": ACL_PERMISSION_ALLOW,
+        }
+        deleted_acl = {
+            "resource_type": ACL_RESOURCE_TYPE_TOPIC,
+            "resource_name": f"{topic}-deleted-acl",
+            "pattern_type": ACL_PATTERN_TYPE_LITERAL,
+            "principal": "User:kraft-failover-deleted-acl",
+            "host": "*",
+            "operation": ACL_OPERATION_DESCRIBE,
+            "permission_type": ACL_PERMISSION_ALLOW,
+        }
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -9339,6 +9658,13 @@ def main():
                 finalized_feature_level,
             )
 
+        def wait_for_acl_admin_probe():
+            wait_for_acl_admin_checkpoint(
+                broker["port"],
+                broad_allow_acl,
+                deleted_acl,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
@@ -9347,6 +9673,7 @@ def main():
             wait_for_client_telemetry_probe()
             wait_for_delegation_token_probe()
             wait_for_finalized_features_probe()
+            wait_for_acl_admin_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -9404,6 +9731,11 @@ def main():
             broker["port"],
             finalized_feature_name,
             finalized_feature_level,
+        )
+        wait_for_acl_admin_seed(
+            broker["port"],
+            broad_allow_acl,
+            deleted_acl,
         )
         wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
@@ -10518,6 +10850,7 @@ def main():
             f"client_telemetry_checked=true, "
             f"delegation_tokens_checked=true, "
             f"finalized_features_checked=true, "
+            f"acl_admin_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -11054,6 +11387,82 @@ def self_test():
             api_versions_v3_fixture, 177
         )
         require_finalized_feature_visible(api_versions_v3, "metadata.version", 1)
+
+        acl_fixture = {
+            "resource_type": ACL_RESOURCE_TYPE_TOPIC,
+            "resource_name": "acl-self-test",
+            "pattern_type": ACL_PATTERN_TYPE_LITERAL,
+            "principal": "User:acl-self-test",
+            "host": "*",
+            "operation": ACL_OPERATION_DESCRIBE,
+            "permission_type": ACL_PERMISSION_ALLOW,
+        }
+        create_acls_fixture = struct.pack(">i", 178)
+        create_acls_fixture += b"\x00"  # response header tagged fields
+        create_acls_fixture += struct.pack(">i", 0)
+        create_acls_fixture += write_compact_array_len(1)
+        create_acls_fixture += struct.pack(">h", 0)
+        create_acls_fixture += write_compact_string(None)
+        create_acls_fixture += b"\x00"  # result tagged fields
+        create_acls_fixture += b"\x00"  # response tagged fields
+        created_acls = parse_create_acls_response(create_acls_fixture, 178)
+        require_create_acls_success(created_acls, 1)
+
+        describe_acls_fixture = struct.pack(">i", 179)
+        describe_acls_fixture += b"\x00"  # response header tagged fields
+        describe_acls_fixture += struct.pack(">ih", 0, 0)
+        describe_acls_fixture += write_compact_string(None)
+        describe_acls_fixture += write_compact_array_len(1)
+        describe_acls_fixture += struct.pack(">b", acl_fixture["resource_type"])
+        describe_acls_fixture += write_compact_string(acl_fixture["resource_name"])
+        describe_acls_fixture += struct.pack(">b", acl_fixture["pattern_type"])
+        describe_acls_fixture += write_compact_array_len(1)
+        describe_acls_fixture += write_compact_string(acl_fixture["principal"])
+        describe_acls_fixture += write_compact_string(acl_fixture["host"])
+        describe_acls_fixture += struct.pack(
+            ">bb",
+            acl_fixture["operation"],
+            acl_fixture["permission_type"],
+        )
+        describe_acls_fixture += b"\x00"  # ACL tagged fields
+        describe_acls_fixture += b"\x00"  # resource tagged fields
+        describe_acls_fixture += b"\x00"  # response tagged fields
+        described_acls = parse_describe_acls_response(describe_acls_fixture, 179)
+        require_acl_visible(described_acls, acl_fixture)
+
+        delete_acls_fixture = struct.pack(">i", 180)
+        delete_acls_fixture += b"\x00"  # response header tagged fields
+        delete_acls_fixture += struct.pack(">i", 0)
+        delete_acls_fixture += write_compact_array_len(1)
+        delete_acls_fixture += struct.pack(">h", 0)
+        delete_acls_fixture += write_compact_string(None)
+        delete_acls_fixture += write_compact_array_len(1)
+        delete_acls_fixture += struct.pack(">h", 0)
+        delete_acls_fixture += write_compact_string(None)
+        delete_acls_fixture += struct.pack(">b", acl_fixture["resource_type"])
+        delete_acls_fixture += write_compact_string(acl_fixture["resource_name"])
+        delete_acls_fixture += struct.pack(">b", acl_fixture["pattern_type"])
+        delete_acls_fixture += write_compact_string(acl_fixture["principal"])
+        delete_acls_fixture += write_compact_string(acl_fixture["host"])
+        delete_acls_fixture += struct.pack(
+            ">bb",
+            acl_fixture["operation"],
+            acl_fixture["permission_type"],
+        )
+        delete_acls_fixture += b"\x00"  # matching ACL tagged fields
+        delete_acls_fixture += b"\x00"  # filter result tagged fields
+        delete_acls_fixture += b"\x00"  # response tagged fields
+        deleted_acls = parse_delete_acls_response(delete_acls_fixture, 180)
+        require_delete_acls_success(deleted_acls, acl_fixture)
+
+        absent_acls_fixture = struct.pack(">i", 181)
+        absent_acls_fixture += b"\x00"  # response header tagged fields
+        absent_acls_fixture += struct.pack(">ih", 0, 0)
+        absent_acls_fixture += write_compact_string(None)
+        absent_acls_fixture += write_compact_array_len(0)
+        absent_acls_fixture += b"\x00"  # response tagged fields
+        absent_acls = parse_describe_acls_response(absent_acls_fixture, 181)
+        require_acl_absent(absent_acls, acl_fixture)
 
         describe_configs_fixture = struct.pack(">i", 166)
         describe_configs_fixture += b"\x00"  # response header tagged fields
