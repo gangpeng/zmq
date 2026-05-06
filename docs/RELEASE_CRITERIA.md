@@ -14,8 +14,9 @@ single-node demo are not sufficient by themselves.
   metadata mutations survive process crash, fresh-local-dir replacement,
   S3/MinIO rebuild, and provider fault injection without data loss. Existing
   local recovery snapshots must fail closed when unreadable or malformed rather
-  than being silently skipped, and S3 fetch/flush metadata faults must not be
-  reported as empty successful reads or acknowledged writes. Object lifecycle
+  than being silently skipped, and S3 fetch/flush metadata faults, including WAL
+  object-key allocation failures, must not be reported as empty successful reads
+  or acknowledged writes. Object lifecycle
   cleanup must not remove metadata before preserving the S3 keys needed for
   delete or orphan retry, and compaction must checkpoint replacement
   ObjectManager metadata before deleting old S3 objects or else roll back or

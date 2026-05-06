@@ -779,11 +779,7 @@ pub const PartitionStore = struct {
                 // Fallback: synchronous S3 PUT (legacy behavior)
                 const obj_key = std.fmt.allocPrint(self.allocator, "wal/{s}/{d}/off-{d:0>10}", .{
                     topic, partition_id, base_offset,
-                }) catch return .{
-                    .base_offset = @intCast(base_offset),
-                    .log_append_time_ms = -1,
-                    .log_start_offset = @intCast(state.log_start_offset),
-                };
+                }) catch return error.OutOfMemory;
                 defer self.allocator.free(obj_key);
                 s3.putObject(obj_key, data_owned) catch |err| {
                     log.warn("S3 WAL write-through failed: {}", .{err});
@@ -2325,6 +2321,38 @@ test "PartitionStore S3 WAL failed sync produce is not visible or retained" {
     try testing.expectEqual(@as(i16, 0), visible.error_code);
     try testing.expectEqual(@as(i64, 1), visible.high_watermark);
     try testing.expectEqualStrings("rec-a", visible.records);
+}
+
+test "PartitionStore legacy S3 WAL key allocation failure is not acknowledged" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_wal_mode = true;
+    store.s3_storage = s3_storage;
+    try store.ensurePartition("legacy-s3-oom-topic", 0);
+
+    const original_allocator = store.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    store.allocator = failing_allocator.allocator();
+    const result = store.produce("legacy-s3-oom-topic", 0, "rec-a");
+    store.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, result);
+    try testing.expect(failing_allocator.has_induced_failure);
+
+    const failed_state = store.partitionStatePtr("legacy-s3-oom-topic", 0).?;
+    try testing.expectEqual(@as(u64, 0), failed_state.next_offset);
+    try testing.expectEqual(@as(u64, 0), failed_state.high_watermark);
+    try testing.expectEqual(@as(usize, 0), store.memory_wal.?.recordCount());
+    try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
+
+    const invisible = try store.fetch("legacy-s3-oom-topic", 0, 0, 1024);
+    try testing.expectEqual(@as(i16, 0), invisible.error_code);
+    try testing.expectEqual(@as(usize, 0), invisible.records.len);
+    try testing.expectEqual(@as(i64, 0), invisible.high_watermark);
 }
 
 test "PartitionStore S3 WAL hot local produce and fetch tolerate repeated S3 listing" {
