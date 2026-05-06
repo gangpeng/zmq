@@ -286,10 +286,7 @@ pub const Wal = struct {
         while (i < self.segments.items.len) {
             const meta = &self.segments.items[i];
             if (meta.id <= up_to_segment_id) {
-                // Delete the file
-                fs.deleteFileAbsolute(meta.path) catch |err| {
-                    log.warn("Failed to delete WAL segment {s}: {}", .{ meta.path, err });
-                };
+                try fs.deleteFileAbsolute(meta.path);
                 self.allocator.free(meta.path);
                 _ = self.segments.orderedRemove(i);
                 removed += 1;
@@ -2033,6 +2030,36 @@ test "Wal cleanupSegments removes old segments" {
 
         const count_after = wal.segmentCount();
         try testing.expect(count_after < count_before);
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal cleanupSegments fails closed when a segment file cannot be deleted" {
+    const tmp_dir = "/tmp/automq-wal-cleanup-delete-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        const small_segment: usize = 20;
+        var wal = Wal.init(testing.allocator, tmp_dir, small_segment);
+        defer wal.deinit();
+        try wal.open();
+
+        _ = try wal.append("aaaaaaaaaa");
+        _ = try wal.append("bbbbbbbbbb");
+
+        try testing.expect(wal.segments.items.len > 0);
+        const original_path = wal.segments.items[0].path;
+        try fs.deleteFileAbsolute(original_path);
+        wal.allocator.free(original_path);
+
+        const bad_path = try testing.allocator.alloc(u8, 5000);
+        @memset(bad_path, 'x');
+        wal.segments.items[0].path = bad_path;
+
+        try testing.expectError(error.NameTooLong, wal.cleanupSegments(wal.segments.items[0].id));
+        try testing.expectEqual(@as(usize, 1), wal.segments.items.len);
+        try testing.expect(wal.segments.items[0].path.ptr == bad_path.ptr);
     }
 
     fs.deleteTreeAbsolute(tmp_dir) catch {};

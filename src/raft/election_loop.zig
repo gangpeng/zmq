@@ -179,7 +179,10 @@ pub const ElectionLoop = struct {
                 self.raft_state.becomeLeader();
                 log.info("Won election! Became leader at epoch {d}", .{self.raft_state.current_epoch});
                 // Notify followers of new leader
-                pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
+                const failures = pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
+                if (failures > 0) {
+                    log.warn("Leader heartbeat notification failed for {d} peer(s)", .{failures});
+                }
             }
         }
     }
@@ -212,7 +215,10 @@ pub const ElectionLoop = struct {
         if (self.raft_state.role != .leader) return;
         if (self.raft_client_pool) |pool| {
             self.syncClientPoolWithVoterMetadata();
-            pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
+            const failures = pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
+            if (failures > 0) {
+                log.warn("Heartbeat broadcast failed for {d} peer(s)", .{failures});
+            }
         }
     }
 

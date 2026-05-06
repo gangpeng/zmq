@@ -72,9 +72,15 @@ operator-facing behavior.
   Producer-sequence recovery from durable user logs now fails closed on
   malformed record-batch envelopes and advances one logical offset at a time so
   short raw legacy/test records do not hide later idempotent batches.
+  Persisted topic and partition-state restore now propagates local partition
+  storage rebuild failures instead of logging and continuing with visible
+  metadata ahead of local storage, and filesystem WAL cleanup/retention now
+  fails closed without dropping segment metadata when a segment cannot be
+  deleted.
   Auto-created and internal topic creation now fails closed and rolls back
-  visible topic metadata when partition-state allocation fails instead of
-  advertising a topic without local partition state.
+  visible topic metadata when partition-state allocation or local failover
+  ownership tracking fails instead of advertising a topic without local
+  partition state or owner metadata.
   Consumer-group session-timeout eviction no longer allocates while scanning
   expired members, so allocation pressure cannot silently leave timed-out
   members active or suppress the required rebalance. Controller broker-heartbeat
@@ -89,9 +95,13 @@ operator-facing behavior.
   log persistence fails, follower AppendEntries rejects allocation failures and
   non-contiguous entries instead of reporting success, and controller startup
   rejects truncated, invalid, or non-contiguous persisted Raft log records
-  instead of recovering a partial metadata image. Committed Raft voter config
-  records now fail closed on malformed endpoint metadata or application errors
-  instead of marking the config offset applied with partial voter state. Raft
+  instead of recovering a partial metadata image. Raft heartbeat broadcasts now
+  report and log failed peer RPCs instead of silently swallowing quorum
+  communication errors, and controller Vote/BeginQuorumEpoch/EndQuorumEpoch
+  v1 leader-endpoint materialization failures now return storage errors instead
+  of successful responses with missing endpoint metadata. Committed Raft voter
+  config records now fail closed on malformed endpoint metadata or application
+  errors instead of marking the config offset applied with partial voter state. Raft
   snapshot compaction now fails closed before log truncation when
   `snapshot.meta` or `prepared.snapshot` cannot be persisted, and malformed
   `raft.meta`, `snapshot.meta`, or unreadable/malformed `prepared.snapshot`

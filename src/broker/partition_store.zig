@@ -1369,7 +1369,7 @@ pub const PartitionStore = struct {
 
         // Clean up old WAL segments that have been flushed
         if (self.fs_wal) |*wal| {
-            cleaned += wal.cleanupSegments(self.s3_object_counter) catch 0;
+            cleaned += try wal.cleanupSegments(self.s3_object_counter);
         }
 
         return cleaned;
@@ -2557,6 +2557,39 @@ test "PartitionStore ensurePartition fails closed when stream metadata allocatio
     defer testing.allocator.free(key);
     try testing.expect(!store.partitions.contains(key));
     try testing.expect(om.getStream(PartitionStore.hashPartitionKey("stream-oom-topic", 0)) == null);
+}
+
+test "PartitionStore applyRetention surfaces WAL cleanup deletion failures" {
+    const tmp_dir = "/tmp/zmq-partition-store-wal-cleanup-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var store = PartitionStore.initWithConfig(testing.allocator, .{
+        .data_dir = tmp_dir,
+        .wal_segment_size = 96,
+    });
+    defer store.deinit();
+    try store.open();
+
+    _ = try store.produce("cleanup-surface-topic", 0, "aaaaaaaaaa");
+    _ = try store.produce("cleanup-surface-topic", 0, "bbbbbbbbbb");
+
+    const wal = &store.fs_wal.?;
+    try testing.expect(wal.segments.items.len > 0);
+    store.s3_object_counter = wal.segments.items[0].id;
+
+    const original_path = wal.segments.items[0].path;
+    try fs.deleteFileAbsolute(original_path);
+    store.allocator.free(original_path);
+
+    const bad_path = try testing.allocator.alloc(u8, 5000);
+    @memset(bad_path, 'x');
+    wal.segments.items[0].path = bad_path;
+
+    try testing.expectError(error.NameTooLong, store.applyRetention(.{ .cleanup_policy = .compact }));
+    try testing.expect(wal.segments.items.len > 0);
+    try testing.expect(wal.segments.items[0].path.ptr == bad_path.ptr);
 }
 
 // ---------------------------------------------------------------

@@ -530,12 +530,20 @@ pub const RaftClientPool = struct {
     }
 
     /// Send heartbeats to all peers (leader only).
-    pub fn broadcastHeartbeat(self: *RaftClientPool, leader_epoch: i32, leader_id: i32) void {
+    /// Returns the number of peer RPCs that failed so callers can surface
+    /// quorum communication problems instead of silently treating them as sent.
+    pub fn broadcastHeartbeat(self: *RaftClientPool, leader_epoch: i32, leader_id: i32) u32 {
+        var failures: u32 = 0;
         var it = self.clients.iterator();
         while (it.next()) |entry| {
             if (entry.key_ptr.* == leader_id) continue; // Skip self
-            entry.value_ptr.sendBeginQuorumEpoch(leader_epoch, leader_id) catch {};
+            entry.value_ptr.sendBeginQuorumEpoch(leader_epoch, leader_id) catch |err| {
+                failures += 1;
+                log.warn("Heartbeat RPC to peer {d} failed: {}", .{ entry.key_ptr.*, err });
+                continue;
+            };
         }
+        return failures;
     }
 
     /// Send AppendEntries to a specific follower.
@@ -638,6 +646,21 @@ test "RaftClientPool addOrUpdatePeer replaces and removes clients" {
     pool.removePeer(1);
     try std.testing.expectEqual(@as(usize, 0), pool.clients.count());
     try std.testing.expect(pool.getClient(1) == null);
+}
+
+test "RaftClientPool broadcastHeartbeat reports failed peer RPCs" {
+    var pool = RaftClientPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try pool.addPeer(1, "localhost", 9093);
+    try pool.addPeer(2, "localhost", 9094);
+
+    const peer = pool.getClient(2) orelse return error.MissingPeer;
+    peer.fd = -1;
+
+    const failures = pool.broadcastHeartbeat(3, 1);
+    try std.testing.expectEqual(@as(u32, 1), failures);
+    try std.testing.expect(pool.getClient(2).?.fd == null);
 }
 
 test "RaftClient init" {

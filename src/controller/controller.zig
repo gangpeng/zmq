@@ -221,7 +221,15 @@ pub const Controller = struct {
             };
         }
 
-        const node_endpoints = self.collectVoteNodeEndpoints(api_version) catch &.{};
+        const node_endpoints = self.collectVoteNodeEndpoints(api_version) catch |err| {
+            log.warn("Failed to collect Vote leader node endpoints: {}", .{err});
+            const resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .topics = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
 
         const resp = Resp{
@@ -303,7 +311,15 @@ pub const Controller = struct {
             }
         }
 
-        const node_endpoints = self.collectBeginQuorumEpochNodeEndpoints(api_version) catch &.{};
+        const node_endpoints = self.collectBeginQuorumEpochNodeEndpoints(api_version) catch |err| {
+            log.warn("Failed to collect BeginQuorumEpoch leader node endpoints: {}", .{err});
+            const resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .topics = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
 
         const resp = Resp{ .error_code = ErrorCode.none.toInt(), .topics = &.{}, .node_endpoints = node_endpoints };
@@ -336,7 +352,15 @@ pub const Controller = struct {
             self.raft_state.election_timer.reset();
         }
 
-        const node_endpoints = self.collectEndQuorumEpochNodeEndpoints(api_version) catch &.{};
+        const node_endpoints = self.collectEndQuorumEpochNodeEndpoints(api_version) catch |err| {
+            log.warn("Failed to collect EndQuorumEpoch leader node endpoints: {}", .{err});
+            const resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .topics = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
 
         const resp = Resp{ .error_code = ErrorCode.none.toInt(), .topics = &.{}, .node_endpoints = node_endpoints };
@@ -2261,6 +2285,56 @@ fn freeDeserializedFetchSnapshotResponse(resp: *const generated.fetch_snapshot_r
     }
     if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn freeDeserializedQuorumEndpointResponse(comptime Resp: type, resp: *const Resp) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn installTestControllerEndpoint(ctrl: *Controller, fill: u8, host: []const u8, port: u16) ![16]u8 {
+    const directory_id = [_]u8{fill} ** 16;
+    const endpoint_views = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = host,
+        .port = port,
+    }};
+    _ = try ctrl.raft_state.proposeUpdateVoter(ctrl.node_id, directory_id, &endpoint_views, 0, 1);
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    try ctrl.raft_state.applyCommittedConfigs();
+    return directory_id;
+}
+
+fn expectNoSuccessfulEndpointDrop(
+    comptime Resp: type,
+    response: ?[]u8,
+    response_allocator: Allocator,
+    failing_allocator: *const std.testing.FailingAllocator,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+) !bool {
+    if (response) |bytes| {
+        defer response_allocator.free(bytes);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, bytes, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+        defer resp_header.deinit(testing.allocator);
+        try testing.expectEqual(correlation_id, resp_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, bytes, &rpos, api_version);
+        defer freeDeserializedQuorumEndpointResponse(Resp, &resp);
+
+        if (failing_allocator.has_induced_failure and resp.error_code == ErrorCode.none.toInt()) {
+            try testing.expectEqual(@as(usize, 1), resp.node_endpoints.len);
+        }
+        return failing_allocator.has_induced_failure and resp.error_code == ErrorCode.kafka_storage_error.toInt();
+    }
+
+    return failing_allocator.has_induced_failure;
 }
 
 test "Controller init and deinit" {
@@ -4595,4 +4669,133 @@ test "Controller handleRequest BeginQuorumEpoch v1 populates leader node endpoin
     try testing.expectEqual(@as(i32, 1), resp.node_endpoints[0].node_id);
     try testing.expectEqualStrings("controller-3.example", resp.node_endpoints[0].host.?);
     try testing.expectEqual(@as(u16, 19393), resp.node_endpoints[0].port);
+}
+
+test "Controller handleRequest Vote v1 fails closed when leader endpoint allocation fails" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var saw_fail_closed = false;
+    for (2..10) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+        _ = try installTestControllerEndpoint(&ctrl, 21, "controller-vote-fail.example", 19493);
+        try ctrl.raft_state.addVoter(2);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 52, 1, 9300, header_mod.requestHeaderVersion(52, 1));
+        const partitions = [_]Req.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .candidate_epoch = ctrl.raft_state.current_epoch + 1,
+            .candidate_id = 2,
+            .last_offset_epoch = 0,
+            .last_offset = 0,
+        }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{ .cluster_id = null, .voter_id = 1, .topics = &topics };
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        saw_fail_closed = (try expectNoSuccessfulEndpointDrop(
+            Resp,
+            response,
+            response_allocator,
+            &failing_allocator,
+            52,
+            1,
+            9300,
+        )) or saw_fail_closed;
+    }
+    try testing.expect(saw_fail_closed);
+}
+
+test "Controller handleRequest BeginQuorumEpoch v1 fails closed when leader endpoint allocation fails" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var saw_fail_closed = false;
+    for (2..8) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+        const directory_id = try installTestControllerEndpoint(&ctrl, 22, "controller-begin-fail.example", 19593);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 53, 1, 9301, header_mod.requestHeaderVersion(53, 1));
+        const partitions = [_]Req.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .voter_directory_id = directory_id,
+            .leader_id = 1,
+            .leader_epoch = ctrl.raft_state.current_epoch,
+        }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{ .cluster_id = null, .voter_id = 1, .topics = &topics };
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        saw_fail_closed = (try expectNoSuccessfulEndpointDrop(
+            Resp,
+            response,
+            response_allocator,
+            &failing_allocator,
+            53,
+            1,
+            9301,
+        )) or saw_fail_closed;
+    }
+    try testing.expect(saw_fail_closed);
+}
+
+test "Controller handleRequest EndQuorumEpoch v1 fails closed when leader endpoint allocation fails" {
+    const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+    var saw_fail_closed = false;
+    for (2..8) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+        _ = try installTestControllerEndpoint(&ctrl, 23, "controller-end-fail.example", 19693);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 54, 1, 9302, header_mod.requestHeaderVersion(54, 1));
+        const partitions = [_]Req.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .leader_id = 1,
+            .leader_epoch = ctrl.raft_state.current_epoch,
+            .preferred_successors = &.{},
+            .preferred_candidates = &.{},
+        }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{ .cluster_id = null, .topics = &topics };
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        saw_fail_closed = (try expectNoSuccessfulEndpointDrop(
+            Resp,
+            response,
+            response_allocator,
+            &failing_allocator,
+            54,
+            1,
+            9302,
+        )) or saw_fail_closed;
+    }
+    try testing.expect(saw_fail_closed);
 }

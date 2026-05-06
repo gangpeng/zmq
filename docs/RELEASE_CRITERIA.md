@@ -30,24 +30,32 @@ single-node demo are not sufficient by themselves.
   reserve producer-sequence state before append so reservation failures do not
   acknowledge data with stale deduplication state. Producer-sequence recovery
   from durable user logs must reject malformed record-batch envelopes and must
-  not let short raw records hide later idempotent batches. Topic creation must
+  not let short raw records hide later idempotent batches. Topic and
+  partition-state restore must not expose metadata when local partition storage
+  cannot be rebuilt. Filesystem WAL cleanup and retention must surface segment
+  deletion failures and retain segment metadata for retry. Topic creation must
   fail closed and roll back visible topic metadata when local partition-state
-  allocation fails. Consumer-group timeout eviction must not silently keep
+  allocation or failover ownership tracking fails. Consumer-group timeout
+  eviction must not silently keep
   expired members active because an allocation failed while collecting expired
   member IDs. Raft/controller metadata replication and startup recovery must not
   acknowledge or apply entries that failed local log allocation or persistence,
   and persisted Raft logs must reject truncated, invalid, or non-contiguous
-  records instead of recovering a partial controller metadata image. Committed
-  Raft voter config records must not be marked applied when endpoint metadata is
-  malformed or config application fails. Raft snapshot compaction must not
-  truncate log entries unless `snapshot.meta` and the prepared-object registry
-  snapshot have both been persisted, and malformed Raft epoch/vote or snapshot
-  metadata must fail startup recovery. Raft epoch/vote metadata writes must be
-  persisted atomically before granting votes, starting elections, or accepting
-  leader epochs; failures must deny or reject the transition instead of leaving
-  externally visible quorum state ahead of durable `raft.meta`. Unreadable or
-  malformed prepared-object registry snapshots must fail startup recovery rather
-  than silently losing prepared-object tracking after log compaction.
+  records instead of recovering a partial controller metadata image. Raft
+  heartbeat broadcasts must surface peer RPC failures to callers and logs.
+  Controller quorum responses that carry leader endpoints must not report
+  success when leader-endpoint materialization fails.
+  Committed Raft voter config records must not be marked applied when endpoint
+  metadata is malformed or config application fails. Raft snapshot compaction
+  must not truncate log entries unless `snapshot.meta` and the prepared-object
+  registry snapshot have both been persisted, and malformed Raft epoch/vote or
+  snapshot metadata must fail startup recovery. Raft epoch/vote metadata writes
+  must be persisted atomically before granting votes, starting elections, or
+  accepting leader epochs; failures must deny or reject the transition instead
+  of leaving externally visible quorum state ahead of durable `raft.meta`.
+  Unreadable or malformed prepared-object registry snapshots must fail startup
+  recovery rather than silently losing prepared-object tracking after log
+  compaction.
 - `Stateless`: a replacement broker can rebuild topic, partition, offset,
   transaction, producer, ACL, quota, SCRAM, reassignment, and AutoMQ stream/object
   metadata from quorum records and shared storage without manual repair.

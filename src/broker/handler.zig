@@ -905,11 +905,9 @@ pub const Broker = struct {
 
             // Ensure partitions exist in storage
             for (0..@as(usize, @intCast(entry.num_partitions))) |pi| {
-                self.store.ensurePartition(entry.name, @intCast(pi)) catch |err| {
-                    log.warn("Failed to ensure partition {s}-{d}: {}", .{ entry.name, pi, err });
-                };
+                try self.store.ensurePartition(entry.name, @intCast(pi));
             }
-            self.trackLocalTopicPartitionRange(entry.name, 0, entry.num_partitions);
+            try self.trackLocalTopicPartitionRange(entry.name, 0, entry.num_partitions);
 
             log.info("Loaded persisted topic '{s}' ({d} partitions)", .{ entry.name, entry.num_partitions });
         }
@@ -2657,7 +2655,12 @@ pub const Broker = struct {
             };
             partitions_created += 1;
         }
-        self.trackLocalTopicPartitionRange(topic_name, 0, self.default_num_partitions);
+        self.trackLocalTopicPartitionRange(topic_name, 0, self.default_num_partitions) catch |err| {
+            log.warn("Failed to track failover ownership for auto-created topic {s}: {}", .{ topic_name, err });
+            self.restoreTopicsAfterFailedMutation(previous_snapshot);
+            self.removeTopicPartitionRange(topic_name, 0, self.default_num_partitions);
+            return false;
+        };
 
         log.info("Auto-created topic '{s}' with {d} partitions", .{ topic_name, self.default_num_partitions });
         self.writeTopicSnapshotRecord() catch |err| {
@@ -2679,7 +2682,7 @@ pub const Broker = struct {
             for (0..@as(usize, @intCast(partitions))) |pi| {
                 try self.store.ensurePartition(name, @intCast(pi));
             }
-            self.trackLocalTopicPartitionRange(name, 0, partitions);
+            try self.trackLocalTopicPartitionRange(name, 0, partitions);
             return;
         }
 
@@ -2712,7 +2715,7 @@ pub const Broker = struct {
             try self.store.ensurePartition(name, @intCast(pi));
             partitions_created += 1;
         }
-        self.trackLocalTopicPartitionRange(name, 0, partitions);
+        try self.trackLocalTopicPartitionRange(name, 0, partitions);
 
         log.info("Created internal topic '{s}' ({d} partitions, compact)", .{ name, partitions });
     }
@@ -2953,15 +2956,12 @@ pub const Broker = struct {
 
     fn restorePartitionStates(self: *Broker, entries: []const MetadataPersistence.PartitionStateEntry) !void {
         for (entries) |entry| {
-            if (entry.partition_id < 0) continue;
+            if (entry.partition_id < 0) return error.InvalidPartitionStateSnapshot;
             if (!self.topics.contains(entry.topic)) continue;
 
-            self.store.ensurePartition(entry.topic, entry.partition_id) catch |err| {
-                log.warn("Failed to ensure partition for restored state {s}-{d}: {}", .{ entry.topic, entry.partition_id, err });
-                continue;
-            };
+            try self.store.ensurePartition(entry.topic, entry.partition_id);
 
-            const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id }) catch continue;
+            const pkey = try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id });
             defer self.allocator.free(pkey);
 
             if (self.store.partitions.getPtr(pkey)) |state| {
@@ -4048,11 +4048,9 @@ pub const Broker = struct {
         });
 
         for (0..@as(usize, @intCast(entry.num_partitions))) |pi| {
-            self.store.ensurePartition(entry.name, @intCast(pi)) catch |err| {
-                log.warn("Failed to ensure restored topic partition {s}-{d}: {}", .{ entry.name, pi, err });
-            };
+            try self.store.ensurePartition(entry.name, @intCast(pi));
         }
-        self.trackLocalTopicPartitionRange(entry.name, 0, entry.num_partitions);
+        try self.trackLocalTopicPartitionRange(entry.name, 0, entry.num_partitions);
     }
 
     fn restoreTopicSnapshotRecord(self: *Broker, value: []const u8) !void {
@@ -4074,17 +4072,12 @@ pub const Broker = struct {
         };
     }
 
-    fn trackLocalTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) void {
+    fn trackLocalTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) !void {
         if (end_partition <= start_partition) return;
-        self.failover_controller.registerNode(self.node_id) catch |err| {
-            log.warn("Failed to register local failover node {d}: {}", .{ self.node_id, err });
-            return;
-        };
+        try self.failover_controller.registerNode(self.node_id);
         for (@as(usize, @intCast(start_partition))..@as(usize, @intCast(end_partition))) |pi| {
             const partition_index: i32 = @intCast(pi);
-            self.failover_controller.registerPartitionOwner(topic_name, partition_index, self.node_id) catch |err| {
-                log.warn("Failed to track failover owner for {s}-{d}: {}", .{ topic_name, partition_index, err });
-            };
+            try self.failover_controller.registerPartitionOwner(topic_name, partition_index, self.node_id);
         }
     }
 
@@ -4190,12 +4183,9 @@ pub const Broker = struct {
 
         for (entries) |entry| {
             if (!self.topicPartitionExists(entry.topic, entry.partition_id)) continue;
-            self.store.ensurePartition(entry.topic, entry.partition_id) catch |err| {
-                log.warn("Failed to ensure partition for restored shared state {s}-{d}: {}", .{ entry.topic, entry.partition_id, err });
-                continue;
-            };
+            try self.store.ensurePartition(entry.topic, entry.partition_id);
 
-            const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id }) catch continue;
+            const pkey = try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id });
             defer self.allocator.free(pkey);
             const state = self.store.partitions.getPtr(pkey) orelse continue;
             const stream_id = PartitionStore.hashPartitionKey(entry.topic, entry.partition_id);
@@ -28886,6 +28876,22 @@ test "Broker.ensureTopic rolls back when partition state creation fails" {
     try testing.expect(broker.partitionState("auto-partition-create-fail-topic", 0) == null);
 }
 
+test "Broker.ensureTopic rolls back when failover ownership tracking fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const original_failover_allocator = broker.failover_controller.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.failover_controller.allocator = failing_allocator.allocator();
+    defer broker.failover_controller.allocator = original_failover_allocator;
+
+    try testing.expect(!broker.ensureTopic("auto-failover-track-fail-topic"));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expect(broker.topics.get("auto-failover-track-fail-topic") == null);
+    try testing.expect(broker.partitionState("auto-failover-track-fail-topic", 0) == null);
+    try testing.expect(broker.failover_controller.findPartitionOwner("auto-failover-track-fail-topic", 0) == null);
+}
+
 test "Broker.ensureInternalTopic rolls back when partition state creation fails" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -43527,6 +43533,56 @@ test "Broker clamps invalid restored partition state invariants" {
     const stream = broker.object_manager.getStream(stream_id).?;
     try testing.expectEqual(@as(u64, 8), stream.start_offset);
     try testing.expectEqual(@as(u64, 10), stream.end_offset);
+}
+
+test "Broker restorePartitionStates propagates partition storage rebuild failures" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("restore-state-fail-topic"));
+    broker.topics.getPtr("restore-state-fail-topic").?.num_partitions = 2;
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var om = ObjectManager.init(failing_allocator.allocator(), 1);
+    defer om.deinit();
+    broker.store.setObjectManager(&om);
+
+    const topic = try testing.allocator.dupe(u8, "restore-state-fail-topic");
+    defer testing.allocator.free(topic);
+    const entries = [_]MetadataPersistence.PartitionStateEntry{.{
+        .topic = topic,
+        .partition_id = 1,
+        .next_offset = 1,
+        .log_start_offset = 0,
+        .high_watermark = 1,
+        .last_stable_offset = 1,
+        .first_unstable_txn_offset = null,
+    }};
+
+    try testing.expectError(error.OutOfMemory, broker.restorePartitionStates(&entries));
+
+    const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "restore-state-fail-topic", 1 });
+    defer testing.allocator.free(pkey);
+    try testing.expect(!broker.store.partitions.contains(pkey));
+}
+
+test "Broker open fails closed on invalid local partition state entries" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-invalid-partition-state-open-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    const file = try fs.createFileAbsolute(partition_state_path, .{ .truncate = true });
+    try file.writeAll("partition\t626164\t-1\t0\t0\t0\t0\tnull\n");
+    try file.sync();
+    file.close();
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try testing.expectError(error.InvalidPartitionStateSnapshot, broker.open());
 }
 
 test "Broker fetches filesystem WAL records after restart" {
