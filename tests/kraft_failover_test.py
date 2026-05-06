@@ -1154,6 +1154,91 @@ def end_txn(port, transactional_id, producer_id, producer_epoch, committed, corr
     parse_end_txn_response(response, correlation_id)
 
 
+def parse_add_offsets_to_txn_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(
+            f"AddOffsetsToTxn correlation mismatch: {response_correlation}"
+        )
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AddOffsetsToTxn response trailing bytes: {len(response) - pos}"
+        )
+    if error_code != 0:
+        raise TestError(f"AddOffsetsToTxn error_code={error_code}")
+
+
+def add_offsets_to_txn(
+    port, transactional_id, producer_id, producer_epoch, group_id, correlation_id
+):
+    body = write_string(transactional_id)
+    body += struct.pack(">q", producer_id)
+    body += struct.pack(">h", producer_epoch)
+    body += write_string(group_id)
+
+    response = controller_request(port, 25, 0, correlation_id, body)
+    parse_add_offsets_to_txn_response(response, correlation_id)
+
+
+def parse_txn_offset_commit_response(response, correlation_id, expected_topic):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(
+            f"TxnOffsetCommit correlation mismatch: {response_correlation}"
+        )
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topics, pos = read_i32(response, pos)
+    if topics != 1:
+        raise TestError(f"TxnOffsetCommit topic response count={topics}")
+    topic_name, pos = read_string(response, pos)
+    partitions, pos = read_i32(response, pos)
+    if topic_name != expected_topic or partitions != 1:
+        raise TestError(
+            f"TxnOffsetCommit topic={topic_name!r} partitions={partitions}"
+        )
+    partition, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"TxnOffsetCommit response trailing bytes: {len(response) - pos}"
+        )
+    if partition != 0:
+        raise TestError(
+            f"TxnOffsetCommit partition={partition} error_code={error_code}"
+        )
+    if error_code != 0:
+        raise TestError(f"TxnOffsetCommit error_code={error_code}")
+
+
+def txn_offset_commit(
+    port,
+    transactional_id,
+    group_id,
+    producer_id,
+    producer_epoch,
+    topic,
+    offset,
+    correlation_id,
+):
+    body = write_string(transactional_id)
+    body += write_string(group_id)
+    body += struct.pack(">q", producer_id)
+    body += struct.pack(">h", producer_epoch)
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)  # partition_index
+    body += struct.pack(">q", offset)
+    body += write_string("kraft-failover-txn")
+
+    response = controller_request(port, 28, 0, correlation_id, body)
+    parse_txn_offset_commit_response(response, correlation_id, topic)
+
+
 def begin_transaction(port, transactional_id, topic, correlation_id):
     identity = init_producer_id(port, transactional_id, correlation_id)
     add_partitions_to_txn(
@@ -1172,6 +1257,36 @@ def begin_transaction(port, transactional_id, topic, correlation_id):
     }
 
 
+def begin_offset_transaction(port, transactional_id, group_id, topic, offset, correlation_id):
+    identity = init_producer_id(port, transactional_id, correlation_id)
+    add_offsets_to_txn(
+        port,
+        transactional_id,
+        identity["producer_id"],
+        identity["producer_epoch"],
+        group_id,
+        correlation_id + 1,
+    )
+    txn_offset_commit(
+        port,
+        transactional_id,
+        group_id,
+        identity["producer_id"],
+        identity["producer_epoch"],
+        topic,
+        offset,
+        correlation_id + 2,
+    )
+    return {
+        "transactional_id": transactional_id,
+        "producer_id": identity["producer_id"],
+        "producer_epoch": identity["producer_epoch"],
+        "group_id": group_id,
+        "topic": topic,
+        "offset": offset,
+    }
+
+
 def wait_for_transaction_begin(port, transactional_id, topic, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 6400
@@ -1184,6 +1299,34 @@ def wait_for_transaction_begin(port, transactional_id, topic, timeout=30):
         correlation_id += 2
         time.sleep(0.25)
     raise TestError(f"transaction {transactional_id!r} did not begin: {last_error}")
+
+
+def wait_for_offset_transaction_begin(
+    port, transactional_id, group_id, topic, offset, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            txn = begin_offset_transaction(
+                port, transactional_id, group_id, topic, offset, correlation_id
+            )
+            wait_for_committed_offset(
+                port,
+                group_id,
+                topic,
+                offset,
+                timeout=max(1, int(deadline - time.time())),
+            )
+            return txn
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 3
+        time.sleep(0.25)
+    raise TestError(
+        f"transactional offset commit {transactional_id!r} did not begin: {last_error}"
+    )
 
 
 def wait_for_transaction_end(port, txn, committed=True, timeout=30):
@@ -3574,6 +3717,7 @@ def main():
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
         offset_delete_group = f"{group}-offset-delete"
         delete_groups_group = f"{group}-delete-groups"
+        txn_offset_group = f"{group}-txn-offset"
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
         expected_payloads = []
@@ -3608,6 +3752,14 @@ def main():
             committed_offset,
         )
         wait_for_group_delete(broker["port"], delete_groups_group, topic)
+        txn_offset_committed_offset = committed_offset
+        txn_offset_txn = wait_for_offset_transaction_begin(
+            broker["port"],
+            f"{group}-txn-offset",
+            txn_offset_group,
+            topic,
+            txn_offset_committed_offset,
+        )
         idempotent_transactional_id = f"{group}-idempotent"
         idempotent_identity = wait_for_init_producer_id(
             broker["port"],
@@ -3633,6 +3785,9 @@ def main():
         wait_for_committed_offset_error(
             broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
         )
+        wait_for_committed_offset(
+            broker["port"], txn_offset_group, topic, txn_offset_committed_offset
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
 
@@ -3651,7 +3806,11 @@ def main():
         wait_for_committed_offset_error(
             broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
         )
+        wait_for_committed_offset(
+            broker["port"], txn_offset_group, topic, txn_offset_committed_offset
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
+        wait_for_transaction_end(broker["port"], txn_offset_txn)
         wait_for_transaction_end(broker["port"], controller_failover_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r1")
@@ -3688,6 +3847,9 @@ def main():
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
             broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
+        wait_for_committed_offset(
+            broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
@@ -3730,6 +3892,9 @@ def main():
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
             broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
+        wait_for_committed_offset(
+            broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
@@ -3780,6 +3945,9 @@ def main():
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
             broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
+        wait_for_committed_offset(
+            broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], broker_restart_txn)
@@ -3905,7 +4073,8 @@ def main():
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"committed_offset={committed_offset}, "
-            f"transactions_checked=3, "
+            f"transactions_checked=4, "
+            f"txn_offset_commit_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"delete_groups_checked=true, "
             f"classic_group_heartbeats=true, "
@@ -4034,6 +4203,15 @@ def self_test():
         add_txn_fixture += write_string("txn-self-test")
         add_txn_fixture += struct.pack(">iih", 1, 0, 0)
         parse_add_partitions_to_txn_response(add_txn_fixture, 45, "txn-self-test")
+
+        add_offsets_fixture = struct.pack(">iih", 51, 0, 0)
+        parse_add_offsets_to_txn_response(add_offsets_fixture, 51)
+
+        txn_offset_fixture = struct.pack(">ii", 52, 0)
+        txn_offset_fixture += struct.pack(">i", 1)
+        txn_offset_fixture += write_string("txn-offset-self-test")
+        txn_offset_fixture += struct.pack(">iih", 1, 0, 0)
+        parse_txn_offset_commit_response(txn_offset_fixture, 52, "txn-offset-self-test")
 
         end_txn_fixture = struct.pack(">iih", 46, 0, 0)
         parse_end_txn_response(end_txn_fixture, 46)
