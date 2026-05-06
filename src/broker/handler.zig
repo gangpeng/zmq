@@ -28119,7 +28119,7 @@ pub const Broker = struct {
 
         if (pos != request_bytes.len) {
             log.warn("ElectLeaders request has {d} trailing bytes", .{request_bytes.len - pos});
-            return null;
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         const top_error: i16 = if (req.election_type == 0 or req.election_type == 1)
@@ -28134,7 +28134,7 @@ pub const Broker = struct {
                     // If we're not the leader, start an election
                     _ = raft.startElection() catch |err| {
                         log.warn("ElectLeaders skipped: failed to persist raft.meta: {}", .{err});
-                        return null;
+                        return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
                     };
                     if (raft.quorumSize() <= 1) {
                         raft.becomeLeader();
@@ -28156,7 +28156,10 @@ pub const Broker = struct {
                 while (tit.next()) |entry| {
                     const info = entry.value_ptr;
                     const partition_count: usize = @intCast(info.num_partitions);
-                    const partition_results = self.allocator.alloc(PartitionResult, partition_count) catch return null;
+                    const partition_results = self.allocator.alloc(PartitionResult, partition_count) catch |err| {
+                        log.warn("ElectLeaders partition response materialization failed: {}", .{err});
+                        return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                    };
                     for (0..partition_count) |pi| {
                         partition_results[pi] = .{
                             .partition_id = @intCast(pi),
@@ -28166,7 +28169,8 @@ pub const Broker = struct {
                     }
                     results.append(.{ .topic = info.name, .partition_result = partition_results }) catch {
                         self.allocator.free(partition_results);
-                        return null;
+                        log.warn("ElectLeaders response materialization failed", .{});
+                        return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
                     };
                 }
             } else {
@@ -28176,7 +28180,10 @@ pub const Broker = struct {
                     const requested_count = topic_partitions.partitions.len;
                     const partition_count: usize = if (requested_count > 0) requested_count else if (info) |topic_info| @intCast(topic_info.num_partitions) else 1;
 
-                    const partition_results = self.allocator.alloc(PartitionResult, partition_count) catch return null;
+                    const partition_results = self.allocator.alloc(PartitionResult, partition_count) catch |err| {
+                        log.warn("ElectLeaders partition response materialization failed: {}", .{err});
+                        return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                    };
 
                     if (info) |topic_info| {
                         for (0..partition_count) |i| {
@@ -28203,7 +28210,8 @@ pub const Broker = struct {
 
                     results.append(.{ .topic = topic_partitions.topic, .partition_result = partition_results }) catch {
                         self.allocator.free(partition_results);
-                        return null;
+                        log.warn("ElectLeaders response materialization failed", .{});
+                        return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
                     };
                 }
             }
@@ -28214,13 +28222,10 @@ pub const Broker = struct {
             .error_code = top_error,
             .replica_election_results = results.items,
         };
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
-        var buf = self.allocator.alloc(u8, needed) catch return null;
-        var wpos: usize = 0;
-        rh.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, api_version);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version) orelse {
+            log.warn("ElectLeaders response serialization failed", .{});
+            return self.electLeadersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeElectLeadersRequest(self: *Broker, req: *generated.elect_leaders_request.ElectLeadersRequest) void {
@@ -60681,6 +60686,74 @@ test "Broker.handleRequest ElectLeaders returns requested partition results" {
     try testing.expectEqual(@as(i16, 0), resp.replica_election_results[0].partition_result[0].error_code);
     try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.replica_election_results[0].partition_result[1].error_code);
+}
+
+test "Broker.handleRequest ElectLeaders fails closed when response materialization fails" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Req.TopicPartitions{.{
+        .topic = "elect-materialize-fail-topic",
+        .partitions = &.{},
+    }};
+    const req = Req{
+        .election_type = 0,
+        .topic_partitions = &topics,
+        .timeout_ms = 1000,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 43, 2, 4318, header_mod.requestHeaderVersion(43, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 43, 2, 4318);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
+test "Broker.handleRequest ElectLeaders fails closed when serialization fails" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .election_type = 0,
+        .topic_partitions = null,
+        .timeout_ms = 1000,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 43, 2, 4319, header_mod.requestHeaderVersion(43, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 43, 2, 4319);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ElectLeaders authorization denial uses generated response" {
