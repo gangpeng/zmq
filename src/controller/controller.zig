@@ -1901,7 +1901,7 @@ pub const Controller = struct {
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Controller, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
         log.warn("Unsupported API on controller port: {d}", .{api_key});
-        return self.errorResponse(req_header, resp_header_version, 35); // UNSUPPORTED_VERSION
+        return self.serializeSmallErrorResponse(req_header, resp_header_version, ErrorCode.unsupported_version, "controller unsupported API");
     }
 
     fn serializeGeneratedResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, resp_body: anytype, body_version: i16) ?[]u8 {
@@ -1917,14 +1917,20 @@ pub const Controller = struct {
         return buf[0..wpos];
     }
 
-    /// Build a simple error response.
-    fn errorResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, error_code: i16) ?[]u8 {
+    fn serializeSmallErrorResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, error_code: ErrorCode, label: []const u8) ?[]u8 {
+        return self.serializeSmallErrorResponseDirect(req_header, resp_header_version, error_code) orelse {
+            log.warn("{s} response serialization failed", .{label});
+            return self.serializeSmallErrorResponseDirect(req_header, resp_header_version, error_code);
+        };
+    }
+
+    fn serializeSmallErrorResponseDirect(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, error_code: ErrorCode) ?[]u8 {
         const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
         const header_size = resp_header.calcSize(resp_header_version);
         const buf = self.allocator.alloc(u8, header_size + 2) catch return null;
         var wpos: usize = 0;
         resp_header.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, error_code);
+        ser.writeI16(buf, &wpos, @intFromEnum(error_code));
         return buf[0..wpos];
     }
 };
@@ -2529,6 +2535,35 @@ test "Controller handleRequest unsupported API returns error" {
     // error_code: 35 (UNSUPPORTED_VERSION)
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 35), error_code);
+}
+
+test "Controller handleRequest unsupported API retries after allocation failure" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    const api_key: i16 = 1;
+    const api_version: i16 = 0;
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, api_key, api_version, 78, header_mod.requestHeaderVersion(api_key, api_version));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    ctrl.allocator = response_allocator;
+
+    const response = ctrl.handleRequest(buf[0..req_len]);
+    ctrl.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer resp_header.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 78), resp_header.correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+    try testing.expectEqual(response.?.len, rpos);
 }
 
 test "Controller handleRequest advertised APIs reject versions above catalog max before body decode" {
