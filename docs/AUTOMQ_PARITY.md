@@ -49,6 +49,9 @@ operator-facing behavior.
 - DescribeClientQuotas and DescribeUserScramCredentials generated error
   responses now also retry as storage errors after transient response
   allocation failures.
+- AlterUserScramCredentials now pre-serializes successful mutation responses and
+  retries generated storage-error responses so allocation pressure cannot change
+  SCRAM credential state while returning no response frame.
 - UpdateFeatures now pre-serializes successful mutation responses and retries
   generated storage-error responses so allocation pressure cannot finalize
   feature metadata while returning no response frame.
