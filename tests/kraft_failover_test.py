@@ -1634,6 +1634,105 @@ def heartbeat_group(port, group_state, correlation_id):
     parse_heartbeat_response(response, correlation_id)
 
 
+def parse_describe_groups_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"DescribeGroups correlation mismatch: {response_correlation}")
+    group_count, pos = read_i32(response, pos)
+    groups = []
+    for _ in range(group_count):
+        error_code, pos = read_i16(response, pos)
+        group_id, pos = read_string(response, pos)
+        group_state, pos = read_string(response, pos)
+        protocol_type, pos = read_string(response, pos)
+        protocol_data, pos = read_string(response, pos)
+        member_count, pos = read_i32(response, pos)
+        members = []
+        for _ in range(member_count):
+            member_id, pos = read_string(response, pos)
+            client_id, pos = read_string(response, pos)
+            client_host, pos = read_string(response, pos)
+            member_metadata, pos = read_bytes(response, pos)
+            member_assignment, pos = read_bytes(response, pos)
+            members.append(
+                {
+                    "member_id": member_id,
+                    "client_id": client_id,
+                    "client_host": client_host,
+                    "member_metadata": member_metadata,
+                    "member_assignment": member_assignment,
+                }
+            )
+        groups.append(
+            {
+                "error_code": error_code,
+                "group_id": group_id,
+                "group_state": group_state,
+                "protocol_type": protocol_type,
+                "protocol_data": protocol_data,
+                "members": members,
+            }
+        )
+    if pos != len(response):
+        raise TestError(f"DescribeGroups response trailing bytes: {len(response) - pos}")
+    return groups
+
+
+def describe_group(port, group_id, correlation_id):
+    body = struct.pack(">i", 1)
+    body += write_string(group_id)
+    response = controller_request(port, 15, 0, correlation_id, body)
+    groups = parse_describe_groups_response(response, correlation_id)
+    if len(groups) != 1:
+        raise TestError(f"DescribeGroups count={len(groups)}")
+    return groups[0]
+
+
+def assert_group_description(port, group_state, correlation_id):
+    described = describe_group(port, group_state["group_id"], correlation_id)
+    if described["error_code"] != 0:
+        raise TestError(
+            f"DescribeGroups {group_state['group_id']!r} error_code="
+            f"{described['error_code']}"
+        )
+    if described["group_state"] != "Stable":
+        raise TestError(f"DescribeGroups state={described['group_state']!r}")
+    if described["protocol_type"] != "consumer" or described["protocol_data"] != "range":
+        raise TestError(f"DescribeGroups protocol mismatch: {described}")
+    matching_member = next(
+        (
+            member
+            for member in described["members"]
+            if member["member_id"] == group_state["member_id"]
+        ),
+        None,
+    )
+    if matching_member is None:
+        raise TestError(f"DescribeGroups missing member: {described}")
+    if matching_member["member_metadata"] != b"range-metadata":
+        raise TestError(f"DescribeGroups member metadata mismatch: {matching_member}")
+    if matching_member["member_assignment"] != b"kraft-failover-assignment":
+        raise TestError(f"DescribeGroups member assignment mismatch: {matching_member}")
+
+
+def wait_for_group_description(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7300
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert_group_description(port, group_state, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"group description {group_state['group_id']!r} was not stable: {last_error}"
+    )
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -3974,6 +4073,7 @@ def main():
             broker["port"],
             f"{group}-classic",
         )
+        wait_for_group_description(broker["port"], classic_group_state)
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -3996,6 +4096,7 @@ def main():
             broker["port"], abort_failover_txn, "Ongoing", txn_topic
         )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
+        wait_for_group_description(broker["port"], classic_group_state)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -4032,6 +4133,7 @@ def main():
             broker["port"], controller_failover_txn, "CompleteCommit"
         )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
+        wait_for_group_description(broker["port"], classic_group_state)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -4078,6 +4180,7 @@ def main():
             broker["port"], abort_failover_txn, "CompleteAbort"
         )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
+        wait_for_group_description(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -4129,6 +4232,7 @@ def main():
             broker["port"], abort_failover_txn, "CompleteAbort"
         )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
+        wait_for_group_description(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -4192,6 +4296,7 @@ def main():
         )
         wait_for_transaction_end(broker["port"], broker_restart_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
+        wait_for_group_description(broker["port"], classic_group_state)
         duplicate_idempotent = wait_for_record_batch_result(
             broker["port"],
             idempotent_topic,
@@ -4320,6 +4425,7 @@ def main():
             f"idempotent_producer_fencing=true, "
             f"delete_groups_checked=true, "
             f"classic_group_heartbeats=true, "
+            f"group_describe_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -4520,6 +4626,30 @@ def self_test():
 
         heartbeat_fixture = struct.pack(">ih", 49, 0)
         parse_heartbeat_response(heartbeat_fixture, 49)
+
+        describe_group_fixture = struct.pack(">i", 55)
+        describe_group_fixture += struct.pack(">i", 1)
+        describe_group_fixture += struct.pack(">h", 0)
+        describe_group_fixture += write_string("describe-group-self-test")
+        describe_group_fixture += write_string("Stable")
+        describe_group_fixture += write_string("consumer")
+        describe_group_fixture += write_string("range")
+        describe_group_fixture += struct.pack(">i", 1)
+        describe_group_fixture += write_string("member-1")
+        describe_group_fixture += write_string("zmq-client")
+        describe_group_fixture += write_string("/127.0.0.1")
+        describe_group_fixture += write_bytes(b"range-metadata")
+        describe_group_fixture += write_bytes(b"kraft-failover-assignment")
+        described_groups = parse_describe_groups_response(describe_group_fixture, 55)
+        if (
+            len(described_groups) != 1
+            or described_groups[0]["group_id"] != "describe-group-self-test"
+            or described_groups[0]["group_state"] != "Stable"
+            or described_groups[0]["members"][0]["member_id"] != "member-1"
+            or described_groups[0]["members"][0]["member_assignment"]
+            != b"kraft-failover-assignment"
+        ):
+            raise TestError(f"DescribeGroups fixture parser failed: {described_groups}")
 
         leave_fixture = struct.pack(">ih", 50, 0)
         parse_leave_group_response(leave_fixture, 50)
