@@ -627,6 +627,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   authorization-denial builders now also return generated invalid-request or
   storage-error responses instead of dropping denied connections when malformed
   frames or response construction failures are encountered.
+  Telemetry, ListClientMetricsResources, and DescribeTopicPartitions
+  authorization-denial builders now follow the same generated fail-closed
+  behavior for malformed denied frames and response serialization or
+  materialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

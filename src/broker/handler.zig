@@ -9681,13 +9681,13 @@ pub const Broker = struct {
 
         if (!validateGetTelemetrySubscriptionsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied GetTelemetrySubscriptions request", .{});
-            return null;
+            return self.getTelemetrySubscriptionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied GetTelemetrySubscriptions request: {}", .{err});
-            return null;
+            return self.getTelemetrySubscriptionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{
@@ -9701,7 +9701,10 @@ pub const Broker = struct {
             .delta_temporality = false,
             .requested_metrics = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetTelemetrySubscriptions denied response serialization failed", .{});
+            return self.getTelemetrySubscriptionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handlePushTelemetryAuthorizationError(
@@ -9718,20 +9721,23 @@ pub const Broker = struct {
 
         if (!validatePushTelemetryRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied PushTelemetry request", .{});
-            return null;
+            return self.pushTelemetryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied PushTelemetry request: {}", .{err});
-            return null;
+            return self.pushTelemetryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("PushTelemetry denied response serialization failed", .{});
+            return self.pushTelemetryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleAlterReplicaLogDirsAuthorizationError(
@@ -9843,13 +9849,13 @@ pub const Broker = struct {
 
         if (!validateListClientMetricsResourcesRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ListClientMetricsResources request", .{});
-            return null;
+            return self.listClientMetricsResourcesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ListClientMetricsResources request: {}", .{err});
-            return null;
+            return self.listClientMetricsResourcesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{
@@ -9857,7 +9863,10 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .client_metrics_resources = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListClientMetricsResources denied response serialization failed", .{});
+            return self.listClientMetricsResourcesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleDescribeTopicPartitionsAuthorizationError(
@@ -9875,19 +9884,22 @@ pub const Broker = struct {
 
         if (!validateDescribeTopicPartitionsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied DescribeTopicPartitions request", .{});
-            return null;
+            return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeTopicPartitions request: {}", .{err});
-            return null;
+            return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeTopicPartitionsRequest(&req);
 
         var topics: []TopicResponse = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+                log.warn("DescribeTopicPartitions denied response materialization failed: {}", .{err});
+                return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer if (topics.len > 0) self.allocator.free(topics);
 
@@ -9907,7 +9919,10 @@ pub const Broker = struct {
             .topics = topics,
             .next_cursor = null,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeTopicPartitions denied response serialization failed", .{});
+            return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleCreateStreamsAuthorizationError(
@@ -41880,6 +41895,53 @@ test "Broker.handleRequest GetTelemetrySubscriptions authorization denial uses g
     try testing.expectEqual(@as(usize, 0), resp.requested_metrics.len);
 }
 
+test "Broker.handleRequest GetTelemetrySubscriptions authorization denial rejects malformed request" {
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 71, 0, 7115, header_mod.requestHeaderVersion(71, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 71, 0, 7115);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest GetTelemetrySubscriptions authorization denial fails closed when serialization fails" {
+    const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const client_id = [_]u8{8} ** 16;
+    const req = Req{ .client_instance_id = client_id };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 71, 0, 7116, header_mod.requestHeaderVersion(71, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 71, 0, 7116);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest GetTelemetrySubscriptions rejects truncated request" {
     const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
 
@@ -42273,6 +42335,62 @@ test "Broker.handleRequest PushTelemetry authorization denial uses generated res
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry authorization denial rejects malformed request" {
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 72, 0, 7215, header_mod.requestHeaderVersion(72, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 72, 0, 7215);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest PushTelemetry authorization denial fails closed when serialization fails" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const client_id = [_]u8{7} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7216, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 72, 0, 7216);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expectEqual(@as(usize, 0), broker.client_telemetry_samples.count());
 }
 
 test "Broker.handleRequest PushTelemetry rejects truncated request" {
@@ -43693,6 +43811,53 @@ test "Broker.handleRequest ListClientMetricsResources authorization denial uses 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
     try testing.expectEqual(@as(usize, 0), resp.client_metrics_resources.len);
+}
+
+test "Broker.handleRequest ListClientMetricsResources authorization denial rejects malformed request" {
+    const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 74, 0, 7415, header_mod.requestHeaderVersion(74, 0));
+    ser.writeI8(&buf, &pos, 0x7f);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 74, 0, 7415);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest ListClientMetricsResources authorization denial fails closed when serialization fails" {
+    const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+    const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 74, 0, 7416, header_mod.requestHeaderVersion(74, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 74, 0, 7416);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ListClientMetricsResources rejects truncated request" {
@@ -52648,6 +52813,82 @@ test "Broker.handleRequest DescribeTopicPartitions authorization denial uses gen
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[1].error_code);
     try testing.expectEqual(@as(usize, 0), resp.topics[1].partitions.len);
     try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.topics[1].topic_authorized_operations);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 3, 19093);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 75, 0, 7515, header_mod.requestHeaderVersion(75, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeTopicPartitionsErrorResponseBytes(response.?, 7515, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions authorization denial fails closed when response materialization fails" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+
+    var broker = Broker.init(testing.allocator, 3, 19093);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const topics = [_]Req.TopicRequest{.{ .name = "dtp-denied-materialize-fail" }};
+    const req = Req{
+        .topics = &topics,
+        .response_partition_limit = 10,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7516, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTopicPartitionsErrorResponseBytes(response.?, 7516, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+
+    var broker = Broker.init(testing.allocator, 3, 19093);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{
+        .topics = &.{},
+        .response_partition_limit = 10,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7517, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTopicPartitionsErrorResponseBytes(response.?, 7517, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DescribeTopicPartitions rejects truncated request" {
