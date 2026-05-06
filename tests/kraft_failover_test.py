@@ -2853,6 +2853,59 @@ def wait_for_consumer_group_heartbeat_rack_update(
     )
 
 
+def wait_for_consumer_group_heartbeat_subscription_update(
+    port, group_state, topic, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7840
+    last_error = None
+    previous_epoch = group_state["member_epoch"]
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+                subscribed_topics=[topic],
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat subscription update error_code="
+                    f"{response['error_code']} message={response['error_message']!r}"
+                )
+            if response["member_id"] != group_state["member_id"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat subscription update member mismatch: "
+                    f"{response}"
+                )
+            if response["member_epoch"] <= previous_epoch:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat subscription update epoch did not "
+                    f"advance: {response}"
+                )
+            assignment = response["assignment"]
+            if assignment is None or not assignment["topic_partitions"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat subscription update missing assignment: "
+                    f"{response}"
+                )
+            topic_assignment = assignment["topic_partitions"][0]
+            group_state["member_epoch"] = response["member_epoch"]
+            group_state["topic_id"] = topic_assignment["topic_id"]
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat subscription update did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
 def wait_for_consumer_group_heartbeat_leave(port, group_state, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 7850
@@ -3087,6 +3140,12 @@ def wait_for_kip848_consumer_group_description(
 
 def wait_for_kip848_static_member_checkpoint(port, group_state, topic):
     wait_for_consumer_group_heartbeat_static_rejoin(port, group_state)
+    wait_for_kip848_consumer_group_description(port, group_state, topic)
+
+
+def wait_for_kip848_subscription_checkpoint(port, group_state, topic):
+    wait_for_consumer_group_heartbeat(port, group_state)
+    wait_for_consumer_group_heartbeat_owned_assignment(port, group_state)
     wait_for_kip848_consumer_group_description(port, group_state, topic)
 
 
@@ -5365,10 +5424,12 @@ def main():
         txn_offset_group = f"{group}-txn-offset"
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
+        kip848_subscription_topic = f"{topic}-kip848-subscription"
         expected_payloads = []
         wait_for_topic(broker["port"], topic)
         wait_for_topic(broker["port"], txn_topic)
         wait_for_topic(broker["port"], idempotent_topic)
+        wait_for_topic(broker["port"], kip848_subscription_topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         committed_offset = first_offset + 1
@@ -5466,6 +5527,21 @@ def main():
             kip848_static_group_state,
             topic,
         )
+        kip848_subscription_group_state = wait_for_consumer_group_heartbeat_join(
+            broker["port"],
+            f"{group}-kip848-subscription",
+            topic,
+        )
+        wait_for_consumer_group_heartbeat_subscription_update(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -5513,6 +5589,11 @@ def main():
             broker["port"],
             kip848_static_group_state,
             topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5592,6 +5673,11 @@ def main():
             broker["port"],
             kip848_static_group_state,
             topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5675,6 +5761,11 @@ def main():
             broker["port"],
             kip848_static_group_state,
             topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5768,6 +5859,11 @@ def main():
             broker["port"],
             kip848_static_group_state,
             topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5866,6 +5962,11 @@ def main():
             broker["port"],
             kip848_static_group_state,
             topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -5976,6 +6077,11 @@ def main():
             broker["port"],
             kip848_static_group_state,
             topic,
+        )
+        wait_for_kip848_subscription_checkpoint(
+            broker["port"],
+            kip848_subscription_group_state,
+            kip848_subscription_topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6139,6 +6245,7 @@ def main():
             f"kip848_rejoin_checked=true, "
             f"kip848_rack_checked=true, "
             f"kip848_owned_assignment_checked=true, "
+            f"kip848_subscription_update_checked=true, "
             f"kip848_static_rejoin_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
