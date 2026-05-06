@@ -1537,6 +1537,38 @@ def wait_for_controller_api_versions_checkpoint(
     )
 
 
+def wait_for_all_controller_api_versions_checkpoint(
+    processes,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9860)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if info["proc"].poll() is not None:
+                    continue
+                response = api_versions_v3(info["port"], correlation_id)
+                correlation_id += 1
+                require_controller_api_versions(response)
+                checked[node_id] = len(response["apis"])
+            if not checked:
+                raise TestError(f"no live controllers to probe during {label}")
+            state["correlation_id"] = correlation_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"all-controller ApiVersions did not recover during {label}: {last_error}"
+    )
+
+
 def parse_controller_small_error_response(response, correlation_id, response_name):
     pos = parse_flexible_response_header(response, correlation_id)
     error_code, pos = read_i16(response, pos)
@@ -11153,6 +11185,12 @@ def main():
             controller_api_versions_state,
             "initial leader",
         )
+        all_controller_api_versions_state = {"correlation_id": 9860}
+        wait_for_all_controller_api_versions_checkpoint(
+            processes,
+            all_controller_api_versions_state,
+            "initial leader",
+        )
         controller_unsupported_state = {"correlation_id": 9740}
         wait_for_controller_unsupported_checkpoint(
             processes[leader_id]["port"],
@@ -11818,6 +11856,11 @@ def main():
                 controller_api_versions_state,
                 "network partition matrix",
             )
+            wait_for_all_controller_api_versions_checkpoint(
+                processes,
+                all_controller_api_versions_state,
+                "network partition matrix",
+            )
             wait_for_controller_unsupported_checkpoint(
                 processes[leader_id]["port"],
                 controller_unsupported_state,
@@ -11983,6 +12026,11 @@ def main():
         wait_for_controller_api_versions_checkpoint(
             processes[replacement_leader]["port"],
             controller_api_versions_state,
+            "controller leader failover",
+        )
+        wait_for_all_controller_api_versions_checkpoint(
+            processes,
+            all_controller_api_versions_state,
             "controller leader failover",
         )
         wait_for_controller_unsupported_checkpoint(
@@ -12188,6 +12236,11 @@ def main():
             controller_api_versions_state,
             "old leader fresh rejoin",
         )
+        wait_for_all_controller_api_versions_checkpoint(
+            processes,
+            all_controller_api_versions_state,
+            "old leader fresh rejoin",
+        )
         wait_for_controller_unsupported_checkpoint(
             processes[replacement_leader]["port"],
             controller_unsupported_state,
@@ -12388,6 +12441,11 @@ def main():
             controller_api_versions_state,
             "surviving controller restart",
         )
+        wait_for_all_controller_api_versions_checkpoint(
+            processes,
+            all_controller_api_versions_state,
+            "surviving controller restart",
+        )
         wait_for_controller_unsupported_checkpoint(
             processes[replacement_leader]["port"],
             controller_unsupported_state,
@@ -12573,6 +12631,11 @@ def main():
         wait_for_controller_api_versions_checkpoint(
             processes[replacement_leader]["port"],
             controller_api_versions_state,
+            "broker restart",
+        )
+        wait_for_all_controller_api_versions_checkpoint(
+            processes,
+            all_controller_api_versions_state,
             "broker restart",
         )
         wait_for_controller_unsupported_checkpoint(
@@ -12886,6 +12949,7 @@ def main():
             f"describe_quorum_v2_checked=true, "
             f"fetch_snapshot_v1_checked=true, "
             f"controller_api_versions_checked=true, "
+            f"all_controller_api_versions_checked=true, "
             f"controller_unsupported_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
             f"all_controller_describe_quorum_v2_checked=true, "

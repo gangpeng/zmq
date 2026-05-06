@@ -48,7 +48,7 @@ operator-facing behavior.
   FetchSnapshot v1 is live-probed directly against the active controller and
   verifies request-scoped `SNAPSHOT_NOT_FOUND` responses plus current-leader
   endpoint routing metadata through failover checkpoints.
-  Controller ApiVersions v3 is live-probed directly against the active
+  Controller ApiVersions v3 is live-probed directly against every alive
   controller and verifies the audited controller catalog while keeping telemetry
   keys 71/72 absent through failover checkpoints.
   AlterClientQuotas/DescribeClientQuotas v1 are live-probed with a real client
@@ -361,8 +361,8 @@ listener endpoint metadata and voter directory IDs through the same transition
 set. Direct FetchSnapshot v1 probes now verify request-scoped
 `SNAPSHOT_NOT_FOUND` handling and current-leader endpoint routing metadata
 through the same transition set. Direct controller ApiVersions v3 probes now
-verify the exact audited controller catalog and telemetry-key absence through
-the same transition set.
+verify the exact audited controller catalog and telemetry-key absence on every
+alive controller through the same transition set.
 
 Latest default-suite fail-closed tranche: metadata-client controller discovery
 now surfaces malformed DescribeQuorum responses, including trailing response
@@ -686,6 +686,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   The same gate now probes each advertised controller key at `max_version + 1`
   plus telemetry keys 71/72, verifying live `unsupported_version` responses
   across controller failover and restart.
+  Controller ApiVersions v3 catalog and telemetry-key absence are now checked on
+  every alive controller, not just the active leader, after controller failover
+  and rolling restart transitions.
   DescribeQuorum v2 endpoint/directory metadata is now checked on every alive
   controller, not just the active leader, after controller failover and rolling
   restart transitions.
@@ -1417,6 +1420,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   committed voter endpoints, and
   live unsupported-version/unsupported-key controller guard responses remain
   stable across the advertised controller catalog, and
+  Controller ApiVersions v3 catalog visibility is checked on every alive
+  controller after failover/restart transitions, and
   DescribeQuorum v2 endpoint metadata is checked on every alive controller
   after failover/restart transitions, and
   keys 71/72 remain telemetry-only/unsupported on the controller port.
