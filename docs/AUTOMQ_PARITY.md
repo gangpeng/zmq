@@ -669,6 +669,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   OffsetFetch, and OffsetDelete now also fail closed with generated
   invalid-request or storage-error responses when denied frames are malformed or
   denial response construction or serialization fails.
+  Topic-admin authorization-denial builders for ApiVersions, CreateTopics, and
+  DeleteTopics now do the same for malformed denied frames and denial response
+  materialization or serialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

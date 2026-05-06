@@ -6610,7 +6610,7 @@ pub const Broker = struct {
         var pos = body_start;
         _ = Req.deserialize(self.allocator, request_bytes, &pos, body_version) catch |err| {
             log.warn("Malformed denied ApiVersions request: {}", .{err});
-            return null;
+            return self.apiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.invalid_request.toInt());
         };
 
         const resp_body = ApiVersionsResponse{
@@ -6618,7 +6618,10 @@ pub const Broker = struct {
             .api_keys = &.{},
             .throttle_time_ms = 0,
         };
-        return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version);
+        return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version) orelse {
+            log.warn("ApiVersions denied response serialization failed", .{});
+            return self.apiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.kafka_storage_error.toInt());
+        };
     }
 
     fn handleCreateTopicsAuthorizationError(
@@ -6636,19 +6639,22 @@ pub const Broker = struct {
 
         if (!validateCreateTopicsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied CreateTopics request", .{});
-            return null;
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied CreateTopics request: {}", .{err});
-            return null;
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeCreateTopicsRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("CreateTopics denied response allocation failed: {}", .{err});
+                return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build CreateTopics authorization response");
+            };
         }
         defer if (topics.len > 0) self.allocator.free(topics);
 
@@ -6669,6 +6675,29 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics,
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreateTopics denied response serialization failed", .{});
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreateTopics authorization response");
+        };
+    }
+
+    fn createTopicsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.create_topics_response.CreateTopicsResponse;
+        const TopicResult = Resp.CreatableTopicResult;
+        const topics = [_]TopicResult{.{
+            .name = "",
+            .topic_id = zeroUuid(),
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .topic_config_error_code = 0,
+            .num_partitions = -1,
+            .replication_factor = -1,
+            .configs = null,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -6687,20 +6716,23 @@ pub const Broker = struct {
 
         if (!validateDeleteTopicsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied DeleteTopics request", .{});
-            return null;
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DeleteTopics request: {}", .{err});
-            return null;
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDeleteTopicsRequest(&req);
 
         const response_count = if (api_version >= 6) req.topics.len else req.topic_names.len;
         var responses: []TopicResult = &.{};
         if (response_count > 0) {
-            responses = self.allocator.alloc(TopicResult, response_count) catch return null;
+            responses = self.allocator.alloc(TopicResult, response_count) catch |err| {
+                log.warn("DeleteTopics denied response allocation failed: {}", .{err});
+                return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build DeleteTopics authorization response");
+            };
         }
         defer if (responses.len > 0) self.allocator.free(responses);
 
@@ -6727,6 +6759,25 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteTopics denied response serialization failed", .{});
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteTopics authorization response");
+        };
+    }
+
+    fn deleteTopicsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+        const TopicResult = Resp.DeletableTopicResult;
+        const responses = [_]TopicResult{.{
+            .name = "",
+            .topic_id = zeroUuid(),
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = &responses,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -30626,6 +30677,79 @@ fn expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(
     defer response_allocator.free(response.?);
 
     const error_code = try readCommittedOffsetAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
+fn addTopicAdminAuthorizationAcls(broker: *Broker) !void {
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .create, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .delete, .allow, "*");
+}
+
+fn freeDeserializedCreateTopicsResponse(resp: *const generated.create_topics_response.CreateTopicsResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.configs) |configs| {
+            if (configs.len > 0) testing.allocator.free(configs);
+        }
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn readTopicAdminAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    switch (api_key) {
+        18 => {
+            const Resp = generated.api_versions_response.ApiVersionsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedApiVersionsResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        19 => {
+            const Resp = generated.create_topics_response.CreateTopicsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedCreateTopicsResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            return resp.topics[0].error_code;
+        },
+        20 => {
+            const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.responses.len);
+            return resp.responses[0].error_code;
+        },
+        else => return error.UnsupportedApiKey,
+    }
+}
+
+fn expectTopicAdminAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readTopicAdminAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
 }
 
@@ -64174,6 +64298,124 @@ test "Broker.handleRequest DeleteTopics authorization denial uses generated resp
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.responses[0].error_code);
     try testing.expectEqualStrings("Not authorized", resp.responses[0].error_message.?);
     try testing.expect(broker.topics.contains("dt-denied-topic"));
+}
+
+test "Broker.handleRequest topic-admin authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addTopicAdminAuthorizationAcls(&broker);
+
+    const cases = [_]struct {
+        api_key: i16,
+        api_version: i16,
+        correlation_id: i32,
+    }{
+        .{ .api_key = 18, .api_version = 3, .correlation_id = 1816 },
+        .{ .api_key = 19, .api_version = 7, .correlation_id = 1916 },
+        .{ .api_key = 20, .api_version = 6, .correlation_id = 2017 },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, case.api_key, case.api_version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.api_version));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readTopicAdminAuthorizationErrorCode(response.?, case.api_key, case.api_version, case.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+    }
+}
+
+test "Broker.handleRequest topic-admin authorization denial fails closed when serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addTopicAdminAuthorizationAcls(&broker);
+
+    {
+        const Req = generated.api_versions_request.ApiVersionsRequest;
+        const req = Req{
+            .client_software_name = "zmq-denied-serialize-fail",
+            .client_software_version = "0.1.0",
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 18, 3, 1817, header_mod.requestHeaderVersion(18, 3));
+        req.serialize(&buf, &pos, 3);
+
+        try expectTopicAdminAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 18, 3, 1817, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.create_topics_request.CreateTopicsRequest;
+        const req = Req{
+            .topics = &.{},
+            .timeout_ms = 30000,
+            .validate_only = false,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 19, 7, 1917, header_mod.requestHeaderVersion(19, 7));
+        req.serialize(&buf, &pos, 7);
+
+        try expectTopicAdminAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 19, 7, 1917, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.delete_topics_request.DeleteTopicsRequest;
+        const req = Req{
+            .topics = &.{},
+            .timeout_ms = 30000,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 20, 6, 2018, header_mod.requestHeaderVersion(20, 6));
+        req.serialize(&buf, &pos, 6);
+
+        try expectTopicAdminAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 20, 6, 2018, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest topic-admin authorization denial fails closed when response construction fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addTopicAdminAuthorizationAcls(&broker);
+
+    {
+        const Req = generated.create_topics_request.CreateTopicsRequest;
+        const Topic = Req.CreatableTopic;
+        const topics = [_]Topic{.{
+            .name = "ct-denied-oom-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+        }};
+        const req = Req{
+            .topics = &topics,
+            .timeout_ms = 30000,
+            .validate_only = false,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 19, 7, 1918, header_mod.requestHeaderVersion(19, 7));
+        req.serialize(&buf, &pos, 7);
+
+        try expectTopicAdminAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 19, 7, 1918, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.delete_topics_request.DeleteTopicsRequest;
+        const Topic = Req.DeleteTopicState;
+        const topics = [_]Topic{.{
+            .name = "dt-denied-oom-topic",
+            .topic_id = [_]u8{0} ** 16,
+        }};
+        const req = Req{
+            .topics = &topics,
+            .timeout_ms = 30000,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 20, 6, 2019, header_mod.requestHeaderVersion(20, 6));
+        req.serialize(&buf, &pos, 6);
+
+        try expectTopicAdminAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 20, 6, 2019, 1, ErrorCode.kafka_storage_error);
+    }
 }
 
 test "Broker.handleRequest DeleteTopics clears ongoing reassignments for deleted topic" {
