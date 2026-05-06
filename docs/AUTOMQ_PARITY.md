@@ -592,7 +592,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   local cleanup checkpoints fail.
   DescribeClientQuotas now advertises key 48 v0-v1, decodes generated
   legacy/flexible requests, rejects malformed and semantically invalid filters,
-  and returns generated QuotaManager-backed per-client quota entries.
+  returns generated QuotaManager-backed per-client quota entries, and emits
+  generated storage-error responses when response materialization or
+  serialization fails.
   AlterClientQuotas now advertises key 49 v0-v1, decodes generated
   legacy/flexible requests, validates quota entities and keys, supports
   validate-only, mutates/removes QuotaManager-backed client/default quotas,
@@ -607,6 +609,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   flexible requests, rejects malformed frames, describes requested or all
   SCRAM-SHA-256 users, reports missing users per result, and preserves the
   nullable `Users` wire encoding while keeping null and empty as describe-all.
+  Response materialization and serialization failures now return generated
+  storage-error responses instead of dropping the connection.
   AlterUserScramCredentials now advertises key 51 v0, decodes generated
   flexible requests, upserts/removes precomputed SCRAM-SHA-256 credentials,
   rejects unsupported mechanisms, exposes mutations through Describe, writes

@@ -21467,7 +21467,10 @@ pub const Broker = struct {
             .error_message = if (request_error == @intFromEnum(ErrorCode.none)) null else "Invalid client quota filter",
             .entries = entries,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeClientQuotas response serialization failed", .{});
+            return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize client quota response");
+        };
     }
 
     fn describeClientQuotasErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
@@ -21911,7 +21914,10 @@ pub const Broker = struct {
             .error_message = null,
             .results = results[0..results_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeUserScramCredentials response serialization failed", .{});
+            return self.describeUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize SCRAM credential response");
+        };
     }
 
     fn describeUserScramCredentialsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
@@ -39673,6 +39679,34 @@ test "Broker.handleRequest DescribeClientQuotas fails closed when response mater
     try testing.expect(resp.entries == null);
 }
 
+test "Broker.handleRequest DescribeClientQuotas fails closed when response serialization fails" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4807, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 48, 1, 4807);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest AlterClientQuotas v1 mutates quotas and DescribeClientQuotas reads them" {
     const AlterReq = generated.alter_client_quotas_request.AlterClientQuotasRequest;
     const AlterResp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
@@ -40408,6 +40442,34 @@ test "Broker.handleRequest DescribeUserScramCredentials fails closed when respon
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
     try testing.expect(resp.error_message != null);
     try testing.expectEqual(@as(usize, 0), resp.results.len);
+}
+
+test "Broker.handleRequest DescribeUserScramCredentials fails closed when response serialization fails" {
+    const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+    const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 50, 0, 5008, header_mod.requestHeaderVersion(50, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 50, 0, 5008);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest AlterUserScramCredentials upserts SCRAM user and Describe reads it" {
