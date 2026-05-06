@@ -24629,15 +24629,13 @@ pub const Broker = struct {
 
         if (!validateSaslHandshakeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed SaslHandshake request", .{});
-            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .mechanisms = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeSaslHandshakeResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request.toInt(), &.{});
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode SaslHandshake request: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .mechanisms = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeSaslHandshakeResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request.toInt(), &.{});
         };
 
         const mechanism = req.mechanism orelse "";
@@ -24645,21 +24643,60 @@ pub const Broker = struct {
 
         const mechanisms = self.collectSaslMechanisms() catch |err| {
             log.warn("SASL handshake mechanism response allocation failed: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .mechanisms = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeSaslHandshakeResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), &.{});
         };
         defer if (mechanisms.len > 0) self.allocator.free(mechanisms);
+
+        const resp = Resp{
+            .error_code = if (is_enabled) @intFromEnum(ErrorCode.none) else @intFromEnum(ErrorCode.unsupported_sasl_mechanism),
+            .mechanisms = mechanisms,
+        };
+        const response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("SaslHandshake response serialization failed", .{});
+            return self.saslHandshakeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), &.{});
+        };
 
         if (is_enabled) {
             self.storeSaslMechanism(req_header.client_id, mechanism) catch |err| {
                 log.warn("SASL handshake: failed to store mechanism for client: {}", .{err});
-                const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .mechanisms = mechanisms };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                self.allocator.free(response);
+                return self.serializeSaslHandshakeResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), mechanisms);
             };
         }
 
+        return response;
+    }
+
+    fn serializeSaslHandshakeResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        error_code: i16,
+        mechanisms: []const ?[]const u8,
+    ) ?[]u8 {
+        const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
         const resp = Resp{
-            .error_code = if (is_enabled) @intFromEnum(ErrorCode.none) else @intFromEnum(ErrorCode.unsupported_sasl_mechanism),
+            .error_code = error_code,
+            .mechanisms = mechanisms,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("SaslHandshake response serialization failed", .{});
+            return self.saslHandshakeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), &.{});
+        };
+    }
+
+    fn saslHandshakeErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        error_code: i16,
+        mechanisms: []const ?[]const u8,
+    ) ?[]u8 {
+        const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
+        const resp = Resp{
+            .error_code = error_code,
             .mechanisms = mechanisms,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -24793,12 +24830,19 @@ pub const Broker = struct {
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
                             return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                         };
-                        if (!self.storeAuthenticatedPrincipal(client_id, full_principal, false, result.expires_at_ms)) {
-                            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
-                        }
                         const now_ms = @import("time_compat").milliTimestamp();
                         const session_lifetime_ms = if (result.expires_at_ms) |expires_at_ms| @max(@as(i64, 0), expires_at_ms - now_ms) else 0;
-                        return self.serializeSaslAuthenticateResponseWithLifetime(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{}, session_lifetime_ms);
+                        return self.completeSaslAuthentication(
+                            req_header,
+                            resp_header_version,
+                            api_version,
+                            client_id,
+                            full_principal,
+                            false,
+                            result.expires_at_ms,
+                            &.{},
+                            session_lifetime_ms,
+                        );
                     }
                 }
             }
@@ -24839,10 +24883,20 @@ pub const Broker = struct {
                                 std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
                                     return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                                 };
-                            if (!self.storeAuthenticatedPrincipal(client_id, full_principal, via_delegation_token, session_expires_at_ms)) {
-                                self.removeScramSession(client_id);
-                                return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
-                            }
+                            const session_lifetime_ms = if (sm.authorization_expires_at_ms) |expires_at_ms| @max(@as(i64, 0), expires_at_ms - now_ms) else 0;
+                            const response = self.completeSaslAuthentication(
+                                req_header,
+                                resp_header_version,
+                                api_version,
+                                client_id,
+                                full_principal,
+                                via_delegation_token,
+                                session_expires_at_ms,
+                                server_final,
+                                session_lifetime_ms,
+                            );
+                            self.removeScramSession(client_id);
+                            return response;
                         }
                         const session_lifetime_ms = if (sm.authorization_expires_at_ms) |expires_at_ms| @max(@as(i64, 0), expires_at_ms - now_ms) else 0;
                         const response = self.serializeSaslAuthenticateResponseWithLifetime(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", server_final, session_lifetime_ms);
@@ -24923,9 +24977,17 @@ pub const Broker = struct {
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
                             return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                         };
-                        if (!self.storeAuthenticatedPrincipal(client_id, full_principal, false, null)) {
-                            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
-                        }
+                        return self.completeSaslAuthentication(
+                            req_header,
+                            resp_header_version,
+                            api_version,
+                            client_id,
+                            full_principal,
+                            false,
+                            null,
+                            &.{},
+                            0,
+                        );
                     }
                     return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{});
                 }
@@ -24934,6 +24996,48 @@ pub const Broker = struct {
             // PLAIN authentication failed
             return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Authentication failed", &.{});
         }
+    }
+
+    fn completeSaslAuthentication(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        client_id: []const u8,
+        full_principal: []u8,
+        via_delegation_token: bool,
+        expires_at_ms: ?i64,
+        auth_bytes: ?[]const u8,
+        session_lifetime_ms: i64,
+    ) ?[]u8 {
+        const response = self.serializeSaslAuthenticateResponseDirect(
+            req_header,
+            resp_header_version,
+            api_version,
+            @intFromEnum(ErrorCode.none),
+            "",
+            auth_bytes,
+            session_lifetime_ms,
+        ) orelse {
+            self.allocator.free(full_principal);
+            log.warn("SaslAuthenticate success response serialization failed", .{});
+            return self.saslAuthenticateErrorResponse(
+                req_header,
+                resp_header_version,
+                api_version,
+                ErrorCode.kafka_storage_error.toInt(),
+                "Failed to serialize SASL authentication response",
+                &.{},
+                0,
+            );
+        };
+
+        if (!self.storeAuthenticatedPrincipal(client_id, full_principal, via_delegation_token, expires_at_ms)) {
+            self.allocator.free(response);
+            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+        }
+
+        return response;
     }
 
     fn resolveSaslMechanism(self: *Broker, client_id: []const u8) ?[]const u8 {
@@ -24947,6 +25051,41 @@ pub const Broker = struct {
     }
 
     fn serializeSaslAuthenticateResponseWithLifetime(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, error_message: ?[]const u8, auth_bytes: ?[]const u8, session_lifetime_ms: i64) ?[]u8 {
+        return self.serializeSaslAuthenticateResponseDirect(req_header, resp_header_version, api_version, error_code, error_message, auth_bytes, session_lifetime_ms) orelse {
+            log.warn("SaslAuthenticate response serialization failed", .{});
+            return self.saslAuthenticateErrorResponse(
+                req_header,
+                resp_header_version,
+                api_version,
+                ErrorCode.kafka_storage_error.toInt(),
+                "Failed to serialize SASL authentication response",
+                &.{},
+                0,
+            );
+        };
+    }
+
+    fn serializeSaslAuthenticateResponseDirect(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, error_message: ?[]const u8, auth_bytes: ?[]const u8, session_lifetime_ms: i64) ?[]u8 {
+        const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+        const resp = Resp{
+            .error_code = error_code,
+            .error_message = error_message,
+            .auth_bytes = auth_bytes,
+            .session_lifetime_ms = session_lifetime_ms,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn saslAuthenticateErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        error_code: i16,
+        error_message: ?[]const u8,
+        auth_bytes: ?[]const u8,
+        session_lifetime_ms: i64,
+    ) ?[]u8 {
         const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
         const resp = Resp{
             .error_code = error_code,
@@ -33370,7 +33509,7 @@ test "Broker.handleRequest SaslHandshake fails closed when mechanism storage fai
     var pos = buildTestRequest(&buf, 17, 1, 1705, header_mod.requestHeaderVersion(17, 1));
     req.serialize(&buf, &pos, 1);
 
-    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
     const response_allocator = failing_allocator.allocator();
     broker.allocator = response_allocator;
 
@@ -33391,6 +33530,43 @@ test "Broker.handleRequest SaslHandshake fails closed when mechanism storage fai
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
     try testing.expectEqual(@as(usize, 2), resp.mechanisms.len);
+    try testing.expect(broker.sasl_mechanisms.get("test-client") == null);
+}
+
+test "Broker.handleRequest SaslHandshake fails closed when response serialization fails" {
+    const Req = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled_mechanisms = "PLAIN,SCRAM-SHA-256";
+
+    const req = Req{ .mechanism = "PLAIN" };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 17, 1, 1706, header_mod.requestHeaderVersion(17, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(17, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1706), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.mechanisms.len > 0) testing.allocator.free(resp.mechanisms);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.mechanisms.len);
     try testing.expect(broker.sasl_mechanisms.get("test-client") == null);
 }
 
@@ -33719,6 +33895,87 @@ test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("Invalid request", resp.error_message.?);
+}
+
+test "Broker.handleRequest SaslAuthenticate fails closed when error response serialization fails" {
+    const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 36, 2, 3605, header_mod.requestHeaderVersion(36, 2));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(36, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3605), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqualStrings("Failed to serialize SASL authentication response", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 0), resp.auth_bytes.?.len);
+    try testing.expectEqual(@as(i64, 0), resp.session_lifetime_ms);
+}
+
+test "Broker.completeSaslAuthentication does not store principal when success response serialization fails" {
+    const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "PLAIN";
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, std.math.maxInt(usize));
+    const response_allocator = failing_allocator.allocator();
+    const full_principal = try response_allocator.dupe(u8, "User:serialize-user");
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    broker.allocator = response_allocator;
+
+    const req_header = RequestHeader{
+        .api_key = 36,
+        .api_version = 2,
+        .correlation_id = 3606,
+        .client_id = "test-client",
+    };
+    const response = broker.completeSaslAuthentication(
+        &req_header,
+        header_mod.responseHeaderVersion(36, 2),
+        2,
+        "test-client",
+        full_principal,
+        false,
+        null,
+        &.{},
+        0,
+    );
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(36, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3606), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expect(broker.authenticated_sessions.get("test-client") == null);
 }
 
 test "Broker.handleRequest SaslAuthenticate rejects trailing bytes" {
