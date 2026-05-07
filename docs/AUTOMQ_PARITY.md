@@ -43,6 +43,9 @@ operator-facing behavior.
   and verifies non-overlapping monotonic PID blocks through failover
   checkpoints, while non-leader controllers are probed for `NOT_CONTROLLER`
   rejection without advancing PID state.
+  AddRaftVoter/RemoveRaftVoter/UpdateRaftVoter negative paths are live-probed
+  on non-leader controllers for `NOT_CONTROLLER` rejection without mutating the
+  voter set or endpoints.
   BrokerHeartbeat/UnregisterBroker and ControllerRegistration negative paths
   are also live-probed on non-leader controllers for `NOT_CONTROLLER`
   rejection without mutating broker registration or voter endpoint state.
@@ -682,6 +685,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   empty listeners, RemoveRaftVoter unknown voters, UpdateRaftVoter unknown
   voters, and UpdateRaftVoter invalid KRaft feature ranges at controller
   leader/failover/restart checkpoints without mutating the committed voter set.
+  Dynamic voter probes now also verify live follower `NOT_CONTROLLER`
+  responses for duplicate AddRaftVoter, unknown RemoveRaftVoter, unknown
+  UpdateRaftVoter, and invalid-feature UpdateRaftVoter frames without mutating
+  voter membership or endpoints.
   It also verifies BrokerHeartbeat v1 unknown-broker/offline-log-dir tagged
   responses and UnregisterBroker unknown-broker responses across the same
   checkpoints without mutating broker registration state.
@@ -1431,6 +1438,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeQuorum v2 endpoint/directory metadata, and
   live generated dynamic voter negative responses remain stable across
   controller leader failover and rolling restart without mutating voters, and
+  live dynamic voter follower `NOT_CONTROLLER` responses remain stable without
+  mutating voters or endpoints, and
   live AllocateProducerIds follower `NOT_CONTROLLER` responses remain stable
   without allocating PID blocks on non-leaders, and
   live BrokerHeartbeat/UnregisterBroker unknown-broker responses remain stable

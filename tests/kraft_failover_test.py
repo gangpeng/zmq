@@ -1861,6 +1861,18 @@ def add_raft_voter_empty_listeners(port, voter_id, correlation_id):
     return parse_raft_voter_response(response, correlation_id, "AddRaftVoter")
 
 
+def add_raft_voter_duplicate(port, voter_id, listener_port, correlation_id):
+    body = bytearray()
+    body += write_compact_string(CLUSTER_ID)
+    body += struct.pack(">ii", 1000, voter_id)
+    body += raft_voter_directory_id(voter_id)
+    body += write_compact_array_len(1)
+    body += write_raft_voter_listener("CONTROLLER", "127.0.0.1", listener_port)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 80, 0, correlation_id, bytes(body))
+    return parse_raft_voter_response(response, correlation_id, "AddRaftVoter")
+
+
 def remove_raft_voter_unknown(port, voter_id, correlation_id):
     body = bytearray()
     body += write_compact_string(CLUSTER_ID)
@@ -2012,6 +2024,114 @@ def wait_for_dynamic_raft_voter_negative_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"dynamic Raft voter negative probes did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
+def wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+    processes,
+    expected_leader_id,
+    expected_ports,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 10440)
+    existing_voter_id = sorted(expected_ports)[0]
+    unknown_voter_id = max(expected_ports) + 50100
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if node_id == expected_leader_id or info["proc"].poll() is not None:
+                    continue
+                add_duplicate = add_raft_voter_duplicate(
+                    info["port"],
+                    existing_voter_id,
+                    expected_ports[existing_voter_id],
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_raft_voter_error(
+                    add_duplicate,
+                    ERROR_NOT_CONTROLLER,
+                    "AddRaftVoter duplicate follower",
+                    label,
+                )
+
+                remove_unknown = remove_raft_voter_unknown(
+                    info["port"],
+                    unknown_voter_id,
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_raft_voter_error(
+                    remove_unknown,
+                    ERROR_NOT_CONTROLLER,
+                    "RemoveRaftVoter unknown follower",
+                    label,
+                )
+
+                update_unknown = update_raft_voter(
+                    info["port"],
+                    unknown_voter_id,
+                    65535,
+                    0,
+                    0,
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_raft_voter_error(
+                    update_unknown,
+                    ERROR_NOT_CONTROLLER,
+                    "UpdateRaftVoter unknown follower",
+                    label,
+                )
+
+                update_invalid_feature = update_raft_voter(
+                    info["port"],
+                    existing_voter_id,
+                    expected_ports[existing_voter_id],
+                    2,
+                    1,
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_raft_voter_error(
+                    update_invalid_feature,
+                    ERROR_NOT_CONTROLLER,
+                    "UpdateRaftVoter invalid feature follower",
+                    label,
+                )
+                checked[node_id] = {
+                    "add_duplicate": add_duplicate["error_code"],
+                    "remove_unknown": remove_unknown["error_code"],
+                    "update_unknown": update_unknown["error_code"],
+                    "update_invalid_feature": update_invalid_feature["error_code"],
+                }
+            if not checked:
+                raise TestError(
+                    f"no live non-leader controllers to probe during {label}"
+                )
+            quorum = describe_quorum_v2(
+                processes[expected_leader_id]["port"],
+                correlation_id,
+            )
+            correlation_id += 1
+            require_dynamic_voter_quorum_unchanged(quorum, expected_ports, label)
+            state["correlation_id"] = correlation_id
+            return {
+                "checked": checked,
+                "quorum": quorum,
+            }
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 5
+        time.sleep(0.25)
+    raise TestError(
+        f"dynamic Raft voter follower rejection did not recover during {label}: "
         f"{last_error}"
     )
 
@@ -11645,6 +11765,14 @@ def main():
             dynamic_voter_state,
             "initial leader",
         )
+        dynamic_voter_follower_state = {"correlation_id": 10440}
+        wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+            processes,
+            leader_id,
+            ports,
+            dynamic_voter_follower_state,
+            "initial leader",
+        )
         broker_lifecycle_state = {"correlation_id": 9540, "broker_id": 60100}
         wait_for_broker_lifecycle_negative_checkpoint(
             processes[leader_id]["port"],
@@ -12364,6 +12492,13 @@ def main():
                 dynamic_voter_state,
                 "network partition matrix",
             )
+            wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+                processes,
+                leader_id,
+                ports,
+                dynamic_voter_follower_state,
+                "network partition matrix",
+            )
             wait_for_broker_lifecycle_negative_checkpoint(
                 processes[leader_id]["port"],
                 broker_lifecycle_state,
@@ -12570,6 +12705,13 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             dynamic_voter_state,
+            "controller leader failover",
+        )
+        wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            dynamic_voter_follower_state,
             "controller leader failover",
         )
         wait_for_broker_lifecycle_negative_checkpoint(
@@ -12816,6 +12958,13 @@ def main():
             dynamic_voter_state,
             "old leader fresh rejoin",
         )
+        wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            dynamic_voter_follower_state,
+            "old leader fresh rejoin",
+        )
         wait_for_broker_lifecycle_negative_checkpoint(
             processes[replacement_leader]["port"],
             broker_lifecycle_state,
@@ -13057,6 +13206,13 @@ def main():
             dynamic_voter_state,
             "surviving controller restart",
         )
+        wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            dynamic_voter_follower_state,
+            "surviving controller restart",
+        )
         wait_for_broker_lifecycle_negative_checkpoint(
             processes[replacement_leader]["port"],
             broker_lifecycle_state,
@@ -13283,6 +13439,13 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             dynamic_voter_state,
+            "broker restart",
+        )
+        wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            dynamic_voter_follower_state,
             "broker restart",
         )
         wait_for_broker_lifecycle_negative_checkpoint(
@@ -13584,6 +13747,7 @@ def main():
             f"controller_unsupported_checked=true, "
             f"all_controller_unsupported_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
+            f"dynamic_raft_voter_follower_rejection_checked=true, "
             f"all_controller_describe_quorum_v2_checked=true, "
             f"broker_lifecycle_negative_checked=true, "
             f"broker_lifecycle_follower_rejection_checked=true, "
