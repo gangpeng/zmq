@@ -1613,6 +1613,16 @@ def require_controller_unsupported_response(response, api_key, api_version, labe
         )
 
 
+def controller_unsupported_cases():
+    cases = [
+        (api_key, versions[1] + 1)
+        for api_key, versions in sorted(CONTROLLER_API_VERSIONS.items())
+        if api_key != 18
+    ]
+    cases.extend([(71, 0), (72, 0)])
+    return cases
+
+
 def wait_for_controller_unsupported_checkpoint(
     port,
     state,
@@ -1621,12 +1631,7 @@ def wait_for_controller_unsupported_checkpoint(
 ):
     deadline = time.time() + timeout
     correlation_id = state.get("correlation_id", 9740)
-    unsupported_cases = [
-        (api_key, versions[1] + 1)
-        for api_key, versions in sorted(CONTROLLER_API_VERSIONS.items())
-        if api_key != 18
-    ]
-    unsupported_cases.extend([(71, 0), (72, 0)])
+    unsupported_cases = controller_unsupported_cases()
     last_error = None
     while time.time() < deadline:
         try:
@@ -1651,6 +1656,51 @@ def wait_for_controller_unsupported_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"controller unsupported API probes did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
+def wait_for_all_controller_unsupported_checkpoint(
+    processes,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 10040)
+    unsupported_cases = controller_unsupported_cases()
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if info["proc"].poll() is not None:
+                    continue
+                for api_key, api_version in unsupported_cases:
+                    response = controller_small_error_request(
+                        info["port"],
+                        api_key,
+                        api_version,
+                        correlation_id,
+                    )
+                    require_controller_unsupported_response(
+                        response,
+                        api_key,
+                        api_version,
+                        f"{label} on controller {node_id}",
+                    )
+                    correlation_id += 1
+                checked[node_id] = len(unsupported_cases)
+            if not checked:
+                raise TestError(f"no live controllers to probe during {label}")
+            state["correlation_id"] = correlation_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += len(unsupported_cases)
+        time.sleep(0.25)
+    raise TestError(
+        f"all-controller unsupported API probes did not recover during {label}: "
         f"{last_error}"
     )
 
@@ -11331,6 +11381,12 @@ def main():
             controller_unsupported_state,
             "initial leader",
         )
+        all_controller_unsupported_state = {"correlation_id": 10040}
+        wait_for_all_controller_unsupported_checkpoint(
+            processes,
+            all_controller_unsupported_state,
+            "initial leader",
+        )
         describe_quorum_state = {"correlation_id": 9140}
         wait_for_describe_quorum_v2_checkpoint(
             processes[leader_id]["port"],
@@ -12014,6 +12070,11 @@ def main():
                 controller_unsupported_state,
                 "network partition matrix",
             )
+            wait_for_all_controller_unsupported_checkpoint(
+                processes,
+                all_controller_unsupported_state,
+                "network partition matrix",
+            )
             wait_for_describe_quorum_v2_checkpoint(
                 processes[leader_id]["port"],
                 ports,
@@ -12196,6 +12257,11 @@ def main():
         wait_for_controller_unsupported_checkpoint(
             processes[replacement_leader]["port"],
             controller_unsupported_state,
+            "controller leader failover",
+        )
+        wait_for_all_controller_unsupported_checkpoint(
+            processes,
+            all_controller_unsupported_state,
             "controller leader failover",
         )
         wait_for_describe_quorum_v2_checkpoint(
@@ -12418,6 +12484,11 @@ def main():
             controller_unsupported_state,
             "old leader fresh rejoin",
         )
+        wait_for_all_controller_unsupported_checkpoint(
+            processes,
+            all_controller_unsupported_state,
+            "old leader fresh rejoin",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -12635,6 +12706,11 @@ def main():
             controller_unsupported_state,
             "surviving controller restart",
         )
+        wait_for_all_controller_unsupported_checkpoint(
+            processes,
+            all_controller_unsupported_state,
+            "surviving controller restart",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -12837,6 +12913,11 @@ def main():
         wait_for_controller_unsupported_checkpoint(
             processes[replacement_leader]["port"],
             controller_unsupported_state,
+            "broker restart",
+        )
+        wait_for_all_controller_unsupported_checkpoint(
+            processes,
+            all_controller_unsupported_state,
             "broker restart",
         )
         wait_for_describe_quorum_v2_checkpoint(
@@ -13160,6 +13241,7 @@ def main():
             f"controller_api_versions_checked=true, "
             f"all_controller_api_versions_checked=true, "
             f"controller_unsupported_checked=true, "
+            f"all_controller_unsupported_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
             f"all_controller_describe_quorum_v2_checked=true, "
             f"broker_lifecycle_negative_checked=true, "

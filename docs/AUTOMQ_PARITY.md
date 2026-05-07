@@ -686,7 +686,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
   checkpoints without mutating committed voter endpoints.
   The same gate now probes each advertised controller key at `max_version + 1`
   plus telemetry keys 71/72, verifying live `unsupported_version` responses
-  across controller failover and restart.
+  on every alive controller across controller failover and restart.
   Controller ApiVersions v3 catalog and telemetry-key absence are now checked on
   every alive controller, not just the active leader, after controller failover
   and rolling restart transitions.
@@ -1424,7 +1424,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
   live ControllerRegistration negative responses remain stable without mutating
   committed voter endpoints, and
   live unsupported-version/unsupported-key controller guard responses remain
-  stable across the advertised controller catalog, and
+  stable across the advertised controller catalog on every alive controller, and
   Controller ApiVersions v3 catalog visibility is checked on every alive
   controller after failover/restart transitions, and
   DescribeQuorum v2 endpoint metadata is checked on every alive controller
