@@ -975,9 +975,15 @@ def selected_e2e_load_scale_phases():
         return []
 
     raw_matrix = os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
-    phase_names = split_csv(raw_matrix) if raw_matrix else (
-        ["load"] if e2e_load_scale_fixture_enabled() else ["scale"]
-    )
+    raw_required = os.environ.get("ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES")
+    if raw_matrix:
+        phase_names = split_csv(raw_matrix)
+    elif e2e_load_scale_fixture_enabled() and raw_required:
+        phase_names = split_csv(raw_required)
+    elif e2e_load_scale_fixture_enabled():
+        phase_names = ["load"]
+    else:
+        phase_names = ["scale"]
     if not phase_names:
         raise AssertionError("ZMQ_E2E_LOAD_SCALE_MATRIX did not contain any phases")
 
@@ -1454,8 +1460,13 @@ def self_test():
         if fixture_phases[0]["restore"] != e2e_load_scale_fixture_command("restore"):
             raise AssertionError("E2E fixture restore command drifted")
 
-        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "load,scale-in"
         os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "load,scale-in"
+        fixture_phases = selected_e2e_load_scale_phases()
+        if [phase["name"] for phase in fixture_phases] != ["load", "scale-in"]:
+            raise AssertionError(f"E2E fixture required-phase inference failed: {fixture_phases}")
+        validate_required_e2e_load_scale_phase_coverage()
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "load,scale-in"
         fixture_phases = selected_e2e_load_scale_phases()
         if [phase["name"] for phase in fixture_phases] != ["load", "scale-in"]:
             raise AssertionError(f"E2E fixture matrix parsing failed: {fixture_phases}")

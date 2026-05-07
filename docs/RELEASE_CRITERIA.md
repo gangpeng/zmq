@@ -132,8 +132,9 @@ cross-broker chaos phases, `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` for live Docker
 scale-in/scale-out/load phases, and provider/client/profile requirement
 variables for S3 and external-client matrices. Docker E2E load/scale jobs may
 set `ZMQ_E2E_LOAD_SCALE_USE_FIXTURE=1` to satisfy required named phases with
-the built-in fixture when external orchestration hooks are not needed. S3
-provider coverage must pin
+the built-in fixture when external orchestration hooks are not needed; in that
+mode the fixture can infer its phase matrix directly from
+`ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES`. S3 provider coverage must pin
 provider, outage, process-crash/replacement, ListObjectsV2 pagination,
 multipart-edge, and multipart-fault profiles with
 `ZMQ_S3_PROVIDER_REQUIRED_PROFILES`,
