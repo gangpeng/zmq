@@ -2143,6 +2143,93 @@ def wait_for_broker_lifecycle_negative_checkpoint(
     )
 
 
+def require_broker_lifecycle_not_controller_response(response, response_name, label):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(
+            f"{response_name} follower throttle mismatch during {label}: {response}"
+        )
+    if response["error_code"] != ERROR_NOT_CONTROLLER:
+        raise TestError(
+            f"{response_name} follower error mismatch during {label}: "
+            f"expected={ERROR_NOT_CONTROLLER} response={response}"
+        )
+
+
+def wait_for_broker_lifecycle_follower_rejection_checkpoint(
+    processes,
+    expected_leader_id,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 10240)
+    broker_id = state.get("broker_id", 61100)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if node_id == expected_leader_id or info["proc"].poll() is not None:
+                    continue
+                heartbeat = broker_heartbeat_unknown(
+                    info["port"],
+                    broker_id,
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_broker_lifecycle_not_controller_response(
+                    heartbeat,
+                    "BrokerHeartbeat",
+                    label,
+                )
+                if (
+                    heartbeat["is_caught_up"]
+                    or not heartbeat["is_fenced"]
+                    or heartbeat["should_shut_down"]
+                ):
+                    raise TestError(
+                        f"BrokerHeartbeat follower state mismatch during {label}: "
+                        f"node_id={node_id} response={heartbeat}"
+                    )
+
+                unregister = unregister_broker_unknown(
+                    info["port"],
+                    broker_id,
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_broker_lifecycle_not_controller_response(
+                    unregister,
+                    "UnregisterBroker",
+                    label,
+                )
+                if unregister["error_message"] is not None:
+                    raise TestError(
+                        f"UnregisterBroker follower error message mismatch during "
+                        f"{label}: node_id={node_id} response={unregister}"
+                    )
+                checked[node_id] = {
+                    "heartbeat": heartbeat["error_code"],
+                    "unregister": unregister["error_code"],
+                }
+            if not checked:
+                raise TestError(
+                    f"no live non-leader controllers to probe during {label}"
+                )
+            state["correlation_id"] = correlation_id
+            state["broker_id"] = broker_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"broker lifecycle follower rejection did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
 def write_controller_registration_listener(name, host, port, security_protocol=0):
     if port < 0 or port > 65535:
         raise TestError(f"invalid controller listener port={port}")
@@ -2301,6 +2388,93 @@ def wait_for_controller_registration_negative_checkpoint(
     raise TestError(
         f"controller registration negative probes did not recover during {label}: "
         f"{last_error}"
+    )
+
+
+def wait_for_controller_registration_follower_rejection_checkpoint(
+    processes,
+    expected_leader_id,
+    expected_ports,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 10340)
+    existing_controller_id = sorted(expected_ports)[0]
+    unknown_controller_id = max(expected_ports) + 60200
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if node_id == expected_leader_id or info["proc"].poll() is not None:
+                    continue
+                unknown = controller_registration(
+                    info["port"],
+                    unknown_controller_id,
+                    "127.0.0.1",
+                    65535,
+                    [],
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_controller_registration_error(
+                    unknown,
+                    ERROR_NOT_CONTROLLER,
+                    "ControllerRegistration unknown controller follower",
+                    label,
+                )
+
+                invalid_feature = controller_registration(
+                    info["port"],
+                    existing_controller_id,
+                    "127.0.0.1",
+                    expected_ports[existing_controller_id],
+                    [{"name": "kraft.version", "min_version": 2, "max_version": 1}],
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_controller_registration_error(
+                    invalid_feature,
+                    ERROR_NOT_CONTROLLER,
+                    "ControllerRegistration invalid feature follower",
+                    label,
+                )
+
+                invalid_listener = controller_registration(
+                    info["port"],
+                    existing_controller_id,
+                    "",
+                    expected_ports[existing_controller_id],
+                    [],
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_controller_registration_error(
+                    invalid_listener,
+                    ERROR_NOT_CONTROLLER,
+                    "ControllerRegistration invalid listener follower",
+                    label,
+                )
+                checked[node_id] = {
+                    "unknown": unknown["error_code"],
+                    "invalid_feature": invalid_feature["error_code"],
+                    "invalid_listener": invalid_listener["error_code"],
+                }
+            if not checked:
+                raise TestError(
+                    f"no live non-leader controllers to probe during {label}"
+                )
+            state["correlation_id"] = correlation_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 3
+        time.sleep(0.25)
+    raise TestError(
+        f"controller registration follower rejection did not recover during "
+        f"{label}: {last_error}"
     )
 
 
@@ -11477,11 +11651,29 @@ def main():
             broker_lifecycle_state,
             "initial leader",
         )
+        broker_lifecycle_follower_state = {
+            "correlation_id": 10240,
+            "broker_id": 61100,
+        }
+        wait_for_broker_lifecycle_follower_rejection_checkpoint(
+            processes,
+            leader_id,
+            broker_lifecycle_follower_state,
+            "initial leader",
+        )
         controller_registration_state = {"correlation_id": 9640}
         wait_for_controller_registration_negative_checkpoint(
             processes[leader_id]["port"],
             ports,
             controller_registration_state,
+            "initial leader",
+        )
+        controller_registration_follower_state = {"correlation_id": 10340}
+        wait_for_controller_registration_follower_rejection_checkpoint(
+            processes,
+            leader_id,
+            ports,
+            controller_registration_follower_state,
             "initial leader",
         )
 
@@ -12177,10 +12369,23 @@ def main():
                 broker_lifecycle_state,
                 "network partition matrix",
             )
+            wait_for_broker_lifecycle_follower_rejection_checkpoint(
+                processes,
+                leader_id,
+                broker_lifecycle_follower_state,
+                "network partition matrix",
+            )
             wait_for_controller_registration_negative_checkpoint(
                 processes[leader_id]["port"],
                 ports,
                 controller_registration_state,
+                "network partition matrix",
+            )
+            wait_for_controller_registration_follower_rejection_checkpoint(
+                processes,
+                leader_id,
+                ports,
+                controller_registration_follower_state,
                 "network partition matrix",
             )
             wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -12372,10 +12577,23 @@ def main():
             broker_lifecycle_state,
             "controller leader failover",
         )
+        wait_for_broker_lifecycle_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_lifecycle_follower_state,
+            "controller leader failover",
+        )
         wait_for_controller_registration_negative_checkpoint(
             processes[replacement_leader]["port"],
             ports,
             controller_registration_state,
+            "controller leader failover",
+        )
+        wait_for_controller_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            controller_registration_follower_state,
             "controller leader failover",
         )
         wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -12603,10 +12821,23 @@ def main():
             broker_lifecycle_state,
             "old leader fresh rejoin",
         )
+        wait_for_broker_lifecycle_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_lifecycle_follower_state,
+            "old leader fresh rejoin",
+        )
         wait_for_controller_registration_negative_checkpoint(
             processes[replacement_leader]["port"],
             ports,
             controller_registration_state,
+            "old leader fresh rejoin",
+        )
+        wait_for_controller_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            controller_registration_follower_state,
             "old leader fresh rejoin",
         )
         wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -12831,10 +13062,23 @@ def main():
             broker_lifecycle_state,
             "surviving controller restart",
         )
+        wait_for_broker_lifecycle_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_lifecycle_follower_state,
+            "surviving controller restart",
+        )
         wait_for_controller_registration_negative_checkpoint(
             processes[replacement_leader]["port"],
             ports,
             controller_registration_state,
+            "surviving controller restart",
+        )
+        wait_for_controller_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            controller_registration_follower_state,
             "surviving controller restart",
         )
         wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -13046,10 +13290,23 @@ def main():
             broker_lifecycle_state,
             "broker restart",
         )
+        wait_for_broker_lifecycle_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_lifecycle_follower_state,
+            "broker restart",
+        )
         wait_for_controller_registration_negative_checkpoint(
             processes[replacement_leader]["port"],
             ports,
             controller_registration_state,
+            "broker restart",
+        )
+        wait_for_controller_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            ports,
+            controller_registration_follower_state,
             "broker restart",
         )
         wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -13329,7 +13586,9 @@ def main():
             f"dynamic_raft_voter_negative_checked=true, "
             f"all_controller_describe_quorum_v2_checked=true, "
             f"broker_lifecycle_negative_checked=true, "
+            f"broker_lifecycle_follower_rejection_checked=true, "
             f"controller_registration_negative_checked=true, "
+            f"controller_registration_follower_rejection_checked=true, "
             f"broker_non_broker_api_rejection_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
