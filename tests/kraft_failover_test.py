@@ -45,6 +45,7 @@ BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 ERROR_NONE = 0
 ERROR_UNSUPPORTED_VERSION = 35
+ERROR_NOT_CONTROLLER = 41
 ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3
 ERROR_TOPIC_ALREADY_EXISTS = 36
 ERROR_GROUP_ID_NOT_FOUND = 69
@@ -803,6 +804,51 @@ def wait_for_allocate_producer_ids_checkpoint(
         correlation_id += 1
         time.sleep(0.25)
     raise TestError(f"AllocateProducerIds did not recover during {label}: {last_error}")
+
+
+def wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+    processes,
+    expected_leader_id,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 10140)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if node_id == expected_leader_id or info["proc"].poll() is not None:
+                    continue
+                rejected = allocate_producer_ids(info["port"], 100, -1, correlation_id)
+                correlation_id += 1
+                if (
+                    rejected["throttle_time_ms"] != 0
+                    or rejected["error_code"] != ERROR_NOT_CONTROLLER
+                    or rejected["producer_id_start"] != -1
+                    or rejected["producer_id_len"] != 0
+                ):
+                    raise TestError(
+                        f"AllocateProducerIds follower rejection mismatch during "
+                        f"{label}: node_id={node_id} response={rejected}"
+                    )
+                checked[node_id] = rejected["error_code"]
+            if not checked:
+                raise TestError(
+                    f"no live non-leader controllers to probe during {label}"
+                )
+            state["correlation_id"] = correlation_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"AllocateProducerIds follower rejection did not recover during {label}: "
+        f"{last_error}"
+    )
 
 
 def produce(port, topic, payload, correlation_id):
@@ -11453,6 +11499,13 @@ def main():
             producer_id_state,
             "initial leader",
         )
+        producer_id_follower_state = {"correlation_id": 10140}
+        wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+            processes,
+            leader_id,
+            producer_id_follower_state,
+            "initial leader",
+        )
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
         offset_delete_group = f"{group}-offset-delete"
@@ -12107,6 +12160,12 @@ def main():
                 producer_id_state,
                 "network partition matrix",
             )
+            wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+                processes,
+                leader_id,
+                producer_id_follower_state,
+                "network partition matrix",
+            )
             wait_for_dynamic_raft_voter_negative_checkpoint(
                 processes[leader_id]["port"],
                 ports,
@@ -12294,6 +12353,12 @@ def main():
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
+            "controller leader failover",
+        )
+        wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            producer_id_follower_state,
             "controller leader failover",
         )
         wait_for_dynamic_raft_voter_negative_checkpoint(
@@ -12521,6 +12586,12 @@ def main():
             producer_id_state,
             "old leader fresh rejoin",
         )
+        wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            producer_id_follower_state,
+            "old leader fresh rejoin",
+        )
         wait_for_dynamic_raft_voter_negative_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -12743,6 +12814,12 @@ def main():
             producer_id_state,
             "surviving controller restart",
         )
+        wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            producer_id_follower_state,
+            "surviving controller restart",
+        )
         wait_for_dynamic_raft_voter_negative_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -12950,6 +13027,12 @@ def main():
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
+            "broker restart",
+        )
+        wait_for_allocate_producer_ids_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            producer_id_follower_state,
             "broker restart",
         )
         wait_for_dynamic_raft_voter_negative_checkpoint(
@@ -13235,6 +13318,7 @@ def main():
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"allocate_producer_ids_checked=true, "
+            f"allocate_producer_ids_follower_rejection_checked=true, "
             f"describe_quorum_v2_checked=true, "
             f"fetch_snapshot_v1_checked=true, "
             f"all_controller_fetch_snapshot_v1_checked=true, "

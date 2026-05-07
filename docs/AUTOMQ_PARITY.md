@@ -41,7 +41,8 @@ operator-facing behavior.
   non-resurrecting through failover checkpoints.
   AllocateProducerIds v0 is live-probed directly against the active controller
   and verifies non-overlapping monotonic PID blocks through failover
-  checkpoints.
+  checkpoints, while non-leader controllers are probed for `NOT_CONTROLLER`
+  rejection without advancing PID state.
   DescribeQuorum v2 is live-probed directly against the active controller and
   verifies controller listener endpoints plus voter directory IDs through the
   same failover checkpoints.
@@ -681,6 +682,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   It also verifies BrokerHeartbeat v1 unknown-broker/offline-log-dir tagged
   responses and UnregisterBroker unknown-broker responses across the same
   checkpoints without mutating broker registration state.
+  AllocateProducerIds v0 now also verifies live follower `NOT_CONTROLLER`
+  responses across controller failover/restart checkpoints without allocating
+  PID blocks on non-leaders.
   ControllerRegistration unknown-controller, invalid feature-range, and invalid
   listener responses are likewise gated across controller failover/restart
   checkpoints without mutating committed voter endpoints.
@@ -1419,6 +1423,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeQuorum v2 endpoint/directory metadata, and
   live generated dynamic voter negative responses remain stable across
   controller leader failover and rolling restart without mutating voters, and
+  live AllocateProducerIds follower `NOT_CONTROLLER` responses remain stable
+  without allocating PID blocks on non-leaders, and
   live BrokerHeartbeat/UnregisterBroker unknown-broker responses remain stable
   without mutating broker registrations, and
   live ControllerRegistration negative responses remain stable without mutating
