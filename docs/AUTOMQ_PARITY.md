@@ -45,7 +45,7 @@ operator-facing behavior.
   DescribeQuorum v2 is live-probed directly against the active controller and
   verifies controller listener endpoints plus voter directory IDs through the
   same failover checkpoints.
-  FetchSnapshot v1 is live-probed directly against the active controller and
+  FetchSnapshot v1 is live-probed directly against every alive controller and
   verifies request-scoped `SNAPSHOT_NOT_FOUND` responses plus current-leader
   endpoint routing metadata through failover checkpoints.
   Controller ApiVersions v3 is live-probed directly against every alive
@@ -359,8 +359,9 @@ leader kill, old-leader fresh rejoin, surviving-controller restart, and broker
 restart checkpoints. Direct DescribeQuorum v2 probes now verify controller
 listener endpoint metadata and voter directory IDs through the same transition
 set. Direct FetchSnapshot v1 probes now verify request-scoped
-`SNAPSHOT_NOT_FOUND` handling and current-leader endpoint routing metadata
-through the same transition set. Direct controller ApiVersions v3 probes now
+`SNAPSHOT_NOT_FOUND` handling and current-leader endpoint routing metadata on
+every alive controller through the same transition set. Direct controller
+ApiVersions v3 probes now
 verify the exact audited controller catalog and telemetry-key absence on every
 alive controller through the same transition set.
 
@@ -692,6 +693,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeQuorum v2 endpoint/directory metadata is now checked on every alive
   controller, not just the active leader, after controller failover and rolling
   restart transitions.
+  FetchSnapshot v1 unavailable-snapshot routing metadata is likewise checked on
+  every alive controller after those transitions.
   Generated controller-only/non-broker request APIs are now rejected on the live
   broker port across the same failover/restart checkpoints.
   ElectLeaders now uses generated request/response schemas and returns requested
@@ -1426,6 +1429,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   controller after failover/restart transitions, and
   DescribeQuorum v2 endpoint metadata is checked on every alive controller
   after failover/restart transitions, and
+  FetchSnapshot v1 current-leader routing metadata is checked on every alive
+  controller after failover/restart transitions, and
   generated controller-only/non-broker request APIs are rejected on the live
   broker port across failover/restart transitions, and
   keys 71/72 remain telemetry-only/unsupported on the controller port.

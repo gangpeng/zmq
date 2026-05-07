@@ -10439,6 +10439,58 @@ def fetch_snapshot_v1(port, end_offset, epoch, position, correlation_id):
     return parse_fetch_snapshot_response(response, correlation_id)
 
 
+def require_fetch_snapshot_v1_unavailable_response(
+    response,
+    expected_leader_id,
+    expected_leader_port,
+    snapshot_end_offset,
+    snapshot_epoch,
+    snapshot_position,
+    label,
+):
+    if (
+        response["throttle_time_ms"] != 0
+        or response["error_code"] != ERROR_NONE
+        or len(response["topics"]) != 1
+        or response["topics"][0]["name"] != "__cluster_metadata"
+        or len(response["topics"][0]["partitions"]) != 1
+    ):
+        raise TestError(f"FetchSnapshot v1 invalid response during {label}: {response}")
+    partition = response["topics"][0]["partitions"][0]
+    if (
+        partition["partition_index"] != 0
+        or partition["error_code"] != ERROR_SNAPSHOT_NOT_FOUND
+        or partition["snapshot_end_offset"] != snapshot_end_offset
+        or partition["snapshot_epoch"] != snapshot_epoch
+        or partition["position"] != snapshot_position
+        or partition["records"] is not None
+    ):
+        raise TestError(
+            f"FetchSnapshot v1 unexpected partition during {label}: {partition}"
+        )
+    current_leader = partition["current_leader"]
+    if (
+        current_leader is None
+        or current_leader["leader_id"] != expected_leader_id
+        or current_leader["leader_epoch"] < 0
+    ):
+        raise TestError(
+            f"FetchSnapshot v1 leader tag mismatch during {label}: "
+            f"{current_leader}"
+        )
+    if response["node_endpoints"] != [
+        {
+            "node_id": expected_leader_id,
+            "host": "127.0.0.1",
+            "port": expected_leader_port,
+        }
+    ]:
+        raise TestError(
+            f"FetchSnapshot v1 endpoint mismatch during {label}: "
+            f"{response['node_endpoints']}"
+        )
+
+
 def wait_for_fetch_snapshot_checkpoint(
     port,
     expected_leader_id,
@@ -10462,48 +10514,15 @@ def wait_for_fetch_snapshot_checkpoint(
                 snapshot_position,
                 correlation_id,
             )
-            if (
-                response["throttle_time_ms"] != 0
-                or response["error_code"] != ERROR_NONE
-                or len(response["topics"]) != 1
-                or response["topics"][0]["name"] != "__cluster_metadata"
-                or len(response["topics"][0]["partitions"]) != 1
-            ):
-                raise TestError(f"FetchSnapshot v1 invalid response: {response}")
-            partition = response["topics"][0]["partitions"][0]
-            if (
-                partition["partition_index"] != 0
-                or partition["error_code"] != ERROR_SNAPSHOT_NOT_FOUND
-                or partition["snapshot_end_offset"] != snapshot_end_offset
-                or partition["snapshot_epoch"] != snapshot_epoch
-                or partition["position"] != snapshot_position
-                or partition["records"] is not None
-            ):
-                raise TestError(
-                    f"FetchSnapshot v1 unexpected partition during {label}: "
-                    f"{partition}"
-                )
-            current_leader = partition["current_leader"]
-            if (
-                current_leader is None
-                or current_leader["leader_id"] != expected_leader_id
-                or current_leader["leader_epoch"] < 0
-            ):
-                raise TestError(
-                    f"FetchSnapshot v1 leader tag mismatch during {label}: "
-                    f"{current_leader}"
-                )
-            if response["node_endpoints"] != [
-                {
-                    "node_id": expected_leader_id,
-                    "host": "127.0.0.1",
-                    "port": expected_leader_port,
-                }
-            ]:
-                raise TestError(
-                    f"FetchSnapshot v1 endpoint mismatch during {label}: "
-                    f"{response['node_endpoints']}"
-                )
+            require_fetch_snapshot_v1_unavailable_response(
+                response,
+                expected_leader_id,
+                expected_leader_port,
+                snapshot_end_offset,
+                snapshot_epoch,
+                snapshot_position,
+                label,
+            )
             state["correlation_id"] = correlation_id + 1
             return response
         except Exception as exc:
@@ -10511,6 +10530,58 @@ def wait_for_fetch_snapshot_checkpoint(
         correlation_id += 1
         time.sleep(0.25)
     raise TestError(f"FetchSnapshot v1 did not recover during {label}: {last_error}")
+
+
+def wait_for_all_fetch_snapshot_checkpoint(
+    processes,
+    expected_leader_id,
+    expected_leader_port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9980)
+    snapshot_end_offset = 987654321
+    snapshot_epoch = 77
+    snapshot_position = 12
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if info["proc"].poll() is not None:
+                    continue
+                response = fetch_snapshot_v1(
+                    info["port"],
+                    snapshot_end_offset,
+                    snapshot_epoch,
+                    snapshot_position,
+                    correlation_id,
+                )
+                correlation_id += 1
+                require_fetch_snapshot_v1_unavailable_response(
+                    response,
+                    expected_leader_id,
+                    expected_leader_port,
+                    snapshot_end_offset,
+                    snapshot_epoch,
+                    snapshot_position,
+                    f"{label} on controller {node_id}",
+                )
+                checked[node_id] = response["node_endpoints"]
+            if not checked:
+                raise TestError(f"no live controllers to probe during {label}")
+            state["correlation_id"] = correlation_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"all-controller FetchSnapshot v1 did not recover during {label}: "
+        f"{last_error}"
+    )
 
 
 def tail(path, limit=12000):
@@ -11283,6 +11354,14 @@ def main():
             fetch_snapshot_state,
             "initial leader",
         )
+        all_fetch_snapshot_state = {"correlation_id": 9980}
+        wait_for_all_fetch_snapshot_checkpoint(
+            processes,
+            leader_id,
+            ports[leader_id],
+            all_fetch_snapshot_state,
+            "initial leader",
+        )
         dynamic_voter_state = {"correlation_id": 9440}
         wait_for_dynamic_raft_voter_negative_checkpoint(
             processes[leader_id]["port"],
@@ -11955,6 +12034,13 @@ def main():
                 fetch_snapshot_state,
                 "network partition matrix",
             )
+            wait_for_all_fetch_snapshot_checkpoint(
+                processes,
+                leader_id,
+                ports[leader_id],
+                all_fetch_snapshot_state,
+                "network partition matrix",
+            )
             wait_for_allocate_producer_ids_checkpoint(
                 processes[leader_id]["port"],
                 producer_id_state,
@@ -12130,6 +12216,13 @@ def main():
             replacement_leader,
             ports[replacement_leader],
             fetch_snapshot_state,
+            "controller leader failover",
+        )
+        wait_for_all_fetch_snapshot_checkpoint(
+            processes,
+            replacement_leader,
+            ports[replacement_leader],
+            all_fetch_snapshot_state,
             "controller leader failover",
         )
         wait_for_allocate_producer_ids_checkpoint(
@@ -12345,6 +12438,13 @@ def main():
             fetch_snapshot_state,
             "old leader fresh rejoin",
         )
+        wait_for_all_fetch_snapshot_checkpoint(
+            processes,
+            replacement_leader,
+            ports[replacement_leader],
+            all_fetch_snapshot_state,
+            "old leader fresh rejoin",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -12555,6 +12655,13 @@ def main():
             fetch_snapshot_state,
             "surviving controller restart",
         )
+        wait_for_all_fetch_snapshot_checkpoint(
+            processes,
+            replacement_leader,
+            ports[replacement_leader],
+            all_fetch_snapshot_state,
+            "surviving controller restart",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -12750,6 +12857,13 @@ def main():
             replacement_leader,
             ports[replacement_leader],
             fetch_snapshot_state,
+            "broker restart",
+        )
+        wait_for_all_fetch_snapshot_checkpoint(
+            processes,
+            replacement_leader,
+            ports[replacement_leader],
+            all_fetch_snapshot_state,
             "broker restart",
         )
         wait_for_allocate_producer_ids_checkpoint(
@@ -13042,6 +13156,7 @@ def main():
             f"allocate_producer_ids_checked=true, "
             f"describe_quorum_v2_checked=true, "
             f"fetch_snapshot_v1_checked=true, "
+            f"all_controller_fetch_snapshot_v1_checked=true, "
             f"controller_api_versions_checked=true, "
             f"all_controller_api_versions_checked=true, "
             f"controller_unsupported_checked=true, "
