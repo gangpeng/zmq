@@ -134,7 +134,10 @@ variables for S3 and external-client matrices. Docker E2E load/scale jobs may
 set `ZMQ_E2E_LOAD_SCALE_USE_FIXTURE=1` to satisfy required named phases with
 the built-in fixture when external orchestration hooks are not needed; in that
 mode the fixture can infer its phase matrix directly from
-`ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES`. S3 provider coverage must pin
+`ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES`. Fixture-backed `scale-out` phases
+pre-stop their target by default before starting it; jobs that prepare a
+stopped node externally can set
+`ZMQ_E2E_LOAD_SCALE_<PHASE>_FIXTURE_PRESTOP=0`. S3 provider coverage must pin
 provider, outage, process-crash/replacement, ListObjectsV2 pagination,
 multipart-edge, and multipart-fault profiles with
 `ZMQ_S3_PROVIDER_REQUIRED_PROFILES`,

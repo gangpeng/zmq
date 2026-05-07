@@ -38,9 +38,12 @@ Optional cross-broker chaos environment:
                                       phase-specific scale/load hooks
   ZMQ_E2E_LOAD_SCALE_USE_FIXTURE=1     use the built-in fixture when hooks are absent
   ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES   fail if matrix omits required phases
-  ZMQ_E2E_LOAD_SCALE_FIXTURE_NODE      node stopped/started by fixture (node0)
+  ZMQ_E2E_LOAD_SCALE_FIXTURE_NODE      node stopped/started by fixture
+                                      (node0; scale-out defaults to node1)
   ZMQ_E2E_LOAD_SCALE_FIXTURE_PRODUCER_NODE
                                       node used by fixture marker produce (node1)
+  ZMQ_E2E_LOAD_SCALE_<PHASE>_FIXTURE_PRESTOP
+                                      pre-stop target before scale-out apply (1)
   ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS
                                       record count for fixture load phase
 
@@ -1176,9 +1179,11 @@ def run_load_scale_fixture(kind):
     broker_ports = parse_named_ports(os.environ.get("ZMQ_E2E_BROKER_PORTS"), "ZMQ_E2E_BROKER_PORTS")
     containers = parse_named_map(os.environ.get("ZMQ_E2E_CONTAINERS"), "ZMQ_E2E_CONTAINERS")
     action = e2e_load_scale_fixture_env(phase_name, "ACTION", phase_name).lower()
-    target_node = e2e_load_scale_fixture_env(phase_name, "NODE", "node0")
+    default_target_node = "node1" if action == "scale-out" else "node0"
+    target_node = e2e_load_scale_fixture_env(phase_name, "NODE", default_target_node)
     producer_node = e2e_load_scale_fixture_env(phase_name, "PRODUCER_NODE", "node1")
     dry_run = e2e_load_scale_fixture_env(phase_name, "DRY_RUN", "0") == "1"
+    prestop = truthy(e2e_load_scale_fixture_env(phase_name, "PRESTOP", "1"))
 
     if target_node not in broker_ports or target_node not in containers:
         raise AssertionError(f"unknown fixture target node {target_node!r}")
@@ -1197,6 +1202,9 @@ def run_load_scale_fixture(kind):
                 wait_for_broker_port(broker_ports[target_node], should_be_up=True, timeout=60)
     elif action == "scale-out":
         if kind == "apply":
+            if not dry_run and prestop and docker_container_running(containers[target_node]):
+                run_docker_container_command("stop", containers[target_node])
+                wait_for_broker_port(broker_ports[target_node], should_be_up=False, timeout=20)
             if not dry_run and not docker_container_running(containers[target_node]):
                 run_docker_container_command("start", containers[target_node])
             if not dry_run:
@@ -1460,21 +1468,26 @@ def self_test():
         if fixture_phases[0]["restore"] != e2e_load_scale_fixture_command("restore"):
             raise AssertionError("E2E fixture restore command drifted")
 
-        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "load,scale-in"
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "load,scale-in,scale-out"
         fixture_phases = selected_e2e_load_scale_phases()
-        if [phase["name"] for phase in fixture_phases] != ["load", "scale-in"]:
+        if [phase["name"] for phase in fixture_phases] != ["load", "scale-in", "scale-out"]:
             raise AssertionError(f"E2E fixture required-phase inference failed: {fixture_phases}")
         validate_required_e2e_load_scale_phase_coverage()
 
-        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "load,scale-in"
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "load,scale-in,scale-out"
         fixture_phases = selected_e2e_load_scale_phases()
-        if [phase["name"] for phase in fixture_phases] != ["load", "scale-in"]:
+        if [phase["name"] for phase in fixture_phases] != ["load", "scale-in", "scale-out"]:
             raise AssertionError(f"E2E fixture matrix parsing failed: {fixture_phases}")
         validate_required_e2e_load_scale_phase_coverage()
         fixture_env = e2e_load_scale_hook_env(fixture_phases[0], 0, "self-test-topic")
         fixture_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
         run_e2e_load_scale_hook("self-test:fixture-default-apply", fixture_phases[0]["apply"], fixture_env)
         run_e2e_load_scale_hook("self-test:fixture-default-restore", fixture_phases[0]["restore"], fixture_env)
+        scale_out_env = e2e_load_scale_hook_env(fixture_phases[2], 2, "self-test-topic")
+        scale_out_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
+        scale_out_env["ZMQ_E2E_LOAD_SCALE_SCALE_OUT_FIXTURE_PRESTOP"] = "0"
+        run_e2e_load_scale_hook("self-test:fixture-scale-out-apply", fixture_phases[2]["apply"], scale_out_env)
+        run_e2e_load_scale_hook("self-test:fixture-scale-out-restore", fixture_phases[2]["restore"], scale_out_env)
     finally:
         os.environ.clear()
         os.environ.update(old_env)
