@@ -1564,6 +1564,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   read-after-write plus reassignment-target recovery. The clean three-node
   Docker E2E gate was re-executed successfully with `45/45` passing, including
   cross-node fetch and target-owner Produce/Fetch after reassignment.
+  Its classic consumer-group probe now parses the JoinGroup generation/member
+  state, verifies a SyncGroup v0 assignment round trip, and heartbeats with the
+  accepted member identity instead of accepting any heartbeat response bytes.
   Live Docker load/scale orchestration hooks and required-phase validation are
   now pinned by `test-e2e`; broader CI execution across real scale-in/out/load
   environments remains.

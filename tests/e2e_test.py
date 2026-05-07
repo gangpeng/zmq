@@ -180,6 +180,37 @@ def read_i64(buf, pos):
     return struct.unpack_from('>q', buf, pos)[0], pos + 8
 
 
+def write_string(value):
+    if value is None:
+        return struct.pack('>h', -1)
+    raw = value.encode()
+    return struct.pack('>h', len(raw)) + raw
+
+
+def write_bytes(value):
+    if value is None:
+        return struct.pack('>i', -1)
+    return struct.pack('>i', len(value)) + value
+
+
+def read_string(buf, pos):
+    length, pos = read_i16(buf, pos)
+    if length < 0:
+        return None, pos
+    if pos + length > len(buf):
+        raise RuntimeError("buffer underflow while reading string")
+    return buf[pos:pos+length].decode('utf-8', errors='replace'), pos + length
+
+
+def read_bytes(buf, pos):
+    length, pos = read_i32(buf, pos)
+    if length < 0:
+        return None, pos
+    if pos + length > len(buf):
+        raise RuntimeError("buffer underflow while reading bytes")
+    return buf[pos:pos+length], pos + length
+
+
 def read_compact_string(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
@@ -343,6 +374,51 @@ def api_versions(sock, corr_id):
     if data is None or len(data) < 8:
         return 0
     return struct.unpack_from('>i', data, 6)[0]
+
+
+def parse_join_group_response(response, corr_id):
+    pos = 0
+    response_corr, pos = read_i32(response, pos)
+    if response_corr != corr_id:
+        raise RuntimeError(f"JoinGroup correlation mismatch: {response_corr}")
+    error_code, pos = read_i16(response, pos)
+    generation_id, pos = read_i32(response, pos)
+    protocol_name, pos = read_string(response, pos)
+    leader, pos = read_string(response, pos)
+    member_id, pos = read_string(response, pos)
+    member_count, pos = read_i32(response, pos)
+    members = []
+    for _ in range(max(member_count, 0)):
+        response_member_id, pos = read_string(response, pos)
+        metadata, pos = read_bytes(response, pos)
+        members.append({"member_id": response_member_id, "metadata": metadata})
+    return {
+        "error_code": error_code,
+        "generation_id": generation_id,
+        "protocol_name": protocol_name,
+        "leader": leader,
+        "member_id": member_id,
+        "members": members,
+    }
+
+
+def parse_sync_group_response(response, corr_id):
+    pos = 0
+    response_corr, pos = read_i32(response, pos)
+    if response_corr != corr_id:
+        raise RuntimeError(f"SyncGroup correlation mismatch: {response_corr}")
+    error_code, pos = read_i16(response, pos)
+    assignment, pos = read_bytes(response, pos)
+    return {"error_code": error_code, "assignment": assignment}
+
+
+def parse_heartbeat_response(response, corr_id):
+    pos = 0
+    response_corr, pos = read_i32(response, pos)
+    if response_corr != corr_id:
+        raise RuntimeError(f"Heartbeat correlation mismatch: {response_corr}")
+    error_code, pos = read_i16(response, pos)
+    return {"error_code": error_code}
 
 
 def create_topic(sock, corr_id, name, partitions=3):
@@ -1153,6 +1229,32 @@ def self_test():
     if payload not in message_set:
         raise AssertionError("broker offset rewrite would corrupt E2E MessageSet payload")
 
+    join_fixture = struct.pack('>ihi', 101, 0, 7)
+    join_fixture += write_string("range")
+    join_fixture += write_string("member-1")
+    join_fixture += write_string("member-1")
+    join_fixture += struct.pack('>i', 1)
+    join_fixture += write_string("member-1")
+    join_fixture += write_bytes(b"metadata")
+    joined = parse_join_group_response(join_fixture, 101)
+    if (
+        joined["error_code"] != 0
+        or joined["generation_id"] != 7
+        or joined["member_id"] != "member-1"
+        or joined["members"][0]["metadata"] != b"metadata"
+    ):
+        raise AssertionError(f"E2E JoinGroup parser drifted: {joined}")
+
+    sync_fixture = struct.pack('>ih', 102, 0) + write_bytes(b"assignment")
+    synced = parse_sync_group_response(sync_fixture, 102)
+    if synced["error_code"] != 0 or synced["assignment"] != b"assignment":
+        raise AssertionError(f"E2E SyncGroup parser drifted: {synced}")
+
+    heartbeat_fixture = struct.pack('>ih', 103, 0)
+    heartbeat = parse_heartbeat_response(heartbeat_fixture, 103)
+    if heartbeat["error_code"] != 0:
+        raise AssertionError(f"E2E Heartbeat parser drifted: {heartbeat}")
+
     old_env = os.environ.copy()
     try:
         os.environ.pop("ZMQ_E2E_CHAOS_DOWN", None)
@@ -1407,7 +1509,7 @@ def main():
     sock_f.close()
 
     # =============================================
-    # Test (f): Consumer group — JoinGroup, Heartbeat, SyncGroup
+    # Test (f): Consumer group — JoinGroup, SyncGroup, Heartbeat
     # =============================================
     print("\n[Test f] Consumer group operations")
     sock_g = t.connect(NODES[0]["broker_port"])
@@ -1417,7 +1519,10 @@ def main():
     data = kafka_request(sock_g, 10, 0, t.next(), fc_body)
     t.check("FindCoordinator", data is not None and len(data) >= 4)
 
+    group_state = None
+
     # JoinGroup v0
+    jg_corr = t.next()
     jg_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
     jg_body += struct.pack('>i', 30000)
     jg_body += struct.pack('>h', 0)  # empty member_id
@@ -1425,21 +1530,73 @@ def main():
     jg_body += struct.pack('>i', 1)
     jg_body += struct.pack('>h', len(b'range')) + b'range'
     jg_body += struct.pack('>i', 0)
-    data = kafka_request(sock_g, 11, 0, t.next(), jg_body)
+    data = kafka_request(sock_g, 11, 0, jg_corr, jg_body)
     jg_ok = data is not None and len(data) >= 10
     if jg_ok:
-        jg_err = struct.unpack_from('>h', data, 4)[0]
-        jg_gen = struct.unpack_from('>i', data, 6)[0]
-        t.check(f"JoinGroup: err={jg_err}, gen={jg_gen}", jg_err == 0)
+        try:
+            joined = parse_join_group_response(data, jg_corr)
+            jg_ok = (
+                joined["error_code"] == 0
+                and joined["generation_id"] >= 0
+                and bool(joined["member_id"])
+            )
+            t.check(
+                f"JoinGroup: err={joined['error_code']}, gen={joined['generation_id']}, member={joined['member_id']}",
+                jg_ok,
+            )
+            if jg_ok:
+                group_state = joined
+        except Exception as e:
+            t.check("JoinGroup", False, str(e))
     else:
         t.check("JoinGroup", False, "no response")
 
+    # SyncGroup v0
+    if group_state is not None:
+        sync_assignment = b"e2e-assignment"
+        sg_corr = t.next()
+        sg_body = write_string("e2e-group")
+        sg_body += struct.pack('>i', group_state["generation_id"])
+        sg_body += write_string(group_state["member_id"])
+        sg_body += struct.pack('>i', 1)
+        sg_body += write_string(group_state["member_id"])
+        sg_body += write_bytes(sync_assignment)
+        data = kafka_request(sock_g, 14, 0, sg_corr, sg_body)
+        if data is not None:
+            try:
+                synced = parse_sync_group_response(data, sg_corr)
+                t.check(
+                    f"SyncGroup: err={synced['error_code']}, assignment={len(synced['assignment'] or b'')}B",
+                    synced["error_code"] == 0 and synced["assignment"] == sync_assignment,
+                    f"response={synced}",
+                )
+            except Exception as e:
+                t.check("SyncGroup", False, str(e))
+        else:
+            t.check("SyncGroup", False, "no response")
+    else:
+        t.check("SyncGroup", False, "JoinGroup did not return usable member state")
+
     # Heartbeat v0
-    hb_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-    hb_body += struct.pack('>i', 1)
-    hb_body += struct.pack('>h', len(b'me')) + b'me'
-    data = kafka_request(sock_g, 12, 0, t.next(), hb_body)
-    t.check("Heartbeat", data is not None and len(data) >= 4)
+    if group_state is not None:
+        hb_corr = t.next()
+        hb_body = write_string("e2e-group")
+        hb_body += struct.pack('>i', group_state["generation_id"])
+        hb_body += write_string(group_state["member_id"])
+        data = kafka_request(sock_g, 12, 0, hb_corr, hb_body)
+        if data is not None:
+            try:
+                heartbeated = parse_heartbeat_response(data, hb_corr)
+                t.check(
+                    f"Heartbeat: err={heartbeated['error_code']}",
+                    heartbeated["error_code"] == 0,
+                )
+            except Exception as e:
+                t.check("Heartbeat", False, str(e))
+        else:
+            t.check("Heartbeat", False, "no response")
+    else:
+        t.check("Heartbeat", False, "JoinGroup did not return usable member state")
 
     sock_g.close()
 
