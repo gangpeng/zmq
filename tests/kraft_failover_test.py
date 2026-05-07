@@ -81,6 +81,19 @@ CONTROLLER_API_VERSIONS = {
     81: (0, 0),
     82: (0, 0),
 }
+BROKER_NON_BROKER_API_VERSIONS = {
+    56: 3,  # AlterPartition
+    58: 0,  # Envelope
+    59: 1,  # FetchSnapshot
+    62: 4,  # BrokerRegistration
+    63: 1,  # BrokerHeartbeat
+    64: 0,  # UnregisterBroker
+    67: 0,  # AllocateProducerIds
+    70: 0,  # ControllerRegistration
+    80: 0,  # AddRaftVoter
+    81: 0,  # RemoveRaftVoter
+    82: 0,  # UpdateRaftVoter
+}
 
 
 class TestError(Exception):
@@ -1569,7 +1582,7 @@ def wait_for_all_controller_api_versions_checkpoint(
     )
 
 
-def parse_controller_small_error_response(response, correlation_id, response_name):
+def parse_small_error_response(response, correlation_id, response_name):
     pos = parse_flexible_response_header(response, correlation_id)
     error_code, pos = read_i16(response, pos)
     if pos != len(response):
@@ -1577,6 +1590,10 @@ def parse_controller_small_error_response(response, correlation_id, response_nam
             f"{response_name} response trailing bytes: {len(response) - pos}"
         )
     return {"error_code": error_code}
+
+
+def parse_controller_small_error_response(response, correlation_id, response_name):
+    return parse_small_error_response(response, correlation_id, response_name)
 
 
 def controller_small_error_request(port, api_key, api_version, correlation_id):
@@ -1634,6 +1651,52 @@ def wait_for_controller_unsupported_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"controller unsupported API probes did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
+def broker_non_broker_api_request(port, api_key, api_version, correlation_id):
+    response = flexible_kafka_request(port, api_key, api_version, correlation_id)
+    return parse_small_error_response(
+        response,
+        correlation_id,
+        f"broker non-broker api_key={api_key} v={api_version}",
+    )
+
+
+def wait_for_broker_non_broker_api_rejection_checkpoint(
+    port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9960)
+    cases = sorted(BROKER_NON_BROKER_API_VERSIONS.items())
+    last_error = None
+    while time.time() < deadline:
+        try:
+            for index, (api_key, api_version) in enumerate(cases):
+                response = broker_non_broker_api_request(
+                    port,
+                    api_key,
+                    api_version,
+                    correlation_id + index,
+                )
+                if response["error_code"] != ERROR_UNSUPPORTED_VERSION:
+                    raise TestError(
+                        f"broker non-broker API rejection mismatch during {label}: "
+                        f"api_key={api_key} api_version={api_version} "
+                        f"response={response}"
+                    )
+            state["correlation_id"] = correlation_id + len(cases)
+            return {"cases": cases}
+        except Exception as exc:
+            last_error = exc
+        correlation_id += len(cases)
+        time.sleep(0.25)
+    raise TestError(
+        f"broker non-broker API rejection probes did not recover during {label}: "
         f"{last_error}"
     )
 
@@ -11243,6 +11306,12 @@ def main():
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        broker_non_broker_api_state = {"correlation_id": 9960}
+        wait_for_broker_non_broker_api_rejection_checkpoint(
+            broker["port"],
+            broker_non_broker_api_state,
+            "initial broker",
+        )
         producer_id_state = {"correlation_id": 9040}
         wait_for_allocate_producer_ids_checkpoint(
             processes[leader_id]["port"],
@@ -11908,6 +11977,11 @@ def main():
                 controller_registration_state,
                 "network partition matrix",
             )
+            wait_for_broker_non_broker_api_rejection_checkpoint(
+                broker["port"],
+                broker_non_broker_api_state,
+                "network partition matrix",
+            )
         wait_for_log_position_checkpoint(
             broker["port"],
             topic,
@@ -12078,6 +12152,11 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             controller_registration_state,
+            "controller leader failover",
+        )
+        wait_for_broker_non_broker_api_rejection_checkpoint(
+            broker["port"],
+            broker_non_broker_api_state,
             "controller leader failover",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -12288,6 +12367,11 @@ def main():
             controller_registration_state,
             "old leader fresh rejoin",
         )
+        wait_for_broker_non_broker_api_rejection_checkpoint(
+            broker["port"],
+            broker_non_broker_api_state,
+            "old leader fresh rejoin",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -12493,6 +12577,11 @@ def main():
             controller_registration_state,
             "surviving controller restart",
         )
+        wait_for_broker_non_broker_api_rejection_checkpoint(
+            broker["port"],
+            broker_non_broker_api_state,
+            "surviving controller restart",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -12683,6 +12772,11 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             controller_registration_state,
+            "broker restart",
+        )
+        wait_for_broker_non_broker_api_rejection_checkpoint(
+            broker["port"],
+            broker_non_broker_api_state,
             "broker restart",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -12955,6 +13049,7 @@ def main():
             f"all_controller_describe_quorum_v2_checked=true, "
             f"broker_lifecycle_negative_checked=true, "
             f"controller_registration_negative_checked=true, "
+            f"broker_non_broker_api_rejection_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
