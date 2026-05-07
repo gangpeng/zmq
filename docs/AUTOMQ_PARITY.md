@@ -22,7 +22,9 @@ operator-facing behavior.
   remains for single-node mode. Manifest and partition snapshot APIs are
   read-side views. BrokerRegistration v2 is controller-advertised for broker
   log-directory identity, and registered directory IDs are persisted/replayed
-  through controller Raft metadata records and full snapshots.
+  through controller Raft metadata records and full snapshots. Non-leader
+  controllers are live-probed for BrokerRegistration `NOT_CONTROLLER`
+  rejection without registering synthetic brokers.
 - Kafka protocol support is functional for common single-node broker paths, but
   semantic parity across all generated APIs and versions is incomplete.
 - AlterReplicaLogDirs is now advertised and handled through generated request
@@ -689,6 +691,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   responses for duplicate AddRaftVoter, unknown RemoveRaftVoter, unknown
   UpdateRaftVoter, and invalid-feature UpdateRaftVoter frames without mutating
   voter membership or endpoints.
+  BrokerRegistration v2 now also verifies live follower `NOT_CONTROLLER`
+  responses across controller failover/restart checkpoints without registering
+  synthetic brokers on non-leaders.
   It also verifies BrokerHeartbeat v1 unknown-broker/offline-log-dir tagged
   responses and UnregisterBroker unknown-broker responses across the same
   checkpoints without mutating broker registration state.
@@ -1440,6 +1445,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   controller leader failover and rolling restart without mutating voters, and
   live dynamic voter follower `NOT_CONTROLLER` responses remain stable without
   mutating voters or endpoints, and
+  live BrokerRegistration follower `NOT_CONTROLLER` responses remain stable
+  without registering synthetic brokers on non-leaders, and
   live AllocateProducerIds follower `NOT_CONTROLLER` responses remain stable
   without allocating PID blocks on non-leaders, and
   live BrokerHeartbeat/UnregisterBroker unknown-broker responses remain stable

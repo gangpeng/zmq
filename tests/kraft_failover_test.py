@@ -2136,6 +2136,142 @@ def wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
     )
 
 
+def write_broker_registration_listener(name, host, port, security_protocol=0):
+    if port < 0 or port > 65535:
+        raise TestError(f"invalid broker listener port={port}")
+    body = bytearray()
+    body += write_compact_string(name)
+    body += write_compact_string(host)
+    body += struct.pack(">Hh", port, security_protocol)
+    body += b"\x00"  # listener tagged fields
+    return bytes(body)
+
+
+def parse_broker_registration_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    broker_epoch, pos = read_i64(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"BrokerRegistration response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "broker_epoch": broker_epoch,
+    }
+
+
+def broker_registration(port, broker_id, listener_port, correlation_id):
+    body = bytearray()
+    body += struct.pack(">i", broker_id)
+    body += write_compact_string(CLUSTER_ID)
+    body += raft_voter_directory_id(broker_id)
+    body += write_compact_array_len(1)
+    body += write_broker_registration_listener(
+        "PLAINTEXT",
+        "127.0.0.1",
+        listener_port,
+    )
+    body += write_compact_array_len(0)  # features
+    body += write_compact_string(None)  # rack
+    body += b"\x00"  # is_migrating_zk_broker=false
+    body += write_compact_array_len(1)
+    body += raft_voter_directory_id(broker_id + 1)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 62, 2, correlation_id, bytes(body))
+    return parse_broker_registration_response(response, correlation_id)
+
+
+def cleanup_broker_registration_probe(processes, broker_id, correlation_id):
+    last_error = None
+    for _, info in sorted(processes.items()):
+        if info["proc"].poll() is not None:
+            continue
+        try:
+            response = unregister_broker_unknown(
+                info["port"],
+                broker_id,
+                correlation_id,
+            )
+            correlation_id += 1
+            if response["error_code"] in (ERROR_NONE, ERROR_BROKER_ID_NOT_REGISTERED):
+                return correlation_id
+            last_error = response
+        except Exception as exc:
+            correlation_id += 1
+            last_error = exc
+    raise TestError(
+        f"could not clean up BrokerRegistration probe broker_id={broker_id}: "
+        f"{last_error}"
+    )
+
+
+def wait_for_broker_registration_follower_rejection_checkpoint(
+    processes,
+    expected_leader_id,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 10540)
+    broker_id = state.get("broker_id", 62100)
+    listener_port = state.get("listener_port", 65000)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if node_id == expected_leader_id or info["proc"].poll() is not None:
+                    continue
+                registered = broker_registration(
+                    info["port"],
+                    broker_id,
+                    listener_port,
+                    correlation_id,
+                )
+                correlation_id += 1
+                if registered["error_code"] == ERROR_NONE:
+                    correlation_id = cleanup_broker_registration_probe(
+                        processes,
+                        broker_id,
+                        correlation_id,
+                    )
+                    raise TestError(
+                        f"BrokerRegistration follower probe reached leader during "
+                        f"{label}: node_id={node_id} response={registered}"
+                    )
+                if (
+                    registered["throttle_time_ms"] != 0
+                    or registered["error_code"] != ERROR_NOT_CONTROLLER
+                    or registered["broker_epoch"] != -1
+                ):
+                    raise TestError(
+                        f"BrokerRegistration follower rejection mismatch during "
+                        f"{label}: node_id={node_id} response={registered}"
+                    )
+                checked[node_id] = registered["error_code"]
+            if not checked:
+                raise TestError(
+                    f"no live non-leader controllers to probe during {label}"
+                )
+            state["correlation_id"] = correlation_id
+            state["broker_id"] = broker_id
+            state["listener_port"] = listener_port
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"BrokerRegistration follower rejection did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
 def parse_broker_heartbeat_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     throttle_time_ms, pos = read_i32(response, pos)
@@ -11807,6 +11943,17 @@ def main():
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        broker_registration_follower_state = {
+            "correlation_id": 10540,
+            "broker_id": 62100,
+            "listener_port": 65000,
+        }
+        wait_for_broker_registration_follower_rejection_checkpoint(
+            processes,
+            leader_id,
+            broker_registration_follower_state,
+            "initial broker",
+        )
         broker_non_broker_api_state = {"correlation_id": 9960}
         wait_for_broker_non_broker_api_rejection_checkpoint(
             broker["port"],
@@ -12523,6 +12670,12 @@ def main():
                 controller_registration_follower_state,
                 "network partition matrix",
             )
+            wait_for_broker_registration_follower_rejection_checkpoint(
+                processes,
+                leader_id,
+                broker_registration_follower_state,
+                "network partition matrix",
+            )
             wait_for_broker_non_broker_api_rejection_checkpoint(
                 broker["port"],
                 broker_non_broker_api_state,
@@ -12736,6 +12889,12 @@ def main():
             replacement_leader,
             ports,
             controller_registration_follower_state,
+            "controller leader failover",
+        )
+        wait_for_broker_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_registration_follower_state,
             "controller leader failover",
         )
         wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -12989,6 +13148,12 @@ def main():
             controller_registration_follower_state,
             "old leader fresh rejoin",
         )
+        wait_for_broker_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_registration_follower_state,
+            "old leader fresh rejoin",
+        )
         wait_for_broker_non_broker_api_rejection_checkpoint(
             broker["port"],
             broker_non_broker_api_state,
@@ -13237,6 +13402,12 @@ def main():
             controller_registration_follower_state,
             "surviving controller restart",
         )
+        wait_for_broker_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_registration_follower_state,
+            "surviving controller restart",
+        )
         wait_for_broker_non_broker_api_rejection_checkpoint(
             broker["port"],
             broker_non_broker_api_state,
@@ -13470,6 +13641,12 @@ def main():
             replacement_leader,
             ports,
             controller_registration_follower_state,
+            "broker restart",
+        )
+        wait_for_broker_registration_follower_rejection_checkpoint(
+            processes,
+            replacement_leader,
+            broker_registration_follower_state,
             "broker restart",
         )
         wait_for_broker_non_broker_api_rejection_checkpoint(
@@ -13753,6 +13930,7 @@ def main():
             f"broker_lifecycle_follower_rejection_checked=true, "
             f"controller_registration_negative_checked=true, "
             f"controller_registration_follower_rejection_checked=true, "
+            f"broker_registration_follower_rejection_checked=true, "
             f"broker_non_broker_api_rejection_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
