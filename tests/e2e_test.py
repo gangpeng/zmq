@@ -36,6 +36,7 @@ Optional cross-broker chaos environment:
   ZMQ_E2E_LOAD_SCALE_APPLY / RESTORE   default scale/load orchestration hooks
   ZMQ_E2E_LOAD_SCALE_<PHASE>_APPLY / RESTORE
                                       phase-specific scale/load hooks
+  ZMQ_E2E_LOAD_SCALE_USE_FIXTURE=1     use the built-in fixture when hooks are absent
   ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES   fail if matrix omits required phases
   ZMQ_E2E_LOAD_SCALE_FIXTURE_NODE      node stopped/started by fixture (node0)
   ZMQ_E2E_LOAD_SCALE_FIXTURE_PRODUCER_NODE
@@ -73,6 +74,10 @@ NODES = [
     {"name": "node2", "broker_port": 19096, "controller_port": 19097, "metrics_port": 19098, "container": "zmq-node-2"},
 ]
 MINIO_PORT = 9000
+
+
+def truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------
@@ -935,6 +940,18 @@ def e2e_load_scale_hooks_configured():
         os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
         or os.environ.get("ZMQ_E2E_LOAD_SCALE_APPLY")
         or os.environ.get("ZMQ_E2E_LOAD_SCALE_RESTORE")
+        or e2e_load_scale_fixture_enabled()
+    )
+
+
+def e2e_load_scale_fixture_enabled():
+    return truthy(os.environ.get("ZMQ_E2E_LOAD_SCALE_USE_FIXTURE", "0"))
+
+
+def e2e_load_scale_fixture_command(kind):
+    return (
+        f"{shlex.quote(sys.executable)} {shlex.quote(__file__)} "
+        f"--load-scale-fixture {kind}"
     )
 
 
@@ -943,9 +960,14 @@ def e2e_load_scale_phase_env_name(phase, suffix):
 
 
 def e2e_load_scale_phase_command(phase, suffix):
-    return os.environ.get(e2e_load_scale_phase_env_name(phase, suffix)) or os.environ.get(
+    configured = os.environ.get(e2e_load_scale_phase_env_name(phase, suffix)) or os.environ.get(
         f"ZMQ_E2E_LOAD_SCALE_{suffix}"
     )
+    if configured:
+        return configured
+    if e2e_load_scale_fixture_enabled():
+        return e2e_load_scale_fixture_command(suffix.lower())
+    return None
 
 
 def selected_e2e_load_scale_phases():
@@ -953,7 +975,9 @@ def selected_e2e_load_scale_phases():
         return []
 
     raw_matrix = os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
-    phase_names = split_csv(raw_matrix) if raw_matrix else ["scale"]
+    phase_names = split_csv(raw_matrix) if raw_matrix else (
+        ["load"] if e2e_load_scale_fixture_enabled() else ["scale"]
+    )
     if not phase_names:
         raise AssertionError("ZMQ_E2E_LOAD_SCALE_MATRIX did not contain any phases")
 
@@ -1310,6 +1334,7 @@ def self_test():
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_RESTORE", None)
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_MATRIX", None)
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_USE_FIXTURE", None)
         if selected_e2e_chaos_phases() != []:
             raise AssertionError("E2E chaos phases unexpectedly configured")
         if selected_e2e_load_scale_phases() != []:
@@ -1413,6 +1438,32 @@ def self_test():
             f"{fixture_command_base} restore",
             load_env,
         )
+
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_APPLY", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_RESTORE", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_MATRIX", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_SCALE_IN_RESTORE", None)
+        os.environ.pop("ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES", None)
+        os.environ["ZMQ_E2E_LOAD_SCALE_USE_FIXTURE"] = "1"
+        fixture_phases = selected_e2e_load_scale_phases()
+        if len(fixture_phases) != 1 or fixture_phases[0]["name"] != "load":
+            raise AssertionError(f"E2E fixture default phase selection failed: {fixture_phases}")
+        if fixture_phases[0]["apply"] != e2e_load_scale_fixture_command("apply"):
+            raise AssertionError("E2E fixture apply command drifted")
+        if fixture_phases[0]["restore"] != e2e_load_scale_fixture_command("restore"):
+            raise AssertionError("E2E fixture restore command drifted")
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "load,scale-in"
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "load,scale-in"
+        fixture_phases = selected_e2e_load_scale_phases()
+        if [phase["name"] for phase in fixture_phases] != ["load", "scale-in"]:
+            raise AssertionError(f"E2E fixture matrix parsing failed: {fixture_phases}")
+        validate_required_e2e_load_scale_phase_coverage()
+        fixture_env = e2e_load_scale_hook_env(fixture_phases[0], 0, "self-test-topic")
+        fixture_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
+        run_e2e_load_scale_hook("self-test:fixture-default-apply", fixture_phases[0]["apply"], fixture_env)
+        run_e2e_load_scale_hook("self-test:fixture-default-restore", fixture_phases[0]["restore"], fixture_env)
     finally:
         os.environ.clear()
         os.environ.update(old_env)
