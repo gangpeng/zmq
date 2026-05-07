@@ -588,14 +588,32 @@ pub const RaftState = struct {
             const data_len: usize = @intCast(std.mem.readInt(u32, content[pos + 16 ..][0..4], .big));
             pos += 20;
             if (data_len > content.len - pos) return error.CorruptRaftLog;
-            if (persisted_offset != self.log.nextOffset()) {
+            const data = content[pos .. pos + data_len];
+            if (persisted_offset > self.log.nextOffset()) {
                 log.warn("Raft log recovery rejected non-contiguous offset: persisted={d}, expected={d}", .{
                     persisted_offset,
                     self.log.nextOffset(),
                 });
                 return error.CorruptRaftLog;
             }
-            const data = content[pos .. pos + data_len];
+            if (persisted_offset < self.log.nextOffset()) {
+                if (self.log.get(persisted_offset)) |existing| {
+                    if (existing.epoch == epoch and std.mem.eql(u8, existing.data, data)) {
+                        pos += data_len;
+                        recovered += 1;
+                        if (epoch > self.current_epoch) self.current_epoch = epoch;
+                        continue;
+                    }
+                }
+                self.log.truncateFrom(persisted_offset);
+                if (persisted_offset != self.log.nextOffset()) {
+                    log.warn("Raft log recovery rejected non-contiguous replacement offset: persisted={d}, expected={d}", .{
+                        persisted_offset,
+                        self.log.nextOffset(),
+                    });
+                    return error.CorruptRaftLog;
+                }
+            }
             _ = try self.log.append(epoch, data);
             pos += data_len;
             recovered += 1;
@@ -3327,6 +3345,32 @@ test "RaftState loadPersistedLog rejects non-contiguous offsets" {
 
     try testing.expectError(error.CorruptRaftLog, state.loadPersistedLog());
     try testing.expectEqual(@as(usize, 0), state.log.length());
+}
+
+test "RaftState loadPersistedLog replays append-only follower truncation" {
+    const tmp_dir = "/tmp/zmq-raft-log-append-only-truncation-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+
+    const path = tmp_dir ++ "/raft.log";
+    try writePersistedRaftLogRecord(path, 1, 0, "old-0");
+    try writePersistedRaftLogRecord(path, 1, 1, "old-1");
+    try writePersistedRaftLogRecord(path, 2, 1, "new-1");
+    try writePersistedRaftLogRecord(path, 2, 2, "new-2");
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    _ = try state.loadPersistedLog();
+    try testing.expectEqual(@as(usize, 3), state.log.length());
+    try testing.expectEqual(@as(i32, 1), state.log.get(0).?.epoch);
+    try testing.expectEqualStrings("old-0", state.log.get(0).?.data);
+    try testing.expectEqual(@as(i32, 2), state.log.get(1).?.epoch);
+    try testing.expectEqualStrings("new-1", state.log.get(1).?.data);
+    try testing.expectEqual(@as(i32, 2), state.log.get(2).?.epoch);
+    try testing.expectEqualStrings("new-2", state.log.get(2).?.data);
+    try testing.expectEqual(@as(i32, 2), state.current_epoch);
 }
 
 test "RaftState loadPersistedLog rejects invalid persisted epoch" {
