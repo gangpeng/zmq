@@ -606,6 +606,52 @@ def wait_for_metadata_leader(t, port, topic, expected_leader, timeout=30):
     raise RuntimeError(f"metadata leader did not converge for {topic}: {last_detail}")
 
 
+def wait_for_broker_api_versions(t, node, timeout=90):
+    deadline = time.time() + timeout
+    last_detail = ""
+    while time.time() < deadline:
+        sock = None
+        try:
+            sock = t.connect(node["broker_port"])
+            api_count = api_versions(sock, t.next())
+            if api_count >= 10:
+                return api_count
+            last_detail = f"{api_count} APIs"
+        except Exception as exc:
+            last_detail = str(exc)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        time.sleep(1)
+    raise RuntimeError(last_detail or "broker did not respond")
+
+
+def wait_for_metadata_topics(t, node, timeout=60):
+    deadline = time.time() + timeout
+    last_detail = ""
+    while time.time() < deadline:
+        sock = None
+        try:
+            sock = t.connect(node["broker_port"])
+            topics = metadata_request(sock, t.next())
+            if topics:
+                return topics
+            last_detail = "empty topic list"
+        except Exception as exc:
+            last_detail = str(exc)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        time.sleep(1)
+    raise RuntimeError(last_detail or "metadata did not respond")
+
+
 def alter_partition_reassignment(port, corr_id, topic, partition, replicas):
     body = struct.pack('>i', 30000)
     body += write_compact_array_len(1)
@@ -1692,22 +1738,11 @@ def main():
     print("\n[Test i] Restart recovery")
     subprocess.run(["docker", "start", stopped["container"]], capture_output=True, timeout=30)
 
-    restart_ok = False
-    restart_detail = ""
-    for _ in range(30):
-        try:
-            sock = t.connect(stopped["broker_port"])
-            n = api_versions(sock, t.next())
-            sock.close()
-            if n >= 10:
-                restart_ok = True
-                restart_detail = f"{n} APIs"
-                break
-            restart_detail = f"{n} APIs"
-        except Exception as e:
-            restart_detail = str(e)
-        time.sleep(1)
-    t.check(f"Node {stopped_node} restarted and responds ({restart_detail})", restart_ok, restart_detail)
+    try:
+        n = wait_for_broker_api_versions(t, stopped, timeout=90)
+        t.check(f"Node {stopped_node} restarted and responds ({n} APIs)", True)
+    except Exception as e:
+        t.check(f"Node {stopped_node} restarted and responds", False, str(e))
 
     try:
         restarted_leader, restarted_quorum = wait_for_controller_leader(t, timeout=30)
@@ -1726,9 +1761,7 @@ def main():
     topic_lists = []
     for node in NODES:
         try:
-            sock = t.connect(node["broker_port"])
-            topics = metadata_request(sock, t.next())
-            sock.close()
+            topics = wait_for_metadata_topics(t, node, timeout=60)
             topic_lists.append(set(topics))
             t.check(f"{node['name']} metadata: {len(topics)} topics ({', '.join(sorted(topics)[:3])}...)", len(topics) > 0)
         except Exception as e:
@@ -1776,8 +1809,20 @@ def main():
     # =============================================
     print("\n[Test l] Partition reassignment convergence")
     reassign_topic = f"e2e-reassign-{os.getpid()}"
-    source_node = 1
-    target_node = 2
+    try:
+        source_node, source_quorum = wait_for_controller_leader(t, timeout=30)
+        if source_node < 0 or source_node >= len(NODES):
+            raise RuntimeError(f"leader {source_node} outside configured nodes")
+        target_node = (source_node + 1) % len(NODES)
+        t.check(
+            f"Reassignment source is controller leader node {source_node}, target node {target_node}",
+            target_node != source_node,
+            f"quorum={source_quorum}",
+        )
+    except Exception as e:
+        source_node = 1
+        target_node = 2
+        t.check("Select reassignment source/target", False, str(e))
     try:
         sock = t.connect(NODES[source_node]["broker_port"])
         err = create_topic(sock, t.next(), reassign_topic, 1)

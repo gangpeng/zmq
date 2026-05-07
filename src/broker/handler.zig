@@ -2720,6 +2720,14 @@ pub const Broker = struct {
         return true;
     }
 
+    fn canAutoCreateTopicForClientRequest(self: *const Broker) bool {
+        if (!self.auto_create_topics) return false;
+        if (self.raft_state) |raft| {
+            return raft.role == .leader;
+        }
+        return true;
+    }
+
     /// Ensure an internal topic exists with the specified partition count.
     fn ensureInternalTopic(self: *Broker, name: []const u8, partitions: i32) !void {
         if (self.topics.getPtr(name)) |topic| {
@@ -13573,7 +13581,7 @@ pub const Broker = struct {
             return self.buildMissingMetadataTopicResponse(topic_req.name, topic_req.topic_id, @intFromEnum(ErrorCode.invalid_topic_exception));
         }
 
-        if (!self.topics.contains(topic_name) and allow_auto_topic_creation) {
+        if (!self.topics.contains(topic_name) and allow_auto_topic_creation and self.canAutoCreateTopicForClientRequest()) {
             _ = self.ensureTopic(topic_name);
         }
 
@@ -13919,8 +13927,12 @@ pub const Broker = struct {
             }
         }
 
-        // Auto-create topic if needed
-        _ = self.ensureTopic(topic_name);
+        // Auto-create topic if needed. In KRaft mode only the controller
+        // leader may materialize new topic metadata; followers wait for quorum
+        // replay so client requests cannot create split-brain local owners.
+        if (self.canAutoCreateTopicForClientRequest()) {
+            _ = self.ensureTopic(topic_name);
+        }
         object_metadata_dirty.* = true;
 
         if (self.partitionRequestError(topic_name, partition_req.index)) |error_code| {
@@ -35435,6 +35447,54 @@ test "Broker.handleRequest Metadata v12 returns generated flexible topic metadat
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].replica_nodes[0]);
 }
 
+test "Broker.handleRequest Metadata does not auto-create on KRaft follower" {
+    const Req = generated.metadata_request.MetadataRequest;
+    const Topic = Req.MetadataRequestTopic;
+    const Resp = generated.metadata_response.MetadataResponse;
+
+    var raft = RaftState.init(testing.allocator, 1, "metadata-quorum-follower");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    try raft.becomeFollower(2, 2);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+
+    const topics = [_]Topic{.{
+        .name = "metadata-follower-auto-create-topic",
+    }};
+    const req = Req{
+        .topics = &topics,
+        .allow_auto_topic_creation = true,
+        .include_topic_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 12, 318, header_mod.requestHeaderVersion(3, 12));
+    req.serialize(&buf, &pos, 12);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(3, 12));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 318), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 12);
+    defer freeDeserializedMetadataResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("metadata-follower-auto-create-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions.len);
+    try testing.expect(!broker.topics.contains("metadata-follower-auto-create-topic"));
+    try testing.expectEqual(@as(usize, 0), raft.log.length());
+}
+
 test "Broker.handleRequest Metadata authorization denial uses generated response" {
     const Req = generated.metadata_request.MetadataRequest;
     const Topic = Req.MetadataRequestTopic;
@@ -37332,6 +37392,59 @@ test "Broker.handleRequest Produce rejects malformed record batch length" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.corrupt_message)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
     try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-malformed-batch-length-topic", 0).?.next_offset);
+}
+
+test "Broker.handleRequest Produce does not auto-create on KRaft follower" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var raft = RaftState.init(testing.allocator, 1, "produce-quorum-follower");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    try raft.becomeFollower(2, 2);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = "follower-records",
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-follower-auto-create-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 325, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 325), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expect(!broker.topics.contains("produce-follower-auto-create-topic"));
+    try testing.expectEqual(@as(usize, 0), raft.log.length());
 }
 
 test "Broker.handleRequest Produce enforces required acks before append" {
