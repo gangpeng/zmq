@@ -109,12 +109,136 @@
           "legendFormat": "connections"
         },
         {
+          "expr": "kafka_server_active_connections",
+          "legendFormat": "server active connections"
+        },
+        {
+          "expr": "kafka_network_socketserver_connectioncount",
+          "legendFormat": "socket-server connections"
+        },
+        {
+          "expr": "Kafka_server_connection_count",
+          "legendFormat": "AutoMQ connection count"
+        },
+        {
+          "expr": "rate(kafka_network_socketserver_expiredconnectionskilledcount_total[5m])",
+          "legendFormat": "expired connection kills"
+        },
+        {
           "expr": "kafka_server_topic_count",
           "legendFormat": "topics"
         },
         {
+          "expr": "Kafka_topic_count",
+          "legendFormat": "AutoMQ topic count"
+        },
+        {
           "expr": "kafka_server_group_count",
           "legendFormat": "groups"
+        },
+        {
+          "expr": "Kafka_group_count",
+          "legendFormat": "AutoMQ group count"
+        },
+        {
+          "expr": "kafka_server_member_count",
+          "legendFormat": "members"
+        },
+        {
+          "expr": "kafka_server_partition_count",
+          "legendFormat": "partitions"
+        },
+        {
+          "expr": "Kafka_partition_count",
+          "legendFormat": "AutoMQ local partitions"
+        },
+        {
+          "expr": "Kafka_partition_total_count",
+          "legendFormat": "AutoMQ total partitions"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numgroups",
+          "legendFormat": "JMX groups"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numoffsets",
+          "legendFormat": "JMX committed offsets"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numgroupsempty",
+          "legendFormat": "empty groups"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numgroupspreparingrebalance",
+          "legendFormat": "preparing rebalance groups"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numgroupscompletingrebalance",
+          "legendFormat": "completing rebalance groups"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numgroupsstable",
+          "legendFormat": "stable groups"
+        },
+        {
+          "expr": "kafka_server_groupmetadatamanager_numgroupsdead",
+          "legendFormat": "dead groups"
+        },
+        {
+          "expr": "kafka_server_group_coordinator_metrics_partition_count",
+          "legendFormat": "{{state}} group coordinator partitions"
+        },
+        {
+          "expr": "kafka_server_group_coordinator_metrics_group_count",
+          "legendFormat": "{{protocol}} groups"
+        },
+        {
+          "expr": "rate(kafka_server_group_coordinator_metrics_offset_commit_count_total[5m])",
+          "legendFormat": "offset commits"
+        },
+        {
+          "expr": "kafka_server_group_coordinator_metrics_event_queue_size",
+          "legendFormat": "group coordinator queue"
+        },
+        {
+          "expr": "kafka_server_group_coordinator_metrics_thread_idle_ratio_avg",
+          "legendFormat": "group coordinator idle"
+        },
+        {
+          "expr": "kafka_server_transaction_coordinator_metrics_transaction_count",
+          "legendFormat": "{{state}} transactions"
+        },
+        {
+          "expr": "kafka_server_transaction_coordinator_metrics_transactional_id_count",
+          "legendFormat": "transactional IDs"
+        },
+        {
+          "expr": "kafka_server_transaction_coordinator_metrics_registered_partition_count",
+          "legendFormat": "registered transaction partitions"
+        },
+        {
+          "expr": "kafka_server_transaction_coordinator_metrics_partition_count",
+          "legendFormat": "{{state}} transaction coordinator partitions"
+        },
+        {
+          "expr": "kafka_server_quota_manager_metrics_client_quota_count",
+          "legendFormat": "client quota overrides"
+        },
+        {
+          "expr": "kafka_server_quota_manager_metrics_default_window_count",
+          "legendFormat": "default quota windows"
+        },
+        {
+          "expr": "kafka_server_quota_manager_metrics_default_produce_byte_rate",
+          "legendFormat": "default produce quota"
+        },
+        {
+          "expr": "kafka_server_quota_manager_metrics_default_fetch_byte_rate",
+          "legendFormat": "default fetch quota"
+        },
+        {
+          "expr": "kafka_server_quota_manager_metrics_default_request_rate",
+          "legendFormat": "default request quota"
         },
         {
           "expr": "kafka_server_kafkaserver_brokerstate",
@@ -155,6 +279,46 @@
         {
           "expr": "sum(rate(s3_request_errors_total[5m])) by (operation)",
           "legendFormat": "{{operation}} errors"
+        },
+        {
+          "expr": "sum(rate(s3_bytes_total[5m])) by (direction)",
+          "legendFormat": "{{direction}} bytes"
+        },
+        {
+          "expr": "sum(rate(cache_operations_total[5m])) by (cache, result)",
+          "legendFormat": "{{cache}} {{result}}"
+        },
+        {
+          "expr": "sum(rate(cache_evictions_total[5m])) by (cache)",
+          "legendFormat": "{{cache}} evictions"
+        },
+        {
+          "expr": "rate(compaction_cycles_total[5m])",
+          "legendFormat": "compaction cycles"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(compaction_cycle_duration_seconds_bucket[10m])) by (le))",
+          "legendFormat": "compaction p99"
+        },
+        {
+          "expr": "rate(compaction_splits_total[5m])",
+          "legendFormat": "compaction splits"
+        },
+        {
+          "expr": "rate(compaction_merges_total[5m])",
+          "legendFormat": "compaction merges"
+        },
+        {
+          "expr": "rate(compaction_cleanups_total[5m])",
+          "legendFormat": "compaction cleanups"
+        },
+        {
+          "expr": "rate(compaction_destroyed_total[5m])",
+          "legendFormat": "destroyed objects"
+        },
+        {
+          "expr": "rate(compaction_expired_prepared_total[5m])",
+          "legendFormat": "expired prepared objects"
         }
       ],
       "title": "S3 Request Volume",
@@ -205,8 +369,20 @@
           "legendFormat": "log cache"
         },
         {
+          "expr": "log_cache_entries",
+          "legendFormat": "log cache entries"
+        },
+        {
           "expr": "s3_block_cache_size_bytes",
           "legendFormat": "s3 block cache"
+        },
+        {
+          "expr": "s3_block_cache_entries",
+          "legendFormat": "s3 block cache entries"
+        },
+        {
+          "expr": "compaction_orphaned_keys",
+          "legendFormat": "compaction orphaned keys"
         },
         {
           "expr": "kafka_client_telemetry_bytes",
@@ -245,6 +421,10 @@
         {
           "expr": "sum(rate(kafka_client_telemetry_export_errors_total[5m]))",
           "legendFormat": "export errors"
+        },
+        {
+          "expr": "sum(rate(kafka_client_telemetry_export_bytes_total[5m]))",
+          "legendFormat": "export bytes"
         }
       ],
       "title": "Client Telemetry",
@@ -271,6 +451,42 @@
         {
           "expr": "raft_commit_index",
           "legendFormat": "commit index"
+        },
+        {
+          "expr": "rate(raft_elections_started_total[5m])",
+          "legendFormat": "elections started"
+        },
+        {
+          "expr": "rate(raft_pre_votes_started_total[5m])",
+          "legendFormat": "pre-votes started"
+        },
+        {
+          "expr": "rate(raft_votes_granted_total[5m])",
+          "legendFormat": "votes granted"
+        },
+        {
+          "expr": "rate(raft_votes_rejected_total[5m])",
+          "legendFormat": "votes rejected"
+        },
+        {
+          "expr": "rate(raft_leader_elections_won_total[5m])",
+          "legendFormat": "leader elections won"
+        },
+        {
+          "expr": "rate(raft_epoch_changes_total[5m])",
+          "legendFormat": "epoch changes"
+        },
+        {
+          "expr": "rate(raft_log_entries_appended_total[5m])",
+          "legendFormat": "log entries appended"
+        },
+        {
+          "expr": "rate(raft_log_entries_committed_total[5m])",
+          "legendFormat": "log entries committed"
+        },
+        {
+          "expr": "rate(raft_snapshots_taken_total[5m])",
+          "legendFormat": "snapshots taken"
         }
       ],
       "title": "Raft State",
@@ -295,6 +511,14 @@
         {
           "expr": "sum(rate(kafka_network_requestmetrics_requests_total[5m])) by (request)",
           "legendFormat": "{{request}} requests"
+        },
+        {
+          "expr": "sum(rate(kafka_network_requestmetrics_requestbytes_total[5m])) by (request)",
+          "legendFormat": "{{request}} request bytes"
+        },
+        {
+          "expr": "sum(rate(kafka_network_requestmetrics_responsebytes_total[5m])) by (request)",
+          "legendFormat": "{{request}} response bytes"
         },
         {
           "expr": "sum(rate(kafka_network_requestmetrics_errors_total{error!=\"NONE\"}[5m])) by (request, error)",
@@ -361,6 +585,14 @@
           "legendFormat": "fetch requests"
         },
         {
+          "expr": "rate(kafka_server_produce_throttle_total[5m])",
+          "legendFormat": "produce throttles"
+        },
+        {
+          "expr": "rate(kafka_server_fetch_throttle_total[5m])",
+          "legendFormat": "fetch throttles"
+        },
+        {
           "expr": "rate(kafka_server_brokertopicmetrics_messagesin_total[5m])",
           "legendFormat": "messages in"
         },
@@ -379,6 +611,14 @@
         {
           "expr": "rate(kafka_server_brokertopicmetrics_bytesout_total[5m])",
           "legendFormat": "bytes out"
+        },
+        {
+          "expr": "rate(kafka_server_bytes_in_total[5m])",
+          "legendFormat": "server bytes in"
+        },
+        {
+          "expr": "rate(kafka_server_bytes_out_total[5m])",
+          "legendFormat": "server bytes out"
         },
         {
           "expr": "rate(kafka_server_brokertopicmetrics_bytesrejected_total[5m])",
@@ -455,6 +695,26 @@
           "legendFormat": "preferred replica imbalance"
         },
         {
+          "expr": "rate(kafka_controller_controllerstats_leaderelectionrateandtimems_total[5m])",
+          "legendFormat": "leader elections"
+        },
+        {
+          "expr": "rate(kafka_controller_controllerstats_uncleanleaderelectionspersec_total[5m])",
+          "legendFormat": "unclean leader elections"
+        },
+        {
+          "expr": "rate(kafka_server_replicamanager_isrshrinks_total[5m])",
+          "legendFormat": "ISR shrinks"
+        },
+        {
+          "expr": "rate(kafka_server_replicamanager_isrexpands_total[5m])",
+          "legendFormat": "ISR expands"
+        },
+        {
+          "expr": "rate(kafka_server_replicamanager_failedisrupdatesperseccount_total[5m])",
+          "legendFormat": "failed ISR updates"
+        },
+        {
           "expr": "kafka_log_logmanager_offlinelogdirectorycount",
           "legendFormat": "offline log directories"
         },
@@ -464,6 +724,114 @@
         }
       ],
       "title": "JMX Controller And Replica Manager",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "id": 13,
+      "targets": [
+        {
+          "expr": "sum(rate(Kafka_request_count_total[5m])) by (type)",
+          "legendFormat": "{{type}} requests"
+        },
+        {
+          "expr": "sum(rate(Kafka_request_error_count_total{error!=\"NONE\"}[5m])) by (type, error)",
+          "legendFormat": "{{type}} {{error}} errors"
+        },
+        {
+          "expr": "sum(rate(Kafka_request_size_bytes_total[5m])) by (type)",
+          "legendFormat": "{{type}} request bytes"
+        },
+        {
+          "expr": "sum(rate(Kafka_response_size_bytes_total[5m])) by (type)",
+          "legendFormat": "{{type}} response bytes"
+        },
+        {
+          "expr": "sum(rate(Kafka_request_time_milliseconds_total[5m])) by (type)",
+          "legendFormat": "{{type}} request ms"
+        }
+      ],
+      "title": "AutoMQ Request Metrics",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "id": 14,
+      "targets": [
+        {
+          "expr": "max(kafka_consumer_lag) by (group, topic, partition)",
+          "legendFormat": "{{group}} {{topic}}-{{partition}} lag"
+        },
+        {
+          "expr": "sum(kafka_consumer_lag) by (group, topic)",
+          "legendFormat": "{{group}} {{topic}} total lag"
+        }
+      ],
+      "title": "Consumer Lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "id": 15,
+      "targets": [
+        {
+          "expr": "automq_object_manager_stream_count",
+          "legendFormat": "streams"
+        },
+        {
+          "expr": "automq_object_manager_stream_set_object_count",
+          "legendFormat": "stream-set objects"
+        },
+        {
+          "expr": "automq_object_manager_stream_object_count",
+          "legendFormat": "stream objects"
+        },
+        {
+          "expr": "automq_object_manager_prepared_object_count",
+          "legendFormat": "prepared objects"
+        },
+        {
+          "expr": "automq_object_manager_mark_destroyed_object_count",
+          "legendFormat": "mark-destroyed objects"
+        }
+      ],
+      "title": "AutoMQ Object Manager",
       "type": "timeseries"
     }
   ],
@@ -492,5 +860,5 @@
   "timezone": "browser",
   "title": "ZMQ AutoMQ Parity Overview",
   "uid": "zmq-automq-parity",
-  "version": 2
+  "version": 3
 }

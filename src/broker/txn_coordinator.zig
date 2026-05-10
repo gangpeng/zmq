@@ -36,6 +36,16 @@ pub const TransactionCoordinator = struct {
         dead,
     };
 
+    pub const StatusCounts = struct {
+        empty: usize = 0,
+        ongoing: usize = 0,
+        prepare_commit: usize = 0,
+        complete_commit: usize = 0,
+        prepare_abort: usize = 0,
+        complete_abort: usize = 0,
+        dead: usize = 0,
+    };
+
     pub const TransactionState = struct {
         producer_id: i64,
         producer_epoch: i16,
@@ -223,18 +233,22 @@ pub const TransactionCoordinator = struct {
         // allocate a new producer_id and reset epoch to 0.
         // NOTE: AutoMQ/Kafka resets when epoch approaches Short.MAX_VALUE.
         if (txn.producer_epoch >= std.math.maxInt(i16) - 1) {
+            try self.transactions.ensureUnusedCapacity(1);
+            const remapped_txn = self.transactions.getPtr(producer_id) orelse {
+                return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_id_mapping));
+            };
             const new_pid = self.next_producer_id;
             self.next_producer_id += 1;
-            const old_pid = txn.producer_id;
-            txn.producer_id = new_pid;
-            txn.producer_epoch = 0;
-            txn.status = .empty;
-            txn.clearPartitions(self.allocator);
-            resetTransactionStart(txn);
-            if (txn.transactional_id != null) txn.timeout_ms = transaction_timeout_ms;
-            const txn_copy = txn.*;
+            const old_pid = remapped_txn.producer_id;
+            remapped_txn.producer_id = new_pid;
+            remapped_txn.producer_epoch = 0;
+            remapped_txn.status = .empty;
+            remapped_txn.clearPartitions(self.allocator);
+            resetTransactionStart(remapped_txn);
+            if (remapped_txn.transactional_id != null) remapped_txn.timeout_ms = transaction_timeout_ms;
+            const txn_copy = remapped_txn.*;
             _ = self.transactions.fetchRemove(old_pid);
-            try self.transactions.put(new_pid, txn_copy);
+            self.transactions.putAssumeCapacity(new_pid, txn_copy);
             self.dirty = true;
             return .{
                 .error_code = 0,
@@ -493,6 +507,41 @@ pub const TransactionCoordinator = struct {
         return self.transactions.count();
     }
 
+    pub fn statusCounts(self: *const TransactionCoordinator) StatusCounts {
+        var counts = StatusCounts{};
+        var it = self.transactions.iterator();
+        while (it.next()) |entry| {
+            switch (entry.value_ptr.status) {
+                .empty => counts.empty += 1,
+                .ongoing => counts.ongoing += 1,
+                .prepare_commit => counts.prepare_commit += 1,
+                .complete_commit => counts.complete_commit += 1,
+                .prepare_abort => counts.prepare_abort += 1,
+                .complete_abort => counts.complete_abort += 1,
+                .dead => counts.dead += 1,
+            }
+        }
+        return counts;
+    }
+
+    pub fn transactionalIdCount(self: *const TransactionCoordinator) usize {
+        var count: usize = 0;
+        var it = self.transactions.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.transactional_id != null) count += 1;
+        }
+        return count;
+    }
+
+    pub fn registeredPartitionCount(self: *const TransactionCoordinator) usize {
+        var count: usize = 0;
+        var it = self.transactions.iterator();
+        while (it.next()) |entry| {
+            count += entry.value_ptr.partitions.items.len;
+        }
+        return count;
+    }
+
     /// Restore transaction state from persisted snapshot (called during Broker.open()).
     /// NOTE: AutoMQ/Kafka loads from __transaction_state topic on coordinator startup.
     /// ZMQ uses file-based persistence as a simplification.
@@ -545,6 +594,31 @@ test "TransactionCoordinator init producer id" {
     try testing.expect(result.producer_id >= 1000);
     try testing.expectEqual(@as(i16, 0), result.producer_epoch);
     try testing.expectEqual(@as(usize, 1), coord.transactionCount());
+}
+
+test "TransactionCoordinator reports status and partition counts" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const empty = try coord.initProducerId(null);
+    const ongoing = try coord.initProducerId("txn-count-ongoing");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try coord.addPartitionsToTxn(ongoing.producer_id, ongoing.producer_epoch, "txn-count-topic", 0));
+    const aborting = try coord.initProducerId("txn-count-aborting");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try coord.addPartitionsToTxn(aborting.producer_id, aborting.producer_epoch, "txn-count-topic", 1));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), coord.endTxn(aborting.producer_id, aborting.producer_epoch, false));
+
+    const counts = coord.statusCounts();
+    try testing.expectEqual(@as(usize, 3), coord.transactionCount());
+    try testing.expectEqual(@as(usize, 1), counts.empty);
+    try testing.expectEqual(@as(usize, 1), counts.ongoing);
+    try testing.expectEqual(@as(usize, 0), counts.prepare_commit);
+    try testing.expectEqual(@as(usize, 0), counts.complete_commit);
+    try testing.expectEqual(@as(usize, 1), counts.prepare_abort);
+    try testing.expectEqual(@as(usize, 0), counts.complete_abort);
+    try testing.expectEqual(@as(usize, 0), counts.dead);
+    try testing.expectEqual(@as(usize, 2), coord.transactionalIdCount());
+    try testing.expectEqual(@as(usize, 2), coord.registeredPartitionCount());
+    try testing.expect(coord.getStatus(empty.producer_id) != null);
 }
 
 test "TransactionCoordinator full lifecycle" {
@@ -779,6 +853,31 @@ test "TransactionCoordinator epoch fencing" {
 
     // Still only 1 transaction entry (reused)
     try testing.expectEqual(@as(usize, 1), coord.transactionCount());
+}
+
+test "TransactionCoordinator epoch overflow remap preserves mapping when allocation fails" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const initial = try coord.initProducerId("overflow-txn");
+    while (coord.transactions.count() < coord.transactions.capacity()) {
+        _ = try coord.initProducerId(null);
+    }
+    coord.transactions.getPtr(initial.producer_id).?.producer_epoch = std.math.maxInt(i16) - 1;
+    const before_next_producer_id = coord.next_producer_id;
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    coord.transactions.allocator = failing_allocator.allocator();
+    defer coord.transactions.allocator = testing.allocator;
+
+    try testing.expectError(error.OutOfMemory, coord.initProducerId("overflow-txn"));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(before_next_producer_id, coord.next_producer_id);
+
+    const retained = coord.transactions.get(initial.producer_id) orelse return error.ExpectedTransaction;
+    try testing.expectEqual(initial.producer_id, retained.producer_id);
+    try testing.expectEqual(std.math.maxInt(i16) - 1, retained.producer_epoch);
+    try testing.expectEqual(@as(?TransactionCoordinator.TxnStatus, null), coord.getStatus(before_next_producer_id));
 }
 
 test "TransactionCoordinator initProducerIdForRequest bumps validated producer epoch" {

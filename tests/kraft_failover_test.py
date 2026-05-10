@@ -38,10 +38,11 @@ import tempfile
 import time
 
 
-RUN_ENABLED = os.environ.get("ZMQ_RUN_KRAFT_FAILOVER_TESTS") == "1"
 ZMQ_BIN = os.environ.get("ZMQ_BIN", "./zig-out/bin/zmq")
-PORT_BASE = int(os.environ.get("ZMQ_KRAFT_CONTROLLER_PORT_BASE", "39093"))
-BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
+PORT_BASE_DEFAULT = 39093
+BROKER_PORT_DEFAULT = 39092
+PORT_BASE = PORT_BASE_DEFAULT
+BROKER_PORT = BROKER_PORT_DEFAULT
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 ERROR_NONE = 0
 ERROR_UNSUPPORTED_VERSION = 35
@@ -66,6 +67,89 @@ ACL_PATTERN_TYPE_LITERAL = 3
 ACL_OPERATION_ALL = 2
 ACL_OPERATION_DESCRIBE = 8
 ACL_PERMISSION_ALLOW = 3
+
+
+PLACEHOLDER_ENV_VALUES = {
+    "...",
+    "placeholder",
+    "required",
+    "tbd",
+    "todo",
+}
+BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
+BOOL_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def placeholder_env_value(value):
+    stripped = str(value).strip()
+    lowered = stripped.lower()
+    angle_start = stripped.find("<")
+    has_angle_placeholder = (
+        angle_start >= 0
+        and stripped.find(">", angle_start + 1) > angle_start + 1
+    )
+    return (
+        lowered in PLACEHOLDER_ENV_VALUES
+        or lowered.startswith("/path/to/")
+        or has_angle_placeholder
+    )
+
+
+def validate_non_placeholder_values(values, label):
+    placeholders = [value for value in values if placeholder_env_value(value)]
+    if placeholders:
+        raise TestError(
+            f"{label} uses placeholder values: " + ", ".join(placeholders)
+        )
+
+
+def strict_bool_text(name, value, default=False):
+    if value is None:
+        return default
+    stripped = str(value).strip()
+    if not stripped:
+        raise TestError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise TestError(f"{name} must not use a placeholder value")
+    lowered = stripped.lower()
+    if lowered in BOOL_TRUE_VALUES:
+        return True
+    if lowered in BOOL_FALSE_VALUES:
+        return False
+    raise TestError(f"{name} must be true or false")
+
+
+def run_gate_enabled(name):
+    return strict_bool_text(name, os.environ.get(name), False)
+
+
+def reject_nonstandard_json_constant(value):
+    raise ValueError(f"non-standard JSON constant {value!r} is not allowed in strict JSON")
+
+
+def reject_duplicate_json_object_keys(pairs):
+    parsed = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON object key {key!r} is not allowed in strict JSON")
+        parsed[key] = value
+    return parsed
+
+
+def parse_automq_cluster_manifest(manifest):
+    try:
+        parsed = json.loads(
+            manifest,
+            parse_constant=reject_nonstandard_json_constant,
+            object_pairs_hook=reject_duplicate_json_object_keys,
+        )
+    except ValueError as exc:
+        raise TestError(f"ExportClusterManifest returned invalid strict JSON: {manifest!r}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise TestError("ExportClusterManifest returned JSON that is not an object")
+    return parsed
+
+
 CONTROLLER_API_VERSIONS = {
     18: (0, 4),
     52: (0, 1),
@@ -81,6 +165,12 @@ CONTROLLER_API_VERSIONS = {
     80: (0, 0),
     81: (0, 0),
     82: (0, 0),
+}
+LEGACY_INTER_BROKER_API_VERSIONS = {
+    4: (0, 7),  # LeaderAndIsr
+    5: (0, 4),  # StopReplica
+    6: (0, 8),  # UpdateMetadata
+    7: (0, 3),  # ControlledShutdown
 }
 BROKER_NON_BROKER_API_VERSIONS = {
     56: 3,  # AlterPartition
@@ -99,6 +189,35 @@ BROKER_NON_BROKER_API_VERSIONS = {
 
 class TestError(Exception):
     pass
+
+
+def positive_int_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    stripped = str(raw).strip()
+    if not stripped:
+        raise TestError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise TestError(f"{name} must not use a placeholder value")
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise TestError(f"{name} must be an integer") from exc
+    if parsed <= 0 or parsed > 65535:
+        raise TestError(f"{name} must be a positive TCP port")
+    return parsed
+
+
+def validate_port_config():
+    global PORT_BASE, BROKER_PORT
+
+    PORT_BASE = positive_int_env("ZMQ_KRAFT_CONTROLLER_PORT_BASE", PORT_BASE_DEFAULT)
+    BROKER_PORT = positive_int_env("ZMQ_KRAFT_BROKER_PORT", BROKER_PORT_DEFAULT)
+    if PORT_BASE + 2 > 65535:
+        raise TestError("ZMQ_KRAFT_CONTROLLER_PORT_BASE leaves controller ports outside TCP range")
+    if BROKER_PORT + 2002 > 65535:
+        raise TestError("ZMQ_KRAFT_BROKER_PORT leaves derived broker ports outside TCP range")
 
 
 def write_varint(value):
@@ -543,11 +662,11 @@ def metadata_partition_leader(port, topic, correlation_id):
 
 
 def wait_for_metadata_leader(port, topic, expected_leader, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 3100
     last_error = None
     last_metadata = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_metadata = metadata_partition_leader(port, topic, correlation_id)
             if last_metadata["leader_id"] == expected_leader:
@@ -566,10 +685,10 @@ def wait_for_metadata_leader(port, topic, expected_leader, timeout=30):
 
 
 def wait_for_topic(port, name):
-    deadline = time.time() + 20
+    deadline = time.monotonic() + 20
     correlation_id = 3000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             create_topic(port, name, correlation_id)
             return
@@ -772,10 +891,10 @@ def wait_for_allocate_producer_ids_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9040)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             allocated = allocate_producer_ids(port, 100, -1, correlation_id)
             if (
@@ -813,10 +932,10 @@ def wait_for_allocate_producer_ids_follower_rejection_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 10140)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -1027,11 +1146,11 @@ def produce_record_batch_result(port, topic, record_batch, correlation_id):
 
 
 def wait_for_record_batch_result(port, topic, record_batch, expected_error, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7100
     last_error = None
     last_result = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_result = produce_record_batch_result(
                 port,
@@ -1175,10 +1294,10 @@ def require_single_offset_for_leader_epoch_partition(topics, topic):
 def wait_for_log_position_checkpoint(
     port, topic, expected_start_offset, expected_end_offset, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8200
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             earliest = require_single_list_offsets_partition(
                 list_offsets(port, topic, -2, correlation_id),
@@ -1271,10 +1390,10 @@ def require_single_delete_records_partition(topics, topic):
 def wait_for_delete_records_checkpoint(
     port, topic, expected_low_watermark, expected_end_offset, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8300
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             partition = require_single_delete_records_partition(
                 delete_records(port, topic, expected_low_watermark, correlation_id),
@@ -1351,10 +1470,10 @@ def require_create_partitions_success(response, topic):
 
 
 def wait_for_create_partitions_mutation(port, topic, count, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8330
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = create_partitions(port, topic, count, False, correlation_id)
             require_create_partitions_success(response, topic)
@@ -1369,10 +1488,10 @@ def wait_for_create_partitions_mutation(port, topic, count, timeout=30):
 def wait_for_create_partitions_validate_only_checkpoint(
     port, topic, count, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8360
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = create_partitions(port, topic, count, True, correlation_id)
             require_create_partitions_success(response, topic)
@@ -1578,10 +1697,10 @@ def wait_for_controller_api_versions_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9340)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = api_versions_v3(port, correlation_id)
             require_controller_api_versions(response)
@@ -1602,10 +1721,10 @@ def wait_for_all_controller_api_versions_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9860)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -1665,8 +1784,32 @@ def controller_unsupported_cases():
         for api_key, versions in sorted(CONTROLLER_API_VERSIONS.items())
         if api_key != 18
     ]
+    for api_key, versions in sorted(LEGACY_INTER_BROKER_API_VERSIONS.items()):
+        cases.append((api_key, versions[0]))
+        if versions[1] != versions[0]:
+            cases.append((api_key, versions[1]))
     cases.extend([(71, 0), (72, 0)])
     return cases
+
+
+def api_case_summary(cases):
+    return (
+        "["
+        + ",".join(f"{api_key}:{api_version}" for api_key, api_version in cases)
+        + "]"
+    )
+
+
+def controller_unsupported_summary(cases):
+    return api_case_summary(cases)
+
+
+def broker_non_broker_api_rejection_cases():
+    return sorted(BROKER_NON_BROKER_API_VERSIONS.items())
+
+
+def broker_non_broker_api_rejection_summary():
+    return api_case_summary(broker_non_broker_api_rejection_cases())
 
 
 def wait_for_controller_unsupported_checkpoint(
@@ -1675,11 +1818,11 @@ def wait_for_controller_unsupported_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9740)
     unsupported_cases = controller_unsupported_cases()
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             for index, (api_key, api_version) in enumerate(unsupported_cases):
                 response = controller_small_error_request(
@@ -1712,11 +1855,11 @@ def wait_for_all_controller_unsupported_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 10040)
     unsupported_cases = controller_unsupported_cases()
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -1766,11 +1909,11 @@ def wait_for_broker_non_broker_api_rejection_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9960)
-    cases = sorted(BROKER_NON_BROKER_API_VERSIONS.items())
+    cases = broker_non_broker_api_rejection_cases()
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             for index, (api_key, api_version) in enumerate(cases):
                 response = broker_non_broker_api_request(
@@ -1947,12 +2090,12 @@ def wait_for_dynamic_raft_voter_negative_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9440)
     existing_voter_id = sorted(expected_ports)[0]
     unknown_voter_id = max(expected_ports) + 50000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             add_response = add_raft_voter_empty_listeners(
                 port,
@@ -2036,12 +2179,12 @@ def wait_for_dynamic_raft_voter_follower_rejection_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 10440)
     existing_voter_id = sorted(expected_ports)[0]
     unknown_voter_id = max(expected_ports) + 50100
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -2216,12 +2359,12 @@ def wait_for_broker_registration_follower_rejection_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 10540)
     broker_id = state.get("broker_id", 62100)
     listener_port = state.get("listener_port", 65000)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -2350,11 +2493,11 @@ def wait_for_broker_lifecycle_negative_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9540)
     broker_id = state.get("broker_id", 60100)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             heartbeat = broker_heartbeat_unknown(port, broker_id, correlation_id)
             require_broker_lifecycle_negative_response(
@@ -2418,11 +2561,11 @@ def wait_for_broker_lifecycle_follower_rejection_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 10240)
     broker_id = state.get("broker_id", 61100)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -2576,12 +2719,12 @@ def wait_for_controller_registration_negative_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9640)
     existing_controller_id = sorted(expected_ports)[0]
     unknown_controller_id = max(expected_ports) + 60100
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             unknown = controller_registration(
                 port,
@@ -2655,12 +2798,12 @@ def wait_for_controller_registration_follower_rejection_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 10340)
     existing_controller_id = sorted(expected_ports)[0]
     unknown_controller_id = max(expected_ports) + 60200
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -2763,10 +2906,10 @@ def require_finalized_feature_visible(response, feature, max_version_level):
 def wait_for_update_features_mutation(
     port, feature, max_version_level, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8780
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = update_features(
                 port,
@@ -2793,10 +2936,10 @@ def wait_for_update_features_mutation(
 def wait_for_finalized_features_checkpoint(
     port, feature, max_version_level, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8810
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = update_features(
                 port,
@@ -3061,10 +3204,10 @@ def require_delete_acls_success(response, binding):
 
 
 def wait_for_acl_admin_seed(port, broad_allow_acl, deleted_acl, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8840
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             created = create_acls(
                 port,
@@ -3094,10 +3237,10 @@ def wait_for_acl_admin_seed(port, broad_allow_acl, deleted_acl, timeout=30):
 
 
 def wait_for_acl_admin_checkpoint(port, broad_allow_acl, deleted_acl, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8880
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             require_acl_visible(
                 describe_acls(port, broad_allow_acl, correlation_id),
@@ -3190,10 +3333,10 @@ def require_alter_client_quota_success(response, client_id):
 
 
 def wait_for_alter_client_quotas_mutation(port, client_id, quota_ops, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8500
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = alter_client_quotas(
                 port,
@@ -3311,11 +3454,11 @@ def wait_for_client_quotas_checkpoint(
     validate_only_client_id,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8540
     last_error = None
     validate_only_ops = [("producer_byte_rate", 9876.0, False)]
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = describe_client_quotas(port, client_id, correlation_id)
             require_describe_client_quota_values(response, client_id, expected_values)
@@ -3413,10 +3556,10 @@ def wait_for_alter_user_scram_credentials_upsert(
     iterations,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8580
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = alter_user_scram_credentials_upsert(
                 port,
@@ -3530,10 +3673,10 @@ def wait_for_user_scram_credentials_checkpoint(
     expected_iterations,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8620
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = describe_user_scram_credentials(port, user, correlation_id)
             require_describe_user_scram_credentials(
@@ -3681,10 +3824,10 @@ def wait_for_client_telemetry_checkpoint(
     metrics,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8660
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             subscription = get_telemetry_subscriptions(
                 port,
@@ -3776,10 +3919,10 @@ def require_create_delegation_token_success(response, owner_name):
 
 
 def wait_for_create_delegation_token(port, owner_name, max_lifetime_ms, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8700
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = create_delegation_token(
                 port,
@@ -3942,10 +4085,10 @@ def wait_for_delegation_token_checkpoint(
     lifetime_ms,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8740
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             renewed = renew_delegation_token(
                 port,
@@ -4067,10 +4210,10 @@ def describe_topic_selected_configs(port, topic, config_names, correlation_id):
 
 
 def wait_for_describe_configs_checkpoint(port, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8450
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = describe_topic_configs(port, topic, correlation_id)
             results = response["results"]
@@ -4213,10 +4356,10 @@ def wait_for_config_admin_seed(
     final_values,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8910
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             altered = alter_configs(
                 port,
@@ -4263,10 +4406,10 @@ def wait_for_config_admin_checkpoint(
     final_values,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8950
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             altered = alter_configs(
                 port,
@@ -4314,10 +4457,10 @@ def wait_for_create_topics_seed(
     expected_values,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8990
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             created = create_topic_with_configs(
                 port,
@@ -4359,10 +4502,10 @@ def wait_for_create_topics_checkpoint(
     validate_only_topic,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 9020
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             described = describe_topic_selected_configs(
                 port,
@@ -4468,10 +4611,10 @@ def describe_log_dirs(port, topic, correlation_id):
 
 
 def wait_for_describe_log_dirs_checkpoint(port, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8550
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = describe_log_dirs(port, topic, correlation_id)
             if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
@@ -4546,10 +4689,10 @@ def alter_replica_log_dirs(port, topic, path, correlation_id):
 
 
 def wait_for_alter_replica_log_dirs_checkpoint(port, topic, path, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8580
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = alter_replica_log_dirs(port, topic, path, correlation_id)
             if response["throttle_time_ms"] != 0:
@@ -4660,11 +4803,11 @@ def latest_broker_epoch(log_path):
 def wait_for_assign_replicas_to_dirs_checkpoint(
     port, topic, data_dir, log_path, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8610
     directory_id = derive_replica_directory_id(data_dir)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             broker_epoch = latest_broker_epoch(log_path)
             if broker_epoch is None:
@@ -4756,10 +4899,10 @@ def elect_leaders(port, topic, correlation_id):
 
 
 def wait_for_elect_leaders_checkpoint(port, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8640
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = elect_leaders(port, topic, correlation_id)
             if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
@@ -4881,10 +5024,10 @@ def describe_topic_partitions(port, topic, correlation_id):
 def wait_for_describe_topic_partitions_checkpoint(
     port, topic, expected_leader_id, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8400
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = describe_topic_partitions(port, topic, correlation_id)
             topics = response["topics"]
@@ -4927,10 +5070,10 @@ def wait_for_describe_topic_partitions_checkpoint(
 def wait_for_describe_topic_partitions_count_checkpoint(
     port, topic, expected_leader_id, expected_partition_count, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8425
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = describe_topic_partitions(port, topic, correlation_id)
             topics = response["topics"]
@@ -4986,10 +5129,10 @@ def require_deleted_topic_absent(response, topic):
 
 
 def wait_for_delete_topics_seed(port, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8460
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             deleted = delete_topic(port, topic, correlation_id)
             require_delete_topics_result(
@@ -5009,10 +5152,10 @@ def wait_for_delete_topics_seed(port, topic, timeout=30):
 
 
 def wait_for_deleted_topic_checkpoint(port, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8480
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             described = describe_topic_partitions(port, topic, correlation_id)
             require_deleted_topic_absent(described, topic)
@@ -5126,10 +5269,10 @@ def require_describe_cluster_checkpoint(
 def wait_for_describe_cluster_checkpoint(
     port, expected_node_id, expected_cluster_id, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8500
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             broker_response = describe_cluster(port, 1, False, correlation_id)
             require_describe_cluster_checkpoint(
@@ -5222,10 +5365,10 @@ def describe_producers(port, topic, correlation_id):
 def wait_for_describe_producers_checkpoint(
     port, topic, identity, min_last_sequence, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8150
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             topics = describe_producers(port, topic, correlation_id)
             if len(topics) != 1 or topics[0]["name"] != topic:
@@ -5261,11 +5404,11 @@ def wait_for_describe_producers_checkpoint(
 
 
 def wait_for_produce_error(port, topic, payload, expected_error, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 4300
     last_error = None
     last_code = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_code = produce_error_code(port, topic, payload, correlation_id)
             if last_code == expected_error:
@@ -5387,11 +5530,11 @@ def list_partition_reassignment(port, topic, partition, correlation_id):
 
 
 def wait_for_partition_reassignment(port, topic, partition, expected_replicas, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 4600
     last_error = None
     last_state = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_state = list_partition_reassignment(port, topic, partition, correlation_id)
             if last_state is not None and last_state["replicas"] == expected_replicas:
@@ -5407,10 +5550,10 @@ def wait_for_partition_reassignment(port, topic, partition, expected_replicas, t
 
 
 def wait_for_produce(port, topic, payload, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 4000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return produce(port, topic, payload, correlation_id)
         except Exception as exc:
@@ -5421,12 +5564,12 @@ def wait_for_produce(port, topic, payload, timeout=45):
 
 
 def wait_for_payloads(port, topic, payloads, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6000
     last_error = None
     last_high_watermark = None
     last_records = b""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             high_watermark, records = fetch_records(port, topic, 0, correlation_id)
             last_high_watermark = high_watermark
@@ -5450,12 +5593,12 @@ def wait_for_payloads(port, topic, payloads, timeout=30):
 
 
 def wait_for_payload_counts(port, topic, expected_counts, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7200
     last_error = None
     last_counts = {}
     last_high_watermark = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             high_watermark, records = fetch_records(port, topic, 0, correlation_id)
             last_high_watermark = high_watermark
@@ -5574,11 +5717,11 @@ def fetch_committed_offset_status(port, group, topic, correlation_id):
 
 
 def wait_for_committed_offset(port, group, topic, expected_offset, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6200
     last_offset = None
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_offset = fetch_committed_offset(port, group, topic, correlation_id)
             if last_offset == expected_offset:
@@ -5596,11 +5739,11 @@ def wait_for_committed_offset(port, group, topic, expected_offset, timeout=30):
 def wait_for_committed_offset_error(
     port, group, topic, expected_error, expected_offset=-1, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6250
     last_result = None
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_result = fetch_committed_offset_status(
                 port, group, topic, correlation_id
@@ -5623,10 +5766,10 @@ def wait_for_committed_offset_error(
 
 
 def wait_for_offset_commit(port, group, topic, expected_offset, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6300
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             commit_offset(port, group, topic, expected_offset, correlation_id)
             return wait_for_committed_offset(
@@ -5634,7 +5777,7 @@ def wait_for_offset_commit(port, group, topic, expected_offset, timeout=30):
                 group,
                 topic,
                 expected_offset,
-                timeout=max(1, int(deadline - time.time())),
+                timeout=max(1, int(deadline - time.monotonic())),
             )
         except Exception as exc:
             last_error = exc
@@ -5799,7 +5942,7 @@ def wait_for_offset_fetch_grouped_checkpoint(
     txn_offset_committed_offset,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8050
     last_error = None
     group_requests = [
@@ -5883,7 +6026,7 @@ def wait_for_offset_fetch_grouped_checkpoint(
         },
     ]
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_offset_fetch_grouped(
                 port, group_requests, expected_groups, correlation_id
@@ -5960,14 +6103,14 @@ def wait_for_offset_commit_v9_member_checkpoint(
     expected_metadata,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8250
     last_error = None
     group_id = group_state["group_id"]
     member_id = group_state["member_id"]
     member_epoch = group_state["member_epoch"]
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             valid_error = offset_commit_v9(
                 port,
@@ -6026,7 +6169,7 @@ def wait_for_offset_fetch_v9_member_checkpoint(
     expected_metadata=None,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8150
     last_error = None
     group_id = group_state["group_id"]
@@ -6091,7 +6234,7 @@ def wait_for_offset_fetch_v9_member_checkpoint(
         },
     ]
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_offset_fetch_grouped(
                 port,
@@ -6152,10 +6295,10 @@ def delete_offset(port, group, topic, correlation_id):
 
 
 def wait_for_offset_delete(port, group, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6400
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             delete_offset(port, group, topic, correlation_id)
             return wait_for_committed_offset(
@@ -6163,7 +6306,7 @@ def wait_for_offset_delete(port, group, topic, timeout=30):
                 group,
                 topic,
                 -1,
-                timeout=max(1, int(deadline - time.time())),
+                timeout=max(1, int(deadline - time.monotonic())),
             )
         except Exception as exc:
             last_error = exc
@@ -6198,10 +6341,10 @@ def init_producer_id(port, transactional_id, correlation_id):
 
 
 def wait_for_init_producer_id(port, transactional_id, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7300
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return init_producer_id(port, transactional_id, correlation_id)
         except Exception as exc:
@@ -6404,10 +6547,10 @@ def begin_offset_transaction(port, transactional_id, group_id, topic, offset, co
 
 
 def wait_for_transaction_begin(port, transactional_id, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6400
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return begin_transaction(port, transactional_id, topic, correlation_id)
         except Exception as exc:
@@ -6420,10 +6563,10 @@ def wait_for_transaction_begin(port, transactional_id, topic, timeout=30):
 def wait_for_offset_transaction_begin(
     port, transactional_id, group_id, topic, offset, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             txn = begin_offset_transaction(
                 port, transactional_id, group_id, topic, offset, correlation_id
@@ -6433,7 +6576,7 @@ def wait_for_offset_transaction_begin(
                 group_id,
                 topic,
                 offset,
-                timeout=max(1, int(deadline - time.time())),
+                timeout=max(1, int(deadline - time.monotonic())),
             )
             return txn
         except Exception as exc:
@@ -6600,10 +6743,10 @@ def assert_transaction_introspection(port, txn, expected_state, expected_topic, 
 def wait_for_transaction_introspection(
     port, txn, expected_state, expected_topic=None, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7200
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_transaction_introspection(
                 port, txn, expected_state, expected_topic, correlation_id
@@ -6620,10 +6763,10 @@ def wait_for_transaction_introspection(
 
 
 def wait_for_transaction_end(port, txn, committed=True, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6600
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             end_txn(
                 port,
@@ -6818,10 +6961,10 @@ def assert_group_description(port, group_state, correlation_id):
 
 
 def wait_for_group_description(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7300
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_group_description(port, group_state, correlation_id)
             return
@@ -6975,10 +7118,10 @@ def assert_consumer_group_description(port, group_state, correlation_id):
 
 
 def wait_for_consumer_group_description(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7400
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_consumer_group_description(port, group_state, correlation_id)
             return
@@ -7053,10 +7196,10 @@ def assert_list_groups_contains(port, group_state, correlation_id):
 
 
 def wait_for_list_groups(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7500
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_list_groups_contains(port, group_state, correlation_id)
             return
@@ -7136,10 +7279,10 @@ def assert_coordinator(port, coordinator_key, key_type, correlation_id):
 def wait_for_coordinator_discovery(
     port, group_id, transactional_id, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7600
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_coordinator(port, group_id, 0, correlation_id)
             assert_coordinator(port, transactional_id, 1, correlation_id + 1)
@@ -7272,11 +7415,11 @@ def assert_consumer_group_heartbeat_assignment(response, group_state):
 
 
 def wait_for_consumer_group_heartbeat_join(port, group_id, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7700
     member_id = f"{group_id}-member"
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7314,11 +7457,11 @@ def wait_for_consumer_group_heartbeat_join(port, group_id, topic, timeout=30):
 def wait_for_consumer_group_heartbeat_static_join(
     port, group_id, topic, instance_id, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7750
     member_id = f"{group_id}-member"
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7358,10 +7501,10 @@ def wait_for_consumer_group_heartbeat_static_join(
 
 
 def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7800
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7385,7 +7528,7 @@ def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
 def wait_for_consumer_group_heartbeat_owned_assignment(
     port, group_state, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7810
     last_error = None
     owned = [
@@ -7394,7 +7537,7 @@ def wait_for_consumer_group_heartbeat_owned_assignment(
             "partitions": [0],
         }
     ]
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7419,10 +7562,10 @@ def wait_for_consumer_group_heartbeat_owned_assignment(
 def wait_for_consumer_group_heartbeat_static_rejoin(
     port, group_state, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7820
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7460,10 +7603,10 @@ def wait_for_consumer_group_heartbeat_static_rejoin(
 def wait_for_consumer_group_heartbeat_rack_update(
     port, group_state, rack_id, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7830
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7489,11 +7632,11 @@ def wait_for_consumer_group_heartbeat_rack_update(
 def wait_for_consumer_group_heartbeat_subscription_update(
     port, group_state, topic, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7840
     last_error = None
     previous_epoch = group_state["member_epoch"]
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7593,12 +7736,12 @@ def assert_consumer_group_heartbeat_negative_join(
 def wait_for_consumer_group_heartbeat_negative_joins(
     port, group_prefix, topic, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7860
     last_error = None
     duplicate_group = f"{group_prefix}-duplicate-subscription"
     unsupported_group = f"{group_prefix}-unsupported-assignor"
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_consumer_group_heartbeat_negative_join(
                 port,
@@ -7631,10 +7774,10 @@ def wait_for_consumer_group_heartbeat_negative_joins(
 
 
 def wait_for_consumer_group_heartbeat_leave(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7850
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7672,10 +7815,10 @@ def wait_for_consumer_group_heartbeat_leave(port, group_state, timeout=30):
 
 
 def wait_for_consumer_group_heartbeat_unknown_member(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7875
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7711,10 +7854,10 @@ def wait_for_consumer_group_heartbeat_unknown_member(port, group_state, timeout=
 def wait_for_consumer_group_heartbeat_rejoin(
     port, group_state, topic, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7890
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = consumer_group_heartbeat(
                 port,
@@ -7843,10 +7986,10 @@ def assert_kip848_consumer_group_description(port, group_state, topic, correlati
 def wait_for_kip848_consumer_group_description(
     port, group_state, topic, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7900
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_kip848_consumer_group_description(
                 port, group_state, topic, correlation_id
@@ -7936,11 +8079,11 @@ def assert_share_group_heartbeat_assignment(response, group_state):
 
 
 def wait_for_share_group_heartbeat_join(port, group_id, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7940
     member_id = f"{group_id}-member"
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_group_heartbeat(
                 port,
@@ -7975,10 +8118,10 @@ def wait_for_share_group_heartbeat_join(port, group_id, topic, timeout=30):
 
 
 def wait_for_share_group_heartbeat(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7950
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_group_heartbeat(
                 port,
@@ -8002,10 +8145,10 @@ def wait_for_share_group_heartbeat(port, group_state, timeout=30):
 def wait_for_share_group_heartbeat_rack_update(
     port, group_state, rack_id, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7960
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_group_heartbeat(
                 port,
@@ -8165,10 +8308,10 @@ def assert_share_group_description(port, group_state, topic, correlation_id):
 
 
 def wait_for_share_group_description(port, group_state, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7970
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             assert_share_group_description(port, group_state, topic, correlation_id)
             return
@@ -8321,7 +8464,7 @@ def share_fetch(
 def wait_for_share_fetch_open(
     port, group_state, expected_payload, timeout=30
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7980
     last_error = None
     topic_partitions = [
@@ -8335,7 +8478,7 @@ def wait_for_share_fetch_open(
             ],
         }
     ]
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_fetch(
                 port,
@@ -8388,11 +8531,11 @@ def wait_for_share_fetch_open(
 
 
 def wait_for_share_fetch_session_checkpoint(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7990
     last_error = None
     next_epoch = group_state["share_session_epoch"] + 1
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_fetch(
                 port,
@@ -8529,7 +8672,7 @@ def share_acknowledge(
 
 
 def wait_for_share_acknowledge_acquired(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8000
     last_error = None
     acquired = group_state.get("share_fetch_acquired")
@@ -8556,7 +8699,7 @@ def wait_for_share_acknowledge_acquired(port, group_state, timeout=30):
             ],
         }
     ]
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_acknowledge(
                 port,
@@ -8598,11 +8741,11 @@ def wait_for_share_acknowledge_acquired(port, group_state, timeout=30):
 
 
 def wait_for_share_acknowledge_session_checkpoint(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8010
     last_error = None
     next_epoch = group_state["share_session_epoch"] + 1
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = share_acknowledge(
                 port,
@@ -8934,10 +9077,10 @@ def assert_share_state_partition_result(results, state, response_name):
 
 
 def wait_for_share_state_initialized(port, state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8100
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             results = initialize_share_group_state(port, state, correlation_id)
             assert_share_state_partition_result(
@@ -8955,10 +9098,10 @@ def wait_for_share_state_initialized(port, state, timeout=30):
 
 
 def wait_for_share_state_written(port, state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8110
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             results = write_share_group_state(port, state, correlation_id)
             assert_share_state_partition_result(
@@ -8976,10 +9119,10 @@ def wait_for_share_state_written(port, state, timeout=30):
 
 
 def wait_for_share_state_read_checkpoint(port, state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8120
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             results = read_share_group_state(port, state, correlation_id)
             partition = assert_share_state_partition_result(
@@ -9003,10 +9146,10 @@ def wait_for_share_state_read_checkpoint(port, state, timeout=30):
 
 
 def wait_for_share_state_summary_checkpoint(port, state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8130
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             results = read_share_group_state_summary(port, state, correlation_id)
             partition = assert_share_state_partition_result(
@@ -9032,10 +9175,10 @@ def wait_for_share_state_summary_checkpoint(port, state, timeout=30):
 
 
 def wait_for_share_state_deleted(port, state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8140
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             results = delete_share_group_state(port, state, correlation_id)
             assert_share_state_partition_result(results, state, "DeleteShareGroupState")
@@ -9130,10 +9273,10 @@ def leave_group(port, group_state, correlation_id):
 
 
 def wait_for_group_stable(port, group_id, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6700
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             group_state = join_group(port, group_id, correlation_id)
             sync_group(port, group_state, correlation_id + 1)
@@ -9147,10 +9290,10 @@ def wait_for_group_stable(port, group_id, timeout=30):
 
 
 def wait_for_group_heartbeat(port, group_state, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6900
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             heartbeat_group(port, group_state, correlation_id)
             return
@@ -9192,11 +9335,11 @@ def delete_group(port, group, correlation_id):
 
 
 def wait_for_group_delete(port, group, topic, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 6950
     deleted = False
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             if not deleted:
                 delete_group(port, group, correlation_id)
@@ -9206,7 +9349,7 @@ def wait_for_group_delete(port, group, topic, timeout=30):
                 group,
                 topic,
                 ERROR_GROUP_ID_NOT_FOUND,
-                timeout=max(1, int(deadline - time.time())),
+                timeout=max(1, int(deadline - time.monotonic())),
             )
         except Exception as exc:
             last_error = exc
@@ -9216,14 +9359,17 @@ def wait_for_group_delete(port, group, topic, timeout=30):
 
 
 def network_hooks_configured():
-    return bool(
-        os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
-        or os.environ.get("ZMQ_KRAFT_NETWORK_DOWN")
-        or os.environ.get("ZMQ_KRAFT_NETWORK_UP")
+    return any(
+        name in os.environ
+        for name in (
+            "ZMQ_KRAFT_NETWORK_MATRIX",
+            "ZMQ_KRAFT_NETWORK_DOWN",
+            "ZMQ_KRAFT_NETWORK_UP",
+        )
     )
 
 
-def network_phase_env_name(phase, suffix):
+def network_phase_token(phase):
     normalized = []
     for ch in phase.upper():
         if ch.isalnum():
@@ -9233,25 +9379,66 @@ def network_phase_env_name(phase, suffix):
     name = "_".join(part for part in "".join(normalized).split("_") if part)
     if not name:
         raise TestError(f"invalid empty KRaft network matrix phase {phase!r}")
-    return f"ZMQ_KRAFT_NETWORK_{name}_{suffix}"
+    return name
+
+
+def network_phase_env_name(phase, suffix):
+    return f"ZMQ_KRAFT_NETWORK_{network_phase_token(phase)}_{suffix}"
+
+
+def validate_network_phase_tokens_unique(phases):
+    by_token = {}
+    for phase in phases:
+        token = network_phase_token(phase)
+        previous = by_token.get(token)
+        if previous is not None and previous != phase:
+            raise TestError(
+                f"KRaft network phase names {previous!r} and {phase!r} "
+                f"map to the same environment token {token}"
+            )
+        by_token[token] = phase
 
 
 def network_phase_command(phase, suffix):
-    return os.environ.get(network_phase_env_name(phase, suffix)) or os.environ.get(
-        f"ZMQ_KRAFT_NETWORK_{suffix}"
-    )
+    specific = network_phase_env_name(phase, suffix)
+    if specific in os.environ:
+        return os.environ[specific]
+    return os.environ.get(f"ZMQ_KRAFT_NETWORK_{suffix}")
 
 
 def network_phase_expect(phase):
-    return os.environ.get(network_phase_env_name(phase, "EXPECT")) or os.environ.get(
-        "ZMQ_KRAFT_NETWORK_EXPECT", "fail"
-    )
+    specific = network_phase_env_name(phase, "EXPECT")
+    if specific in os.environ:
+        return os.environ[specific]
+    if "ZMQ_KRAFT_NETWORK_EXPECT" in os.environ:
+        return os.environ["ZMQ_KRAFT_NETWORK_EXPECT"]
+    return "fail"
 
 
 def split_csv(raw):
-    if not raw:
+    if raw is None:
         return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    if not str(raw).strip():
+        raise TestError("comma-separated value must contain at least one entry")
+    blank_item = False
+    items = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            blank_item = True
+            continue
+        items.append(value)
+    if not items:
+        raise TestError("comma-separated value must contain at least one entry")
+    if blank_item:
+        raise TestError("comma-separated value must not contain blank entries")
+    duplicates = sorted(value for value in set(items) if items.count(value) > 1)
+    if duplicates:
+        raise TestError(
+            "comma-separated value must not contain duplicate entries: "
+            + ", ".join(duplicates)
+        )
+    return items
 
 
 def selected_network_partition_phases():
@@ -9259,12 +9446,14 @@ def selected_network_partition_phases():
         return []
 
     raw_matrix = os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
-    if raw_matrix:
+    if raw_matrix is not None:
         names = split_csv(raw_matrix)
         if not names:
             raise TestError("ZMQ_KRAFT_NETWORK_MATRIX did not contain any phases")
     else:
         names = ["controller-broker"]
+    validate_non_placeholder_values(names, "ZMQ_KRAFT_NETWORK_MATRIX")
+    validate_network_phase_tokens_unique(names)
 
     phases = []
     for name in names:
@@ -9276,6 +9465,10 @@ def selected_network_partition_phases():
                 f"phase {name!r}"
             )
         expect = network_phase_expect(name)
+        if placeholder_env_value(expect):
+            raise TestError(
+                f"KRaft network expectation for {name!r} uses placeholder value"
+            )
         if expect not in ("fail", "survive"):
             raise TestError(f"invalid KRaft network expectation for {name!r}: {expect!r}")
         phases.append({"name": name, "down": down, "up": up, "expect": expect})
@@ -9286,6 +9479,10 @@ def validate_required_network_phase_coverage():
     required_phases = split_csv(os.environ.get("ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"))
     if not required_phases:
         return
+    validate_non_placeholder_values(
+        required_phases,
+        "ZMQ_KRAFT_REQUIRED_NETWORK_PHASES",
+    )
 
     configured_phases = [phase["name"] for phase in selected_network_partition_phases()]
     missing_phases = [phase for phase in required_phases if phase not in configured_phases]
@@ -9311,15 +9508,31 @@ def hook_context_env(processes, broker, leader_id):
     return env
 
 
+def hook_command_words(label, command):
+    stripped = command or ""
+    if placeholder_env_value(stripped):
+        raise TestError(f"{label} command uses placeholder value")
+    try:
+        words = shlex.split(stripped)
+    except ValueError as exc:
+        raise TestError(f"{label} command is malformed: {exc}") from exc
+    if not words:
+        raise TestError(f"{label} command must contain at least one word")
+    return words
+
+
 def run_network_hook(label, command, env):
-    proc = subprocess.run(
-        shlex.split(command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=60,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            hook_command_words(label, command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    except OSError as exc:
+        raise TestError(f"{label} command could not start: {exc}") from exc
     if proc.returncode != 0:
         raise TestError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
 
@@ -9362,7 +9575,20 @@ def run_network_partition_phase(processes, broker, topic, expected_payloads, lea
         "expect": phase["expect"],
         "survived": survived,
         "healed": healed,
+        "healed_fetch_verified": True,
     }
+
+
+def network_partition_phase_marker(result):
+    observed = "survived" if result["survived"] else "failed"
+    healed = "true" if result["healed"] else "false"
+    healed_fetch = "true" if result["healed_fetch_verified"] else "false"
+    return (
+        f"ok: KRaft network partition phase {result['phase']} down=true "
+        f"observed={observed} healed={healed} "
+        f"healed_leader={result['leader_id']} healed_fetch={healed_fetch} "
+        f"expect={result['expect']} source=command"
+    )
 
 
 def run_network_partition_matrix(processes, broker, topic, expected_payloads, leader_id):
@@ -9384,7 +9610,14 @@ def run_network_partition_matrix(processes, broker, topic, expected_payloads, le
         )
         current_leader_id = result["leader_id"]
         results.append(result)
+        print(network_partition_phase_marker(result))
     return results
+
+
+def network_partition_summary(results):
+    if results is None:
+        return "None"
+    return "[" + ",".join(result["phase"] for result in results) + "]"
 
 
 def automq_put_kv(port, key, value, correlation_id, overwrite=True):
@@ -9942,10 +10175,7 @@ def automq_export_cluster_manifest(port, correlation_id):
         raise TestError(f"ExportClusterManifest error_code={error_code}")
     if manifest is None:
         raise TestError("ExportClusterManifest returned null manifest")
-    try:
-        return json.loads(manifest)
-    except json.JSONDecodeError as exc:
-        raise TestError(f"ExportClusterManifest returned invalid JSON: {manifest!r}") from exc
+    return parse_automq_cluster_manifest(manifest)
 
 
 def automq_update_group(port, link_id, group_id, promoted, correlation_id):
@@ -9997,10 +10227,10 @@ def automq_zone_router(port, metadata, route_epoch, correlation_id, api_version=
 
 
 def wait_for_automq_put_kv(port, key, value, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 7000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return automq_put_kv(port, key, value, correlation_id)
         except Exception as exc:
@@ -10011,11 +10241,11 @@ def wait_for_automq_put_kv(port, key, value, timeout=45):
 
 
 def wait_for_automq_kv(port, key, expected_value, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8000
     last_error = None
     last_value = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_value = automq_get_kv(port, key, correlation_id)
             if last_value == expected_value:
@@ -10031,11 +10261,11 @@ def wait_for_automq_kv(port, key, expected_value, timeout=45):
 
 
 def wait_for_automq_kv_missing(port, key, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8500
     last_error = None
     last_item = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_item = automq_get_kv_response(port, key, correlation_id)
             if last_item["error_code"] != 0:
@@ -10051,11 +10281,11 @@ def wait_for_automq_kv_missing(port, key, timeout=45):
 
 
 def wait_for_automq_delete_kv(port, key, expected_value, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 8700
     last_error = None
     last_value = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_value = automq_delete_kv(port, key, correlation_id)
             if last_value == expected_value:
@@ -10072,10 +10302,10 @@ def wait_for_automq_delete_kv(port, key, expected_value, timeout=45):
 
 
 def wait_for_automq_create_stream(port, node_id, tags=None, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 9000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return automq_create_stream(port, node_id, correlation_id, tags=tags)
         except Exception as exc:
@@ -10088,10 +10318,10 @@ def wait_for_automq_create_stream(port, node_id, tags=None, timeout=45):
 def wait_for_automq_open_stream(
     port, node_id, stream_id, stream_epoch, tags=None, timeout=45
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 9300
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return automq_open_stream(
                 port, node_id, stream_id, stream_epoch, correlation_id, tags=tags
@@ -10104,10 +10334,10 @@ def wait_for_automq_open_stream(
 
 
 def wait_for_automq_prepare_s3_object(port, node_id, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 9500
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             return automq_prepare_s3_object(port, node_id, correlation_id)
         except Exception as exc:
@@ -10127,10 +10357,10 @@ def wait_for_automq_commit_stream_object(
     stream_epoch,
     timeout=45,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 9700
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_commit_stream_object(
                 port,
@@ -10160,10 +10390,10 @@ def wait_for_automq_commit_stream_set_object(
     stream_epoch,
     timeout=45,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 9800
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_commit_stream_set_object(
                 port,
@@ -10195,11 +10425,11 @@ def wait_for_automq_stream(
     expected_tags=None,
     timeout=45,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10000
     last_error = None
     last_stream = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             stream = automq_describe_stream(port, stream_id, correlation_id)
             last_stream = stream
@@ -10226,10 +10456,10 @@ def wait_for_automq_stream(
 
 
 def wait_for_automq_stream_missing(port, stream_id, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10500
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_describe_stream(port, stream_id, correlation_id)
         except Exception as exc:
@@ -10244,10 +10474,10 @@ def wait_for_automq_stream_missing(port, stream_id, timeout=45):
 
 
 def wait_for_automq_close_stream(port, node_id, stream_id, stream_epoch, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10600
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_close_stream(port, node_id, stream_id, stream_epoch, correlation_id)
             return
@@ -10259,10 +10489,10 @@ def wait_for_automq_close_stream(port, node_id, stream_id, stream_epoch, timeout
 
 
 def wait_for_automq_delete_stream(port, node_id, stream_id, stream_epoch, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10700
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_delete_stream(port, node_id, stream_id, stream_epoch, correlation_id)
             return
@@ -10281,10 +10511,10 @@ def wait_for_automq_trim_stream(
     new_start_offset,
     timeout=45,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10800
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_trim_stream(
                 port,
@@ -10311,11 +10541,11 @@ def wait_for_automq_opening_stream(
     expected_end_offset=None,
     timeout=45,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10900
     last_error = None
     last_streams = []
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_streams = automq_get_opening_streams(port, node_id, correlation_id)
             for stream in last_streams:
@@ -10340,11 +10570,11 @@ def wait_for_automq_opening_stream(
 
 
 def wait_for_automq_opening_stream_missing(port, node_id, stream_id, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 10950
     last_error = None
     last_streams = []
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_streams = automq_get_opening_streams(port, node_id, correlation_id)
             if all(stream["stream_id"] != stream_id for stream in last_streams):
@@ -10362,10 +10592,10 @@ def wait_for_automq_opening_stream_missing(port, node_id, stream_id, timeout=45)
 def wait_for_automq_register_node(
     port, node_id, node_epoch, wal_config, tags=None, timeout=45
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 11000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_register_node(port, node_id, node_epoch, wal_config, correlation_id, tags=tags)
             return
@@ -10379,11 +10609,11 @@ def wait_for_automq_register_node(
 def wait_for_automq_node(
     port, node_id, expected_epoch, expected_wal_config, expected_tags=None, timeout=45
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 12000
     last_error = None
     last_node = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_node = automq_get_node(port, node_id, correlation_id)
             if (
@@ -10403,10 +10633,10 @@ def wait_for_automq_node(
 
 
 def wait_for_automq_update_license(port, license_value, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 13000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_update_license(port, license_value, correlation_id)
             return
@@ -10418,11 +10648,11 @@ def wait_for_automq_update_license(port, license_value, timeout=45):
 
 
 def wait_for_automq_license(port, expected_license, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 14000
     last_error = None
     last_license = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_license = automq_describe_license(port, correlation_id)
             if last_license == expected_license:
@@ -10438,11 +10668,11 @@ def wait_for_automq_license(port, expected_license, timeout=45):
 
 
 def wait_for_automq_next_node_id(port, cluster_id, expected_node_id=None, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 15000
     last_error = None
     last_node_id = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_node_id = automq_get_next_node_id(port, cluster_id, correlation_id)
             if expected_node_id is None or last_node_id == expected_node_id:
@@ -10461,11 +10691,11 @@ def wait_for_automq_next_node_id(port, cluster_id, expected_node_id=None, timeou
 
 
 def wait_for_automq_partition_snapshot(port, session_id, session_epoch, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 15500
     last_error = None
     last_snapshot = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_snapshot = automq_get_partition_snapshot(
                 port,
@@ -10489,11 +10719,11 @@ def wait_for_automq_partition_snapshot(port, session_id, session_epoch, timeout=
 
 
 def wait_for_automq_manifest_streams(port, minimum_streams, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 15800
     last_error = None
     last_manifest = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_manifest = automq_export_cluster_manifest(port, correlation_id)
             if last_manifest.get("streams", -1) >= minimum_streams:
@@ -10512,11 +10742,11 @@ def wait_for_automq_manifest_streams(port, minimum_streams, timeout=45):
 
 
 def wait_for_automq_manifest_groups(port, expected_groups, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 15900
     last_error = None
     last_manifest = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_manifest = automq_export_cluster_manifest(port, correlation_id)
             if last_manifest.get("groups") == expected_groups:
@@ -10535,10 +10765,10 @@ def wait_for_automq_manifest_groups(port, expected_groups, timeout=45):
 
 
 def wait_for_automq_update_group(port, link_id, group_id, promoted, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 15950
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             automq_update_group(port, link_id, group_id, promoted, correlation_id)
             return
@@ -10550,11 +10780,11 @@ def wait_for_automq_update_group(port, link_id, group_id, promoted, timeout=45):
 
 
 def wait_for_automq_zone_router_update(port, metadata, route_epoch, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 16000
     last_error = None
     last_data = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_data = automq_zone_router(port, metadata, route_epoch, correlation_id)
             if last_data == metadata:
@@ -10571,11 +10801,11 @@ def wait_for_automq_zone_router_update(port, metadata, route_epoch, timeout=45):
 
 
 def wait_for_automq_zone_router(port, expected_metadata, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 17000
     last_error = None
     last_data = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_data = automq_zone_router(port, None, 0, correlation_id)
             if last_data == expected_metadata:
@@ -10763,10 +10993,10 @@ def wait_for_describe_quorum_v2_checkpoint(
     timeout=30,
 ):
     expected_node_ids = sorted(expected_ports)
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9140)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             quorum = describe_quorum_v2(port, correlation_id)
             if quorum["partition_error_code"] != ERROR_NONE:
@@ -10821,10 +11051,10 @@ def wait_for_all_describe_quorum_v2_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9840)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -11025,13 +11255,13 @@ def wait_for_fetch_snapshot_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9240)
     snapshot_end_offset = 987654321
     snapshot_epoch = 77
     snapshot_position = 12
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             response = fetch_snapshot_v1(
                 port,
@@ -11066,13 +11296,13 @@ def wait_for_all_fetch_snapshot_checkpoint(
     label,
     timeout=30,
 ):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = state.get("correlation_id", 9980)
     snapshot_end_offset = 987654321
     snapshot_epoch = 77
     snapshot_position = 12
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             checked = {}
             for node_id, info in sorted(processes.items()):
@@ -11122,9 +11352,9 @@ def tail(path, limit=12000):
 
 
 def wait_for_ready(proc, port, log_path):
-    deadline = time.time() + 30
+    deadline = time.monotonic() + 30
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise TestError(f"controller on {port} exited early with code {proc.returncode}\n{tail(log_path)}")
         try:
@@ -11137,9 +11367,9 @@ def wait_for_ready(proc, port, log_path):
 
 
 def wait_for_broker_ready(proc, port, log_path):
-    deadline = time.time() + 30
+    deadline = time.monotonic() + 30
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise TestError(f"broker on {port} exited early with code {proc.returncode}\n{tail(log_path)}")
         try:
@@ -11152,10 +11382,10 @@ def wait_for_broker_ready(proc, port, log_path):
 
 
 def wait_for_leader(processes, forbidden_leaders=frozenset(), timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation = 1000
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         for node_id, info in processes.items():
             proc = info["proc"]
             if proc.poll() is not None:
@@ -11173,10 +11403,10 @@ def wait_for_leader(processes, forbidden_leaders=frozenset(), timeout=45):
 
 
 def wait_for_all_alive_to_report(processes, expected_leader, timeout=20):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation = 2000
     last_seen = {}
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         ok = True
         for node_id, info in processes.items():
             if info["proc"].poll() is not None:
@@ -11815,11 +12045,12 @@ def run_automq_metadata_failover_scenario(tmp):
 
 
 def main():
-    if not RUN_ENABLED:
+    if not run_gate_enabled("ZMQ_RUN_KRAFT_FAILOVER_TESTS"):
         print("skip: set ZMQ_RUN_KRAFT_FAILOVER_TESTS=1 to run KRaft failover harness")
         return 0
     if not os.path.exists(ZMQ_BIN):
         raise TestError(f"broker binary not found: {ZMQ_BIN}")
+    validate_port_config()
     validate_required_network_phase_coverage()
 
     tmp = tempfile.mkdtemp(prefix="zmq-kraft-failover-")
@@ -13914,6 +14145,8 @@ def main():
             f"reassignment_topic={automq_result['reassignment_topic']}, "
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
+            "reassignment_old_owner_rejected=true, "
+            "reassignment_target_fetch_verified=true, "
             f"allocate_producer_ids_checked=true, "
             f"allocate_producer_ids_follower_rejection_checked=true, "
             f"describe_quorum_v2_checked=true, "
@@ -13923,6 +14156,7 @@ def main():
             f"all_controller_api_versions_checked=true, "
             f"controller_unsupported_checked=true, "
             f"all_controller_unsupported_checked=true, "
+            f"controller_unsupported_cases={controller_unsupported_summary(controller_unsupported_cases())}, "
             f"dynamic_raft_voter_negative_checked=true, "
             f"dynamic_raft_voter_follower_rejection_checked=true, "
             f"all_controller_describe_quorum_v2_checked=true, "
@@ -13932,6 +14166,7 @@ def main():
             f"controller_registration_follower_rejection_checked=true, "
             f"broker_registration_follower_rejection_checked=true, "
             f"broker_non_broker_api_rejection_checked=true, "
+            f"broker_non_broker_api_rejection_cases={broker_non_broker_api_rejection_summary()}, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -13980,8 +14215,10 @@ def main():
             f"kip848_static_rejoin_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
-            f"network_partition={network_partition_result}, "
-            f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
+            f"network_partition={network_partition_summary(network_partition_result)}, "
+            "automq_old_leader_fresh_rejoin="
+            f"{'true' if automq_result['old_leader_fresh_rejoin'] else 'false'}) "
+            "source=command"
         )
         return 0
     finally:
@@ -13993,12 +14230,95 @@ def main():
 
 
 def self_test():
+    global PORT_BASE, BROKER_PORT
+
     class DummyProc:
         def __init__(self, pid):
             self.pid = pid
 
     old_env = os.environ.copy()
+    old_ports = (PORT_BASE, BROKER_PORT)
     try:
+        os.environ["ZMQ_RUN_KRAFT_FAILOVER_TESTS"] = "placeholder"
+        try:
+            run_gate_enabled("ZMQ_RUN_KRAFT_FAILOVER_TESTS")
+            raise TestError("placeholder KRaft run gate was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_KRAFT_FAILOVER_TESTS"] = "   "
+        try:
+            run_gate_enabled("ZMQ_RUN_KRAFT_FAILOVER_TESTS")
+            raise TestError("blank KRaft run gate was accepted")
+        except TestError as exc:
+            if "blank" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_KRAFT_FAILOVER_TESTS"] = "maybe"
+        try:
+            run_gate_enabled("ZMQ_RUN_KRAFT_FAILOVER_TESTS")
+            raise TestError("invalid KRaft run gate was accepted")
+        except TestError as exc:
+            if "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_KRAFT_FAILOVER_TESTS"] = "on"
+        if not run_gate_enabled("ZMQ_RUN_KRAFT_FAILOVER_TESTS"):
+            raise TestError("truthy KRaft run gate was not accepted")
+        os.environ.pop("ZMQ_RUN_KRAFT_FAILOVER_TESTS", None)
+
+        os.environ["ZMQ_KRAFT_CONTROLLER_PORT_BASE"] = "placeholder"
+        try:
+            validate_port_config()
+            raise TestError("placeholder KRaft controller port base was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_CONTROLLER_PORT_BASE"] = "<port>"
+        try:
+            validate_port_config()
+            raise TestError("angle-bracket placeholder KRaft controller port base was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_CONTROLLER_PORT_BASE"] = "not-a-port"
+        try:
+            validate_port_config()
+            raise TestError("malformed KRaft controller port base was accepted")
+        except TestError as exc:
+            if "integer" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_CONTROLLER_PORT_BASE"] = "0"
+        try:
+            validate_port_config()
+            raise TestError("non-positive KRaft controller port base was accepted")
+        except TestError as exc:
+            if "positive TCP port" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_CONTROLLER_PORT_BASE"] = "40000"
+        os.environ["ZMQ_KRAFT_BROKER_PORT"] = "40100"
+        validate_port_config()
+        if PORT_BASE != 40000 or BROKER_PORT != 40100:
+            raise TestError("configured KRaft ports did not parse")
+        os.environ.pop("ZMQ_KRAFT_CONTROLLER_PORT_BASE", None)
+        os.environ.pop("ZMQ_KRAFT_BROKER_PORT", None)
+        PORT_BASE, BROKER_PORT = old_ports
+
+        try:
+            parse_automq_cluster_manifest('{"streams": NaN}')
+            raise TestError("non-standard JSON ExportClusterManifest was accepted")
+        except TestError as exc:
+            message = str(exc)
+            if "strict JSON" not in message or "non-standard JSON constant" not in message:
+                raise
+        try:
+            parse_automq_cluster_manifest('{"streams": 1, "streams": 2}')
+            raise TestError("duplicate-key ExportClusterManifest was accepted")
+        except TestError as exc:
+            message = str(exc)
+            if "strict JSON" not in message or "duplicate JSON object key" not in message:
+                raise
+        if parse_automq_cluster_manifest('{"streams": 1}').get("streams") != 1:
+            raise TestError("strict ExportClusterManifest JSON parsing failed")
+
         if wyhash_hash(2, b"abc") != 0x32DD92E4B2915153:
             raise TestError("wyhash test vector failed")
         directory_id = derive_replica_directory_id("/tmp/zmq-self-test-dir")
@@ -14012,6 +14332,15 @@ def self_test():
         if network_hooks_configured():
             raise TestError("network hooks unexpectedly configured")
 
+        os.environ["ZMQ_KRAFT_NETWORK_DOWN"] = ""
+        try:
+            selected_network_partition_phases()
+            raise TestError("blank global KRaft network hook was accepted")
+        except TestError as exc:
+            if "DOWN and UP hooks" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_KRAFT_NETWORK_DOWN", None)
+
         os.environ["ZMQ_KRAFT_NETWORK_DOWN"] = "true"
         os.environ["ZMQ_KRAFT_NETWORK_UP"] = "true"
         if not network_hooks_configured():
@@ -14020,6 +14349,30 @@ def self_test():
         if len(phases) != 1 or phases[0]["name"] != "controller-broker":
             raise TestError(f"default network phase selection failed: {phases}")
 
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "   "
+        try:
+            selected_network_partition_phases()
+            raise TestError("blank KRaft network phase list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "leader-isolation,,broker-link"
+        try:
+            selected_network_partition_phases()
+            raise TestError("embedded blank KRaft network phase list was accepted")
+        except TestError as exc:
+            if "blank entries" not in str(exc):
+                raise
+
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "leader-isolation,broker-link,leader-isolation"
+        try:
+            selected_network_partition_phases()
+            raise TestError("duplicate KRaft network phase was accepted")
+        except TestError as exc:
+            if "duplicate entries" not in str(exc):
+                raise
+
         os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "leader-isolation, broker-link"
         os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_EXPECT"] = "survive"
         os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_DOWN"] = "true"
@@ -14027,10 +14380,106 @@ def self_test():
         phases = selected_network_partition_phases()
         if [phase["name"] for phase in phases] != ["leader-isolation", "broker-link"]:
             raise TestError(f"network matrix phase parsing failed: {phases}")
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_DOWN"] = ""
+        try:
+            selected_network_partition_phases()
+            raise TestError("blank phase-specific KRaft network hook was accepted")
+        except TestError as exc:
+            if "DOWN and UP hooks" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_DOWN"] = "true"
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "leader-isolation,leader_isolation"
+        try:
+            selected_network_partition_phases()
+            raise TestError("colliding KRaft network phase names were accepted")
+        except TestError as exc:
+            if "same environment token" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "placeholder"
+        try:
+            selected_network_partition_phases()
+            raise TestError("placeholder KRaft network phase was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "leader-isolation, broker-link"
+        phases = selected_network_partition_phases()
         if phases[0]["expect"] != "fail" or phases[1]["expect"] != "survive":
             raise TestError(f"network matrix expectation parsing failed: {phases}")
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_EXPECT"] = "todo"
+        try:
+            selected_network_partition_phases()
+            raise TestError("placeholder KRaft network expectation was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_EXPECT"] = "survive"
+        phase_summary = network_partition_summary(
+            [{"phase": "leader-isolation"}, {"phase": "broker-link"}]
+        )
+        if phase_summary != "[leader-isolation,broker-link]":
+            raise TestError(f"network partition summary formatting failed: {phase_summary}")
+        if network_partition_summary(None) != "None":
+            raise TestError("empty network partition summary formatting failed")
+        failed_marker = network_partition_phase_marker({
+            "phase": "leader-isolation",
+            "leader_id": 1,
+            "expect": "fail",
+            "survived": False,
+            "healed": True,
+            "healed_fetch_verified": True,
+        })
+        if failed_marker != (
+            "ok: KRaft network partition phase leader-isolation down=true "
+            "observed=failed healed=true healed_leader=1 "
+            "healed_fetch=true expect=fail source=command"
+        ):
+            raise TestError(f"network partition fail marker formatting failed: {failed_marker}")
+        survived_marker = network_partition_phase_marker({
+            "phase": "broker-link",
+            "leader_id": 2,
+            "expect": "survive",
+            "survived": True,
+            "healed": True,
+            "healed_fetch_verified": True,
+        })
+        if survived_marker != (
+            "ok: KRaft network partition phase broker-link down=true "
+            "observed=survived healed=true healed_leader=2 "
+            "healed_fetch=true expect=survive source=command"
+        ):
+            raise TestError(f"network partition survive marker formatting failed: {survived_marker}")
         os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "leader-isolation,broker-link"
         validate_required_network_phase_coverage()
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = ",,,"
+        try:
+            validate_required_network_phase_coverage()
+            raise TestError("empty required KRaft network phase list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "   "
+        try:
+            validate_required_network_phase_coverage()
+            raise TestError("blank required KRaft network phase list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "leader-isolation,,broker-link"
+        try:
+            validate_required_network_phase_coverage()
+            raise TestError("embedded blank required KRaft network phase list was accepted")
+        except TestError as exc:
+            if "blank entries" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "required"
+        try:
+            validate_required_network_phase_coverage()
+            raise TestError("placeholder required KRaft network phase was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "leader-isolation,broker-link"
         os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "missing-phase"
         try:
             validate_required_network_phase_coverage()
@@ -14057,6 +14506,34 @@ def self_test():
         env["ZMQ_KRAFT_NETWORK_EXPECT"] = "fail"
         run_network_hook("self-test:down", phases[0]["down"], env)
         run_network_hook("self-test:up", phases[0]["up"], env)
+        try:
+            hook_command_words("self-test:blank", "   ")
+            raise TestError("blank KRaft network hook command was accepted")
+        except TestError as exc:
+            if "at least one word" not in str(exc):
+                raise
+        try:
+            hook_command_words("self-test:malformed", "'unterminated")
+            raise TestError("malformed KRaft network hook command was accepted")
+        except TestError as exc:
+            if "malformed" not in str(exc):
+                raise
+        try:
+            hook_command_words("self-test:placeholder", "/path/to/kraft-hook")
+            raise TestError("placeholder KRaft network hook command was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        try:
+            run_network_hook(
+                "self-test:missing",
+                "__zmq_missing_hook_command__",
+                env,
+            )
+            raise TestError("unstartable KRaft network hook command was accepted")
+        except TestError as exc:
+            if "could not start" not in str(exc):
+                raise
 
         commit_fixture = struct.pack(">ii", 42, 0)
         commit_fixture += struct.pack(">i", 1)
@@ -14588,6 +15065,74 @@ def self_test():
             0,
             "self-test",
         )
+        unsupported_case_set = set(controller_unsupported_cases())
+        for expected in (
+            (4, 0),
+            (4, 7),
+            (5, 0),
+            (5, 4),
+            (6, 0),
+            (6, 8),
+            (7, 0),
+            (7, 3),
+            (71, 0),
+            (72, 0),
+        ):
+            if expected not in unsupported_case_set:
+                raise TestError(
+                    f"controller unsupported cases missing {expected}"
+                )
+        unsupported_case_summary = controller_unsupported_summary(
+            sorted(unsupported_case_set)
+        )
+        for expected in (
+            "4:0",
+            "4:7",
+            "5:0",
+            "5:4",
+            "6:0",
+            "6:8",
+            "7:0",
+            "7:3",
+            "71:0",
+            "72:0",
+        ):
+            if expected not in unsupported_case_summary:
+                raise TestError(
+                    f"controller unsupported cases missing {expected}"
+                )
+        broker_rejection_case_set = set(broker_non_broker_api_rejection_cases())
+        for expected in (
+            (56, 3),
+            (58, 0),
+            (59, 1),
+            (62, 4),
+            (63, 1),
+            (64, 0),
+            (67, 0),
+            (70, 0),
+            (80, 0),
+            (81, 0),
+            (82, 0),
+        ):
+            if expected not in broker_rejection_case_set:
+                raise TestError(f"broker non-broker cases missing {expected}")
+        broker_rejection_summary = api_case_summary(sorted(broker_rejection_case_set))
+        for expected in (
+            "56:3",
+            "58:0",
+            "59:1",
+            "62:4",
+            "63:1",
+            "64:0",
+            "67:0",
+            "70:0",
+            "80:0",
+            "81:0",
+            "82:0",
+        ):
+            if expected not in broker_rejection_summary:
+                raise TestError(f"broker non-broker cases missing {expected}")
 
         add_voter_fixture = struct.pack(">i", 188)
         add_voter_fixture += b"\x00"  # response header tagged fields
@@ -15700,6 +16245,7 @@ def self_test():
         print("ok: KRaft failover harness self-test")
         return 0
     finally:
+        PORT_BASE, BROKER_PORT = old_ports
         os.environ.clear()
         os.environ.update(old_env)
 

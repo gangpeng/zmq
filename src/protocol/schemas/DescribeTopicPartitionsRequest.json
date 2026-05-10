@@ -25,7 +25,7 @@
       "about": "The topics to fetch details for.",
       "fields": [
         { "name": "Name", "type": "string", "versions": "0+",
-          "about": "The topic name", "versions": "0+", "entityType": "topicName"}
+          "about": "The topic name", "entityType": "topicName"}
       ]
     },
     { "name": "ResponsePartitionLimit", "type": "int32", "versions": "0+", "default": "2000",
@@ -33,7 +33,7 @@
     { "name": "Cursor", "type": "Cursor", "versions": "0+", "nullableVersions": "0+", "default": "null",
       "about": "The first topic and partition index to fetch details for.", "fields": [
       { "name": "TopicName", "type": "string", "versions": "0+",
-        "about": "The name for the first topic to process", "versions": "0+", "entityType": "topicName"},
+        "about": "The name for the first topic to process", "entityType": "topicName"},
       { "name": "PartitionIndex", "type": "int32", "versions": "0+", "about": "The partition index to start with"}
     ]}
   ]

@@ -367,10 +367,11 @@ pub const Server = struct {
                 for (to_close[0..to_close_len]) |idle_fd| {
                     closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, idle_fd);
                 }
+                recordExpiredConnectionsKilled(self.metrics, to_close_len);
             }
 
-            // Update active connections gauge after each io_uring iteration
-            updateActiveConnectionMetrics(self.metrics, connections.count());
+            // Update network server gauges after each io_uring iteration.
+            updateNetworkServerMetrics(self.metrics, &connections);
         }
 
         @import("posix_compat").close(sock);
@@ -688,17 +689,20 @@ pub const Server = struct {
                         to_close_len += 1;
                     }
                 }
+                var closed_expired: usize = 0;
                 for (to_close[0..to_close_len]) |idle_fd| {
                     @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, idle_fd, null) catch {};
                     if (connections.fetchRemove(idle_fd)) |entry| {
                         var conn = entry.value;
                         conn.deinit();
+                        closed_expired += 1;
                     }
                 }
+                recordExpiredConnectionsKilled(self.metrics, closed_expired);
             }
 
-            // Update active connections gauge after each epoll iteration
-            updateActiveConnectionMetrics(self.metrics, connections.count());
+            // Update network server gauges after each epoll iteration.
+            updateNetworkServerMetrics(self.metrics, &connections);
 
             // Check if drain phase is complete (all connections done or timeout elapsed).
             // During drain, connections with empty send buffers (no in-flight response)
@@ -755,7 +759,13 @@ pub const Server = struct {
                             // Post-handshake validation: certificate chain, expiry, principal extraction.
                             // Validates the peer certificate and extracts the mTLS principal
                             // for ACL checks. Rejects expired or untrusted certificates.
-                            const principal = tls_mod.validatePeerCertificatePostHandshake(ossl, ssl, fd, self.allocator) catch |err| {
+                            const principal = tls_mod.validatePeerCertificatePostHandshake(
+                                ossl,
+                                ssl,
+                                fd,
+                                self.allocator,
+                                tls_ctx.config.principal_mapping_rules,
+                            ) catch |err| {
                                 log.warn("TLS post-handshake validation failed on fd={d}: {s}", .{ fd, @errorName(err) });
                                 return error.TlsHandshakeFailed;
                             };
@@ -899,6 +909,28 @@ fn updateActiveConnectionMetrics(metrics: ?*MetricRegistry, active_count: usize)
     registry.setGauge("kafka_server_active_connections", active_connections);
     registry.setGauge("kafka_network_connections_active", active_connections);
     registry.setGauge("Kafka_server_connection_count", active_connections);
+    registry.setGauge("kafka_network_socketserver_connectioncount", active_connections);
+}
+
+fn updateNetworkServerMetrics(metrics: ?*MetricRegistry, connections: *std.AutoHashMap(posix.socket_t, Server.Connection)) void {
+    const registry = metrics orelse return;
+    updateActiveConnectionMetrics(registry, connections.count());
+
+    var queued_responses: usize = 0;
+    var it = connections.iterator();
+    while (it.next()) |entry| {
+        const conn = entry.value_ptr;
+        if (conn.send_pending or conn.send_buf.items.len > 0) {
+            queued_responses += 1;
+        }
+    }
+    registry.setGauge("kafka_network_requestchannel_responsequeuesize", @floatFromInt(queued_responses));
+}
+
+fn recordExpiredConnectionsKilled(metrics: ?*MetricRegistry, count: usize) void {
+    if (count == 0) return;
+    const registry = metrics orelse return;
+    registry.addCounter("kafka_network_socketserver_expiredconnectionskilledcount_total", @intCast(count));
 }
 
 // ---------------------------------------------------------------
@@ -921,13 +953,66 @@ test "Server updates active connection metric aliases" {
     try registry.registerGauge("kafka_server_active_connections", "Active Kafka server connections");
     try registry.registerGauge("kafka_network_connections_active", "Active network connections");
     try registry.registerGauge("Kafka_server_connection_count", "AutoMQ-compatible active connection count");
+    try registry.registerGauge("kafka_network_socketserver_connectioncount", "JMX-compatible active socket-server connections");
 
     updateActiveConnectionMetrics(&registry, 3);
     try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("kafka_server_active_connections").?.value);
     try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("kafka_network_connections_active").?.value);
     try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("Kafka_server_connection_count").?.value);
+    try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("kafka_network_socketserver_connectioncount").?.value);
 
     updateActiveConnectionMetrics(null, 7);
+}
+
+test "Server records expired connection kills" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.registerCounter("kafka_network_socketserver_expiredconnectionskilledcount_total", "Expired connection kills");
+
+    recordExpiredConnectionsKilled(&registry, 0);
+    try testing.expectEqual(@as(u64, 0), registry.counters.get("kafka_network_socketserver_expiredconnectionskilledcount_total").?.value);
+
+    recordExpiredConnectionsKilled(&registry, 2);
+    try testing.expectEqual(@as(u64, 2), registry.counters.get("kafka_network_socketserver_expiredconnectionskilledcount_total").?.value);
+
+    recordExpiredConnectionsKilled(null, 3);
+}
+
+test "Server updates response queue gauge from pending sends" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.registerGauge("kafka_server_active_connections", "Active Kafka server connections");
+    try registry.registerGauge("kafka_network_connections_active", "Active network connections");
+    try registry.registerGauge("Kafka_server_connection_count", "AutoMQ-compatible active connection count");
+    try registry.registerGauge("kafka_network_socketserver_connectioncount", "JMX-compatible active socket-server connections");
+    try registry.registerGauge("kafka_network_requestchannel_responsequeuesize", "JMX-compatible response queue depth");
+
+    var connections = std.AutoHashMap(posix.socket_t, Server.Connection).init(testing.allocator);
+    defer {
+        var it = connections.valueIterator();
+        while (it.next()) |conn| conn.deinit();
+        connections.deinit();
+    }
+
+    var idle = Server.Connection.init(testing.allocator, 11);
+    idle.closed = true;
+    try connections.put(11, idle);
+
+    var buffered = Server.Connection.init(testing.allocator, 12);
+    buffered.closed = true;
+    try buffered.send_buf.appendSlice("response");
+    try connections.put(12, buffered);
+
+    var pending = Server.Connection.init(testing.allocator, 13);
+    pending.closed = true;
+    pending.send_pending = true;
+    try connections.put(13, pending);
+
+    updateNetworkServerMetrics(&registry, &connections);
+    try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("kafka_network_socketserver_connectioncount").?.value);
+    try testing.expectEqual(@as(f64, 2.0), registry.gauges.get("kafka_network_requestchannel_responsequeuesize").?.value);
+
+    updateNetworkServerMetrics(null, &connections);
 }
 
 test "Server init creates valid server" {

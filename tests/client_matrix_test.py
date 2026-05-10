@@ -59,7 +59,8 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_VERSION     Human-readable exact client/library version label
 
 Per-profile overrides:
-    For profile "apache_3_7", set ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS,
+    For profile "apache_3_7", set ZMQ_CLIENT_MATRIX_APACHE_3_7_BOOTSTRAP,
+    ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS,
     ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH,
     ZMQ_CLIENT_MATRIX_APACHE_3_7_VERSION, etc. A profile inherits the
     corresponding global setting when its override is not present.
@@ -96,7 +97,6 @@ import textwrap
 import time
 
 
-RUN_ENABLED = os.environ.get("ZMQ_RUN_CLIENT_MATRIX") == "1"
 BOOTSTRAP = os.environ.get("ZMQ_CLIENT_MATRIX_BOOTSTRAP", "localhost:9092")
 TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
 SEMANTIC_ORDER = [
@@ -112,8 +112,17 @@ REBALANCE_TOOLS = {"kafka-python", "confluent-kafka", "java-kafka"}
 TRANSACTION_TOOLS = {"confluent-kafka", "java-kafka"}
 SECURITY_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka"}
 SUPPORTED_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka", "go-kafka"}
+CLIENT_SECURITY_PROTOCOLS = {"PLAINTEXT", "SASL_PLAINTEXT", "SSL", "SASL_SSL"}
+CLIENT_SASL_MECHANISMS = {"PLAIN", "SCRAM-SHA-256", "OAUTHBEARER"}
+TLS_PROTOCOLS = {"SSL", "SASL_SSL"}
+SASL_PROTOCOLS = {"SASL_PLAINTEXT", "SASL_SSL"}
+PYTHON_CLIENT_TOOLS = {"kafka-python", "confluent-kafka"}
+PLACEHOLDER_SETTING_VALUES = {"...", "placeholder", "required", "tbd", "todo"}
+BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
+BOOL_FALSE_VALUES = {"0", "false", "no", "off"}
+DEFAULT_CLIENT_PROFILE = "default"
 JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
-ENABLE_GO_AUTO = os.environ.get("ZMQ_CLIENT_MATRIX_ENABLE_GO") == "1"
+ENABLE_GO_AUTO = False
 GO_MODULE = os.environ.get("ZMQ_CLIENT_MATRIX_GO_MODULE", "github.com/segmentio/kafka-go@latest")
 PYTHON = os.environ.get("ZMQ_CLIENT_MATRIX_PYTHON", sys.executable)
 ACTIVE_PROFILE = "default"
@@ -150,16 +159,34 @@ def parse_semantics(raw):
     if raw in ("", "default", "basic"):
         return {"basic"}
     selected = set()
+    tokens = []
+    blank_semantic = False
     for item in raw.split(","):
         name = item.strip().lower()
         if not name:
+            blank_semantic = True
             continue
+        tokens.append(name)
         if name == "all":
             selected.update(SEMANTIC_ORDER)
             continue
         if name not in SEMANTIC_ORDER:
             raise MatrixError(f"unknown client matrix semantic probe: {name}")
         selected.add(name)
+    if not selected:
+        raise MatrixError(
+            "client matrix semantics must contain at least one comma-separated value"
+        )
+    if blank_semantic:
+        raise MatrixError(
+            "client matrix semantics must not contain blank comma-separated values"
+        )
+    duplicates = sorted(token for token in set(tokens) if tokens.count(token) > 1)
+    if duplicates:
+        raise MatrixError(
+            "client matrix semantics must not contain duplicate "
+            "comma-separated values: " + ", ".join(duplicates)
+        )
     selected.add("basic")
     return selected
 
@@ -192,6 +219,19 @@ def oauth_token_expiry():
         raise MatrixError(f"invalid ZMQ_CLIENT_MATRIX_OAUTH_TOKEN_EXPIRY: {raw!r}")
 
 
+def reject_nonstandard_json_constant(value):
+    raise ValueError(f"non-standard JSON constant {value!r} is not allowed in strict JSON")
+
+
+def reject_duplicate_json_object_keys(pairs):
+    parsed = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON object key {key!r} is not allowed in strict JSON")
+        parsed[key] = value
+    return parsed
+
+
 def decode_jwt_payload(token):
     parts = token.split(".")
     if len(parts) != 3 or not parts[1]:
@@ -199,7 +239,11 @@ def decode_jwt_payload(token):
     padded_payload = parts[1] + "=" * (-len(parts[1]) % 4)
     try:
         payload_bytes = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
-        payload = json.loads(payload_bytes.decode("utf-8"))
+        payload = json.loads(
+            payload_bytes.decode("utf-8"),
+            parse_constant=reject_nonstandard_json_constant,
+            object_pairs_hook=reject_duplicate_json_object_keys,
+        )
     except Exception as exc:
         raise MatrixError(f"OAuth token fixture has an invalid JWT payload: {exc}") from exc
     if not isinstance(payload, dict):
@@ -641,6 +685,58 @@ def oauth_negative_configured_for_tool(tool):
     return False
 
 
+def bool_text(value):
+    return "true" if value else "false"
+
+
+def active_sasl_mechanism_text():
+    return (SASL_MECHANISM or "none").upper()
+
+
+def client_security_detail_line(tool):
+    if not security_enabled():
+        return None
+    security_negative = (
+        semantic_enabled("security-negative")
+        and security_negative_configured_for_tool(tool)
+    )
+    oauth_negative = (
+        semantic_enabled("security-negative")
+        and oauth_negative_configured_for_tool(tool)
+    )
+    sasl_negative = semantic_enabled("security-negative") and sasl_negative_enabled()
+    tls_negative = semantic_enabled("security-negative") and tls_negative_enabled()
+    acl_negative = semantic_enabled("security-negative") and acl_negative_enabled()
+    return (
+        f"ok: client security detail profile {ACTIVE_PROFILE} "
+        f"tool={tool} protocol={SECURITY_PROTOCOL.upper()} "
+        f"mechanism={active_sasl_mechanism_text()} "
+        f"oauth={bool_text(oauth_enabled())} positive=true "
+        f"security_negative={bool_text(security_negative)} "
+        f"oauth_negative={bool_text(oauth_negative)} "
+        f"sasl_negative={bool_text(sasl_negative)} "
+        f"tls_negative={bool_text(tls_negative)} "
+        f"acl_negative={bool_text(acl_negative)} "
+        "source=command"
+    )
+
+
+def emit_client_security_detail(tool):
+    line = client_security_detail_line(tool)
+    if line is not None:
+        print(line)
+
+
+def client_profile_pass_marker(tools):
+    version = profile_version(ACTIVE_PROFILE)
+    version_suffix = f" version={version}" if version else ""
+    return (
+        f"ok: client matrix profile {ACTIVE_PROFILE} passed for "
+        f"{', '.join(tools)} against {BOOTSTRAP}{version_suffix} "
+        "source=command"
+    )
+
+
 def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
     proc = subprocess.run(
         cmd,
@@ -705,26 +801,267 @@ def python_is_current():
         return PYTHON == sys.executable
 
 
+def profile_env_token(profile):
+    return "".join(ch.upper() if ch.isalnum() else "_" for ch in profile)
+
+
 def profile_env_name(profile, suffix):
-    sanitized = "".join(ch.upper() if ch.isalnum() else "_" for ch in profile)
-    return f"ZMQ_CLIENT_MATRIX_{sanitized}_{suffix}"
+    return f"ZMQ_CLIENT_MATRIX_{profile_env_token(profile)}_{suffix}"
+
+
+def list_value_uses_placeholder(value):
+    stripped = str(value or "").strip()
+    lowered = stripped.lower()
+    angle_start = stripped.find("<")
+    has_angle_placeholder = (
+        angle_start >= 0
+        and stripped.find(">", angle_start + 1) > angle_start + 1
+    )
+    return (
+        lowered in PLACEHOLDER_SETTING_VALUES
+        or lowered.startswith("/path/to/")
+        or has_angle_placeholder
+    )
+
+
+def reject_placeholder_list_values(env_name, values):
+    placeholders = [value for value in values if list_value_uses_placeholder(value)]
+    if placeholders:
+        raise MatrixError(
+            f"{env_name} must not use placeholder values: "
+            + ", ".join(placeholders)
+        )
+
+
+def profile_setting_env_names(profile, suffix):
+    if profile == "default":
+        return (f"ZMQ_CLIENT_MATRIX_{suffix}",)
+    return (
+        profile_env_name(profile, suffix),
+        f"ZMQ_CLIENT_MATRIX_{suffix}",
+    )
+
+
+def validate_profile_tokens_unique(profiles):
+    by_token = {}
+    for profile in profiles:
+        token = profile_env_token(profile)
+        previous = by_token.get(token)
+        if previous is not None and previous != profile:
+            raise MatrixError(
+                f"client matrix profile names {previous!r} and {profile!r} "
+                f"map to the same environment token {token}"
+            )
+        by_token[token] = profile
+
+
+def parse_configured_names(env_name, raw):
+    blank_name = False
+    names = []
+    for item in raw.split(","):
+        name = item.strip()
+        if not name:
+            blank_name = True
+            continue
+        names.append(name)
+    if not names:
+        raise MatrixError(
+            f"{env_name} must contain at least one comma-separated value"
+        )
+    if blank_name:
+        raise MatrixError(f"{env_name} must not contain blank comma-separated values")
+    reject_placeholder_list_values(env_name, names)
+    duplicates = sorted(name for name in set(names) if names.count(name) > 1)
+    if duplicates:
+        raise MatrixError(
+            f"{env_name} must not contain duplicate comma-separated values: "
+            + ", ".join(duplicates)
+        )
+    return names
 
 
 def profile_names():
-    raw = os.environ.get("ZMQ_CLIENT_MATRIX_PROFILES", "")
-    names = [name.strip() for name in raw.split(",") if name.strip()]
-    return names if names else ["default"]
+    raw = os.environ.get("ZMQ_CLIENT_MATRIX_PROFILES")
+    if raw is None:
+        return [DEFAULT_CLIENT_PROFILE]
+    names = parse_configured_names("ZMQ_CLIENT_MATRIX_PROFILES", raw)
+    validate_profile_tokens_unique(names)
+    return names
 
 
 def configured_names(env_name):
-    raw = os.environ.get(env_name, "")
-    return [name.strip() for name in raw.split(",") if name.strip()]
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return []
+    return parse_configured_names(env_name, raw)
 
 
 def profile_setting(profile, suffix, fallback):
+    return profile_setting_source(profile, suffix, fallback)[1]
+
+
+def profile_setting_source(profile, suffix, fallback):
     if profile == "default":
-        return os.environ.get(f"ZMQ_CLIENT_MATRIX_{suffix}", fallback)
-    return os.environ.get(profile_env_name(profile, suffix), os.environ.get(f"ZMQ_CLIENT_MATRIX_{suffix}", fallback))
+        env_name = f"ZMQ_CLIENT_MATRIX_{suffix}"
+        if env_name in os.environ:
+            return env_name, os.environ[env_name]
+        return env_name, fallback
+    specific_name = profile_env_name(profile, suffix)
+    if specific_name in os.environ:
+        return specific_name, os.environ[specific_name]
+    global_name = f"ZMQ_CLIENT_MATRIX_{suffix}"
+    if global_name in os.environ:
+        return global_name, os.environ[global_name]
+    return global_name, fallback
+
+
+def explicit_profile_setting(profile, suffix):
+    for env_name in profile_setting_env_names(profile, suffix):
+        if env_name in os.environ:
+            return env_name, os.environ.get(env_name)
+    return None, None
+
+
+def setting_uses_placeholder(value):
+    stripped = str(value or "").strip()
+    return list_value_uses_placeholder(stripped)
+
+
+def require_non_placeholder_setting(name, value):
+    if not str(value or "").strip():
+        raise MatrixError(f"{name} must not be blank")
+    if setting_uses_placeholder(value):
+        raise MatrixError(f"{name} must not use a placeholder value")
+
+
+def validate_bootstrap_server(name, server):
+    if not server:
+        raise MatrixError(f"{name} bootstrap entries must not be blank")
+    if any(ch.isspace() for ch in server):
+        raise MatrixError(f"{name} bootstrap entries must not contain whitespace")
+
+    if server.startswith("["):
+        end = server.find("]")
+        if end <= 1 or end + 1 >= len(server) or server[end + 1] != ":":
+            raise MatrixError(f"{name} bootstrap entry {server!r} must be host:port")
+        host = server[1:end]
+        port_text = server[end + 2:]
+    else:
+        if server.count(":") != 1:
+            raise MatrixError(f"{name} bootstrap entry {server!r} must be host:port")
+        host, port_text = server.rsplit(":", 1)
+
+    if not host.strip():
+        raise MatrixError(f"{name} bootstrap entry {server!r} must include a host")
+    if "/" in host:
+        raise MatrixError(f"{name} bootstrap entry {server!r} must not include a URL scheme or path")
+    if not port_text.strip():
+        raise MatrixError(f"{name} bootstrap entry {server!r} must include a port")
+    if not port_text.isdigit():
+        raise MatrixError(f"{name} bootstrap entry {server!r} port must be numeric")
+    port = int(port_text)
+    if port <= 0 or port > 65535:
+        raise MatrixError(f"{name} bootstrap entry {server!r} port must be between 1 and 65535")
+
+
+def validate_bootstrap_servers_setting(name, value):
+    require_non_placeholder_setting(name, value)
+    servers = [server.strip() for server in str(value).split(",")]
+    if not servers or any(not server for server in servers):
+        raise MatrixError(f"{name} must contain comma-separated host:port bootstrap entries")
+    for server in servers:
+        validate_bootstrap_server(name, server)
+
+
+def strict_bool_text(name, value, default=False):
+    if value is None:
+        return default
+    stripped = str(value).strip()
+    if not stripped:
+        raise MatrixError(f"{name} must not be blank")
+    if setting_uses_placeholder(stripped):
+        raise MatrixError(f"{name} must not use a placeholder value")
+    lowered = stripped.lower()
+    if lowered in BOOL_TRUE_VALUES:
+        return True
+    if lowered in BOOL_FALSE_VALUES:
+        return False
+    raise MatrixError(f"{name} must be true or false")
+
+
+def profile_bool_setting(profile, suffix, default=False):
+    env_name, value = profile_setting_source(profile, suffix, default)
+    return strict_bool_text(env_name, value, default)
+
+
+def run_gate_enabled(name):
+    return strict_bool_text(name, os.environ.get(name), False)
+
+
+def require_explicit_profile_setting(profile, suffix, label):
+    env_name, value = explicit_profile_setting(profile, suffix)
+    if env_name is None:
+        raise MatrixError(
+            f"required client matrix profile {profile} must set {label} "
+            f"provenance with {' or '.join(profile_setting_env_names(profile, suffix))}"
+        )
+    require_non_placeholder_setting(env_name, value)
+    return env_name, value
+
+
+def parse_explicit_profile_tools(profile, raw):
+    blank_tool = False
+    tools = []
+    for item in str(raw or "").split(","):
+        tool = item.strip()
+        if not tool:
+            blank_tool = True
+            continue
+        tools.append(tool)
+    if not tools:
+        raise MatrixError(
+            f"required client matrix profile {profile} TOOLS must contain "
+            "at least one comma-separated value"
+        )
+    if blank_tool:
+        raise MatrixError(
+            f"required client matrix profile {profile} TOOLS must not contain "
+            "blank comma-separated values"
+        )
+    lowered = [tool.lower() for tool in tools]
+    if lowered == ["auto"] or "auto" in lowered:
+        raise MatrixError(
+            f"required client matrix profile {profile} must explicitly list "
+            "selected tools, not auto"
+        )
+    unknown = [tool for tool in tools if tool not in SUPPORTED_TOOLS]
+    if unknown:
+        raise MatrixError(
+            f"required client matrix profile {profile} selects unknown tools: "
+            + ", ".join(unknown)
+        )
+    duplicates = sorted(tool for tool in set(tools) if tools.count(tool) > 1)
+    if duplicates:
+        raise MatrixError(
+            f"required client matrix profile {profile} TOOLS must not contain "
+            "duplicate comma-separated values: " + ", ".join(duplicates)
+        )
+    return tools
+
+
+def parse_explicit_profile_semantics(profile, raw):
+    stripped = str(raw or "").strip()
+    if not stripped:
+        raise MatrixError(
+            f"required client matrix profile {profile} SEMANTICS must contain "
+            "at least one comma-separated value"
+        )
+    if stripped.lower() in ("auto", "default"):
+        raise MatrixError(
+            f"required client matrix profile {profile} must explicitly list "
+            "semantic probes, not auto/default"
+        )
+    return parse_semantics(stripped)
 
 
 def profile_version(profile):
@@ -761,14 +1098,167 @@ def apply_profile(profile):
     BAD_SSL_CA_LOCATION = profile_setting(profile, "BAD_SSL_CA_LOCATION", None)
     ACL_DENIED_TOPIC = profile_setting(profile, "ACL_DENIED_TOPIC", None)
     JAVA_CLASSPATH = profile_setting(profile, "JAVA_CLASSPATH", None)
-    ENABLE_GO_AUTO = profile_setting(profile, "ENABLE_GO", "0") == "1"
+    ENABLE_GO_AUTO = profile_bool_setting(profile, "ENABLE_GO", False)
     GO_MODULE = profile_setting(profile, "GO_MODULE", "github.com/segmentio/kafka-go@latest")
     PYTHON = profile_setting(profile, "PYTHON", sys.executable)
+
+
+def validate_client_security_settings():
+    global SECURITY_PROTOCOL, SASL_MECHANISM
+
+    protocol = str(SECURITY_PROTOCOL or "").strip().upper()
+    if protocol not in CLIENT_SECURITY_PROTOCOLS:
+        raise MatrixError(
+            "ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL must be one of "
+            + ", ".join(sorted(CLIENT_SECURITY_PROTOCOLS))
+        )
+    SECURITY_PROTOCOL = protocol
+
+    if SASL_MECHANISM is not None:
+        mechanism = str(SASL_MECHANISM).strip().upper()
+        if not mechanism:
+            SASL_MECHANISM = None
+        elif mechanism not in CLIENT_SASL_MECHANISMS:
+            raise MatrixError(
+                "ZMQ_CLIENT_MATRIX_SASL_MECHANISM must be one of "
+                + ", ".join(sorted(CLIENT_SASL_MECHANISMS))
+            )
+        else:
+            SASL_MECHANISM = mechanism
+
+    if protocol in SASL_PROTOCOLS:
+        if not SASL_MECHANISM:
+            raise MatrixError(
+                "ZMQ_CLIENT_MATRIX_SASL_MECHANISM must be set for "
+                "SASL_PLAINTEXT or SASL_SSL"
+            )
+        if SASL_MECHANISM != "OAUTHBEARER":
+            require_non_placeholder_setting(
+                "ZMQ_CLIENT_MATRIX_SASL_USERNAME",
+                SASL_USERNAME,
+            )
+            require_non_placeholder_setting(
+                "ZMQ_CLIENT_MATRIX_SASL_PASSWORD",
+                SASL_PASSWORD,
+            )
+
+    if protocol in TLS_PROTOCOLS:
+        require_non_placeholder_setting(
+            "ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION",
+            SSL_CA_LOCATION,
+        )
+
+
+def validate_client_profile_runtime_settings(tools):
+    validate_bootstrap_servers_setting("ZMQ_CLIENT_MATRIX_BOOTSTRAP", BOOTSTRAP)
+    validate_client_security_settings()
+
+    if "java-kafka" in tools:
+        require_non_placeholder_setting(
+            "ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH",
+            JAVA_CLASSPATH,
+        )
+    if "go-kafka" in tools:
+        require_non_placeholder_setting("ZMQ_CLIENT_MATRIX_GO_MODULE", GO_MODULE)
+        module_version = str(GO_MODULE).rsplit("@", 1)
+        if len(module_version) != 2 or module_version[1].strip().lower() == "latest":
+            raise MatrixError(
+                "go-kafka selected but ZMQ_CLIENT_MATRIX_GO_MODULE must pin "
+                "an exact Go module version"
+            )
+    if any(tool in PYTHON_CLIENT_TOOLS for tool in tools):
+        require_non_placeholder_setting("ZMQ_CLIENT_MATRIX_PYTHON", PYTHON)
+
+
+def add_unique_profile(profiles, profile):
+    if profile not in profiles:
+        profiles.append(profile)
+
+
+def required_client_profile_names():
+    profiles = []
+    for env_name in (
+        "ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES",
+        "ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES",
+        "ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES",
+        "ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES",
+        "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES",
+        "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES",
+    ):
+        for profile in configured_names(env_name):
+            add_unique_profile(profiles, profile)
+    return profiles
+
+
+def validate_required_profile_provenance(profiles):
+    profile_set = set(profiles)
+    for profile in required_client_profile_names():
+        if profile not in profile_set:
+            continue
+        bootstrap_name, bootstrap_raw = require_explicit_profile_setting(profile, "BOOTSTRAP", "bootstrap")
+        validate_bootstrap_servers_setting(bootstrap_name, bootstrap_raw)
+        _tools_name, tools_raw = require_explicit_profile_setting(
+            profile,
+            "TOOLS",
+            "selected tool",
+        )
+        parse_explicit_profile_tools(profile, tools_raw)
+        _semantics_name, semantics_raw = require_explicit_profile_setting(
+            profile,
+            "SEMANTICS",
+            "semantic suite",
+        )
+        parse_explicit_profile_semantics(profile, semantics_raw)
+
+
+def validate_required_security_profile_context(profile, label):
+    env_name, protocol = explicit_profile_setting(profile, "SECURITY_PROTOCOL")
+    if env_name is None:
+        raise MatrixError(
+            f"required {label} profiles must set SECURITY_PROTOCOL provenance: "
+            f"{profile}"
+        )
+    require_non_placeholder_setting(env_name, protocol)
+    protocol_upper = str(protocol).strip().upper()
+    if protocol_upper not in CLIENT_SECURITY_PROTOCOLS:
+        raise MatrixError(
+            f"required {label} profile {profile} has unknown SECURITY_PROTOCOL: "
+            f"{protocol}"
+        )
+    if protocol_upper == "PLAINTEXT":
+        raise MatrixError(
+            f"required {label} profile {profile} must use SASL_PLAINTEXT, "
+            "SSL, or SASL_SSL rather than PLAINTEXT"
+        )
+    if protocol_upper in SASL_PROTOCOLS:
+        mechanism_name, mechanism = explicit_profile_setting(profile, "SASL_MECHANISM")
+        if mechanism_name is None:
+            raise MatrixError(
+                f"required {label} profiles must set SASL_MECHANISM provenance: "
+                f"{profile}"
+            )
+        require_non_placeholder_setting(mechanism_name, mechanism)
+        mechanism_upper = str(mechanism).strip().upper()
+        if mechanism_upper not in CLIENT_SASL_MECHANISMS:
+            raise MatrixError(
+                f"required {label} profile {profile} has unknown SASL_MECHANISM: "
+                f"{mechanism}"
+            )
+
+
+def validate_required_profile_subset(label, profiles, required_set):
+    outside = [profile for profile in profiles if profile not in required_set]
+    if outside:
+        raise MatrixError(
+            f"{label} must also be listed in ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES: "
+            + ", ".join(outside)
+        )
 
 
 def validate_required_profiles(profiles):
     profile_set = set(profiles)
     required = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES")
+    required_set = set(required)
     missing = [profile for profile in required if profile not in profile_set]
     if missing:
         raise MatrixError(
@@ -776,12 +1266,25 @@ def validate_required_profiles(profiles):
             + ", ".join(missing)
         )
 
+    validate_required_profile_provenance(profiles)
+
     required_versioned = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES")
+    validate_required_profile_subset(
+        "required versioned client profiles",
+        required_versioned,
+        required_set,
+    )
     missing_versioned = [profile for profile in required_versioned if profile not in profile_set]
     if missing_versioned:
         raise MatrixError(
             "required versioned client profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
             + ", ".join(missing_versioned)
+        )
+    for profile in required_versioned:
+        require_explicit_profile_setting(
+            profile,
+            "VERSION",
+            "exact client/library version",
         )
     unpinned_versions = [
         profile for profile in required_versioned
@@ -831,25 +1334,32 @@ def validate_required_profiles(profiles):
             )
 
     required_security = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES")
+    validate_required_profile_subset(
+        "required secured-client profiles",
+        required_security,
+        required_set,
+    )
     missing_security = [profile for profile in required_security if profile not in profile_set]
     if missing_security:
         raise MatrixError(
             "required secured-client profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
             + ", ".join(missing_security)
         )
-    unsecured = []
+    security_semantic_missing = []
     security_tool_mismatches = []
     for profile in required_security:
         apply_profile(profile)
+        validate_required_security_profile_context(profile, "secured-client")
         tools = selected_tools()
-        if not security_enabled():
-            unsecured.append(profile)
+        if not semantic_enabled("security") and not semantic_enabled("security-negative"):
+            security_semantic_missing.append(profile)
         if not tools or any(tool not in SECURITY_TOOLS for tool in tools):
             security_tool_mismatches.append(profile)
-    if unsecured:
+    if security_semantic_missing:
         raise MatrixError(
-            "required secured-client profiles must enable security semantics or a secured protocol: "
-            + ", ".join(unsecured)
+            "required secured-client profiles must explicitly enable security "
+            "or security-negative semantics: "
+            + ", ".join(security_semantic_missing)
         )
     if security_tool_mismatches:
         raise MatrixError(
@@ -860,6 +1370,11 @@ def validate_required_profiles(profiles):
     required_negative = configured_names(
         "ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES"
     )
+    validate_required_profile_subset(
+        "required negative-security profiles",
+        required_negative,
+        required_set,
+    )
     missing_negative = [profile for profile in required_negative if profile not in profile_set]
     if missing_negative:
         raise MatrixError(
@@ -869,6 +1384,7 @@ def validate_required_profiles(profiles):
     negative_without_vectors = []
     for profile in required_negative:
         apply_profile(profile)
+        validate_required_security_profile_context(profile, "negative-security")
         tools = selected_tools()
         if (
             not semantic_enabled("security-negative")
@@ -885,6 +1401,11 @@ def validate_required_profiles(profiles):
         )
 
     required_oauth = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES")
+    validate_required_profile_subset(
+        "required OAuth profiles",
+        required_oauth,
+        required_set,
+    )
     missing_oauth = [profile for profile in required_oauth if profile not in profile_set]
     if missing_oauth:
         raise MatrixError(
@@ -894,9 +1415,10 @@ def validate_required_profiles(profiles):
     oauth_without_vectors = []
     for profile in required_oauth:
         apply_profile(profile)
+        validate_required_security_profile_context(profile, "OAuth")
         tools = selected_tools()
         if (
-            not security_enabled()
+            not semantic_enabled("security")
             or not oauth_enabled()
             or not tools
             or any(not oauth_positive_configured_for_tool(tool) for tool in tools)
@@ -904,13 +1426,19 @@ def validate_required_profiles(profiles):
             oauth_without_vectors.append(profile)
     if oauth_without_vectors:
         raise MatrixError(
-            "required OAuth profiles must enable OAUTHBEARER security and "
-            "configure a positive fixture for every selected tool: "
+            "required OAuth profiles must enable security semantics, "
+            "OAUTHBEARER security, and configure a positive fixture for every "
+            "selected tool: "
             + ", ".join(oauth_without_vectors)
         )
 
     required_oauth_negative = configured_names(
         "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"
+    )
+    validate_required_profile_subset(
+        "required OAuth-negative profiles",
+        required_oauth_negative,
+        required_set,
     )
     missing_oauth_negative = [
         profile for profile in required_oauth_negative if profile not in profile_set
@@ -923,6 +1451,7 @@ def validate_required_profiles(profiles):
     oauth_negative_without_vectors = []
     for profile in required_oauth_negative:
         apply_profile(profile)
+        validate_required_security_profile_context(profile, "OAuth-negative")
         tools = selected_tools()
         if (
             not semantic_enabled("security-negative")
@@ -1070,7 +1599,29 @@ def selected_tools():
         if ENABLE_GO_AUTO and have("go"):
             tools.append("go-kafka")
         return tools
-    return [tool.strip() for tool in TOOLS.split(",") if tool.strip()]
+    blank_tool = False
+    tools = []
+    for item in TOOLS.split(","):
+        tool = item.strip()
+        if not tool:
+            blank_tool = True
+            continue
+        tools.append(tool)
+    if not tools:
+        raise MatrixError(
+            "ZMQ_CLIENT_MATRIX_TOOLS must contain at least one comma-separated value"
+        )
+    if blank_tool:
+        raise MatrixError(
+            "ZMQ_CLIENT_MATRIX_TOOLS must not contain blank comma-separated values"
+        )
+    duplicates = sorted(tool for tool in set(tools) if tools.count(tool) > 1)
+    if duplicates:
+        raise MatrixError(
+            "ZMQ_CLIENT_MATRIX_TOOLS must not contain duplicate "
+            "comma-separated values: " + ", ".join(duplicates)
+        )
+    return tools
 
 
 def ensure_tool_supports_semantics(tool):
@@ -1159,7 +1710,8 @@ def test_kcat():
             timeout=45,
         )
 
-    print(f"ok: kcat probes ({semantics_csv()})")
+    emit_client_security_detail("kcat")
+    print(f"ok: kcat probes ({semantics_csv()}) source=command")
 
 
 def test_kafka_cli():
@@ -1359,7 +1911,8 @@ def test_kafka_cli():
             if config_path is not None:
                 denied_cmd += ["--producer.config", config_path]
             run_expect_failure(denied_cmd, input_text=payload + "-denied\n", timeout=45)
-        print(f"ok: kafka CLI probes ({semantics_csv()})")
+        emit_client_security_detail("kafka-cli")
+        print(f"ok: kafka CLI probes ({semantics_csv()}) source=command")
     finally:
         if config_path is not None:
             try:
@@ -1370,7 +1923,8 @@ def test_kafka_cli():
 
 def test_kafka_python():
     if run_python_subtool("kafka-python"):
-        print(f"ok: kafka-python delegated to {PYTHON}")
+        emit_client_security_detail("kafka-python")
+        print(f"ok: kafka-python probes ({semantics_csv()}) source=command")
         return
     if not have_module("kafka"):
         raise MatrixError("kafka-python selected but import 'kafka' is not available")
@@ -1450,7 +2004,8 @@ def test_kafka_python():
                     test_kafka_python_tls_negative()
                     test_kafka_python_oauth_negative()
                     test_kafka_python_acl_negative(payload)
-                print(f"ok: kafka-python probes ({semantics_csv()})")
+                emit_client_security_detail("kafka-python")
+                print(f"ok: kafka-python probes ({semantics_csv()}) source=command")
                 return
         raise MatrixError("kafka-python consumer did not fetch produced payload")
     finally:
@@ -1478,8 +2033,8 @@ def test_kafka_python_rebalance(topic):
     try:
         for consumer in consumers:
             consumer.subscribe([topic])
-        deadline = time.time() + 20
-        while time.time() < deadline:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
             assignments = []
             for consumer in consumers:
                 consumer.poll(timeout_ms=500)
@@ -1598,7 +2153,8 @@ def test_kafka_python_acl_negative(payload):
 
 def test_confluent_kafka():
     if run_python_subtool("confluent-kafka"):
-        print(f"ok: confluent-kafka delegated to {PYTHON}")
+        emit_client_security_detail("confluent-kafka")
+        print(f"ok: confluent-kafka probes ({semantics_csv()}) source=command")
         return
     if not have_module("confluent_kafka"):
         raise MatrixError("confluent-kafka selected but import 'confluent_kafka' is not available")
@@ -1674,7 +2230,8 @@ def test_confluent_kafka():
                     test_confluent_tls_negative()
                     test_confluent_oauth_negative()
                     test_confluent_acl_negative(payload)
-                print(f"ok: confluent-kafka probes ({semantics_csv()})")
+                emit_client_security_detail("confluent-kafka")
+                print(f"ok: confluent-kafka probes ({semantics_csv()}) source=command")
                 return
         raise MatrixError("confluent-kafka consumer did not fetch produced payload")
     finally:
@@ -1700,8 +2257,8 @@ def test_confluent_rebalance(topic):
     try:
         for consumer in consumers:
             consumer.subscribe([topic])
-        deadline = time.time() + 20
-        while time.time() < deadline:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
             for consumer in consumers:
                 consumer.poll(0.5)
             assignments = [consumer.assignment() for consumer in consumers]
@@ -2133,7 +2690,8 @@ def test_java_kafka():
             timeout=90,
             env=active_security_env(),
         )
-    print(f"ok: java-kafka probes ({semantics_csv()})")
+    emit_client_security_detail("java-kafka")
+    print(f"ok: java-kafka probes ({semantics_csv()}) source=command")
 
 
 GO_MATRIX_SOURCE = r"""
@@ -2245,11 +2803,11 @@ def test_go_kafka():
         run(["go", "mod", "init", "zmq-client-matrix-go"], timeout=30, cwd=tmp)
         run(["go", "get", GO_MODULE], timeout=120, cwd=tmp)
         run(["go", "run", ".", BOOTSTRAP, topic, payload, group, semantics_csv()], timeout=120, cwd=tmp)
-    print(f"ok: go-kafka probes ({semantics_csv()})")
+    print(f"ok: go-kafka probes ({semantics_csv()}) source=command")
 
 
 def main():
-    if not RUN_ENABLED:
+    if not run_gate_enabled("ZMQ_RUN_CLIENT_MATRIX"):
         print("skip: set ZMQ_RUN_CLIENT_MATRIX=1 to run real-client matrix")
         return 0
 
@@ -2259,7 +2817,7 @@ def main():
         apply_profile(profile)
         run_profile()
 
-    print(f"ok: client matrix passed for {', '.join(profiles)} profile(s)")
+    print(f"ok: client matrix passed for {', '.join(profiles)} profile(s) source=command")
     return 0
 
 
@@ -2270,6 +2828,7 @@ def run_profile():
             "no supported Kafka client tools found; install kcat or Kafka CLI, "
             "or set ZMQ_CLIENT_MATRIX_TOOLS explicitly"
         )
+    validate_client_profile_runtime_settings(tools)
 
     for tool in tools:
         ensure_tool_supports_semantics(tool)
@@ -2288,13 +2847,40 @@ def run_profile():
         else:
             raise MatrixError(f"unknown client matrix tool: {tool}")
 
-    print(f"ok: client matrix profile {ACTIVE_PROFILE} passed for {', '.join(tools)} against {BOOTSTRAP}")
+    print(client_profile_pass_marker(tools))
 
 
 def self_test():
     old_env = os.environ.copy()
     try:
+        os.environ["ZMQ_RUN_CLIENT_MATRIX"] = "placeholder"
+        try:
+            run_gate_enabled("ZMQ_RUN_CLIENT_MATRIX")
+            raise MatrixError("placeholder client matrix run gate was accepted")
+        except MatrixError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_CLIENT_MATRIX"] = "   "
+        try:
+            run_gate_enabled("ZMQ_RUN_CLIENT_MATRIX")
+            raise MatrixError("blank client matrix run gate was accepted")
+        except MatrixError as exc:
+            if "blank" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_CLIENT_MATRIX"] = "maybe"
+        try:
+            run_gate_enabled("ZMQ_RUN_CLIENT_MATRIX")
+            raise MatrixError("invalid client matrix run gate was accepted")
+        except MatrixError as exc:
+            if "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_CLIENT_MATRIX"] = "yes"
+        if not run_gate_enabled("ZMQ_RUN_CLIENT_MATRIX"):
+            raise MatrixError("truthy client matrix run gate was not accepted")
+        os.environ.pop("ZMQ_RUN_CLIENT_MATRIX", None)
+
         os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_VERSION"] = "apache-kafka-clients-3.7.1"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
@@ -2307,6 +2893,7 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_PASSWORD"] = "matrix-pass"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_SSL_CA_LOCATION"] = "/tmp/matrix-bad-ca.pem"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_ACL_DENIED_TOPIC"] = "matrix-denied-topic"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BOOTSTRAP"] = "go-bootstrap:19092"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "segmentio-kafka-go-v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
@@ -2324,6 +2911,220 @@ def self_test():
         if names != ["apache_3_7", "go_1_21"]:
             raise MatrixError(f"profile parsing failed: {names}")
         validate_required_profiles(names)
+
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "   "
+        try:
+            profile_names()
+            raise MatrixError("blank client matrix profile list was accepted")
+        except MatrixError as exc:
+            if "at least one comma-separated value" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,,go_1_21"
+        try:
+            profile_names()
+            raise MatrixError("embedded blank client matrix profile was accepted")
+        except MatrixError as exc:
+            if "blank comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+
+        for env_name in (
+            "ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS",
+            "ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS",
+        ):
+            old_value = os.environ.get(env_name)
+            os.environ[env_name] = "   "
+            try:
+                validate_required_profiles(names)
+                raise MatrixError(f"blank {env_name} client matrix list was accepted")
+            except MatrixError as exc:
+                if "at least one comma-separated value" not in str(exc):
+                    raise
+            os.environ[env_name] = "apache_3_7,,go_1_21"
+            try:
+                validate_required_profiles(names)
+                raise MatrixError(f"embedded blank {env_name} client matrix list was accepted")
+            except MatrixError as exc:
+                if "blank comma-separated" not in str(exc):
+                    raise
+            if old_value is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = old_value
+
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BOOTSTRAP"] = ""
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("blank required client profile bootstrap used global fallback")
+        except MatrixError as exc:
+            if "ZMQ_CLIENT_MATRIX_APACHE_3_7_BOOTSTRAP" not in str(exc) or "blank" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_APACHE_3_7_BOOTSTRAP", None)
+
+        os.environ["ZMQ_CLIENT_MATRIX_TOOLS"] = "java-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = ""
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("blank required client profile tools used global fallback")
+        except MatrixError as exc:
+            if "ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS" not in str(exc) or "blank" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_TOOLS", None)
+
+        os.environ["ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = ""
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("blank required client security protocol used global fallback")
+        except MatrixError as exc:
+            if "ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL" not in str(exc) or "blank" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL", None)
+
+        os.environ["ZMQ_CLIENT_MATRIX_PYTHON"] = sys.executable
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "kafka-python"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_PYTHON"] = ""
+        apply_profile("go_1_21")
+        try:
+            validate_client_profile_runtime_settings(["kafka-python"])
+            raise MatrixError("blank profile client Python used global fallback")
+        except MatrixError as exc:
+            if "PYTHON" not in str(exc) or "blank" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_PYTHON", None)
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_PYTHON", None)
+
+        os.environ["ZMQ_CLIENT_MATRIX_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6OTk5OTk5OTk5OX0."
+        )
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "kafka-python"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SASL_MECHANISM"] = "OAUTHBEARER"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN"] = ""
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("kafka-python")
+            raise MatrixError("blank profile client OAuth token used global fallback")
+        except MatrixError as exc:
+            if "positive OAuth fixture" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_OAUTH_TOKEN", None)
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_SECURITY_PROTOCOL", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_SASL_MECHANISM", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN", None)
+        apply_profile("go_1_21")
+
+        os.environ["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "placeholder"
+        try:
+            apply_profile("default")
+            raise MatrixError("placeholder client matrix enable-go flag was accepted")
+        except MatrixError as exc:
+            if "ENABLE_GO" not in str(exc) or "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "maybe"
+        try:
+            apply_profile("default")
+            raise MatrixError("invalid client matrix enable-go flag was accepted")
+        except MatrixError as exc:
+            if "ENABLE_GO" not in str(exc) or "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "yes"
+        apply_profile("default")
+        if not ENABLE_GO_AUTO:
+            raise MatrixError("truthy client matrix enable-go flag was not accepted")
+        os.environ.pop("ZMQ_CLIENT_MATRIX_ENABLE_GO", None)
+
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = ",,,"
+        try:
+            profile_names()
+            raise MatrixError("empty client matrix profile list was accepted")
+        except MatrixError as exc:
+            if "at least one comma-separated value" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21,apache_3_7"
+        try:
+            profile_names()
+            raise MatrixError("duplicate client matrix profile was accepted")
+        except MatrixError as exc:
+            if "duplicate comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache-3-7,apache_3_7"
+        try:
+            profile_names()
+            raise MatrixError("colliding client matrix profile names were accepted")
+        except MatrixError as exc:
+            if "same environment token" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "placeholder"
+        try:
+            profile_names()
+            raise MatrixError("placeholder client matrix profile was accepted")
+        except MatrixError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "<profile>"
+        try:
+            profile_names()
+            raise MatrixError("angle-bracket placeholder client matrix profile was accepted")
+        except MatrixError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7,go_1_21"
+
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7,placeholder"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("placeholder required client profile was accepted")
+        except MatrixError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7,go_1_21"
+
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = ",,,"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("empty required client tool list was accepted")
+        except MatrixError as exc:
+            if "at least one comma-separated value" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,go-kafka,java-kafka"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("duplicate required client tool list was accepted")
+        except MatrixError as exc:
+            if "duplicate comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,go-kafka"
+
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("required client sub-profile outside required profile set was accepted")
+        except MatrixError as exc:
+            if "ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7,go_1_21"
+
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "latest"
         try:
             validate_required_profiles(names)
@@ -2351,9 +3152,143 @@ def self_test():
         os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS", None)
         os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS", None)
 
+        os.environ.pop("ZMQ_CLIENT_MATRIX_BOOTSTRAP", None)
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required client bootstrap provenance was accepted")
+        except MatrixError as exc:
+            if "BOOTSTRAP" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092"
+
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("malformed required client bootstrap provenance was accepted")
+        except MatrixError as exc:
+            if "BOOTSTRAP" not in str(exc) or "host:port" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092"
+
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "auto"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("auto required client tools were accepted")
+        except MatrixError as exc:
+            if "not auto" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka,,kcat"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("embedded blank required client profile tools were accepted")
+        except MatrixError as exc:
+            if "blank comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka,java-kafka"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("duplicate required client profile tools were accepted")
+        except MatrixError as exc:
+            if "duplicate comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups,groups"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("duplicate required client profile semantics were accepted")
+        except MatrixError as exc:
+            if "duplicate comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS", None)
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required client semantics provenance was accepted")
+        except MatrixError as exc:
+            if "SEMANTICS" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "placeholder"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("placeholder required client version was accepted")
+        except MatrixError as exc:
+            if "VERSION" not in str(exc) and "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "segmentio-kafka-go-v0.4.47"
+
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "PLAINTEXT"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("plaintext required secured-client profile was accepted")
+        except MatrixError as exc:
+            if "rather than PLAINTEXT" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
             raise MatrixError("java profile override failed")
+        if BOOTSTRAP != "global-bootstrap:9092":
+            raise MatrixError("java profile bootstrap fallback failed")
+        expected_profile_marker = (
+            "ok: client matrix profile apache_3_7 passed for java-kafka "
+            "against global-bootstrap:9092 version=apache-kafka-clients-3.7.1 "
+            "source=command"
+        )
+        if client_profile_pass_marker(["java-kafka"]) != expected_profile_marker:
+            raise MatrixError("client profile version marker self-test failed")
+        try:
+            parse_semantics(",,,")
+            raise MatrixError("empty client semantic list was accepted")
+        except MatrixError as exc:
+            if "at least one comma-separated value" not in str(exc):
+                raise
+        try:
+            parse_semantics("admin,,groups")
+            raise MatrixError("embedded blank client semantic was accepted")
+        except MatrixError as exc:
+            if "blank comma-separated" not in str(exc):
+                raise
+        try:
+            parse_semantics("admin,admin")
+            raise MatrixError("duplicate client semantic was accepted")
+        except MatrixError as exc:
+            if "duplicate comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = ",,,"
+        apply_profile("apache_3_7")
+        try:
+            selected_tools()
+            raise MatrixError("empty client tool list was accepted")
+        except MatrixError as exc:
+            if "at least one comma-separated value" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka,,kcat"
+        apply_profile("apache_3_7")
+        try:
+            selected_tools()
+            raise MatrixError("embedded blank client tool was accepted")
+        except MatrixError as exc:
+            if "blank comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka,java-kafka"
+        apply_profile("apache_3_7")
+        try:
+            selected_tools()
+            raise MatrixError("duplicate client tool list was accepted")
+        except MatrixError as exc:
+            if "duplicate comma-separated" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+        apply_profile("apache_3_7")
         if semantics_csv() != "basic,admin,rebalance,transactions,security,security-negative":
             raise MatrixError(f"java semantics override failed: {semantics_csv()}")
         if not security_enabled():
@@ -2377,6 +3312,70 @@ def self_test():
         finally:
             os.unlink(kafka_props_path)
 
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "BROKEN"
+        apply_profile("apache_3_7")
+        try:
+            validate_client_profile_runtime_settings(["java-kafka"])
+            raise MatrixError("invalid client security protocol was accepted")
+        except MatrixError as exc:
+            if "SECURITY_PROTOCOL" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "GSSAPI"
+        apply_profile("apache_3_7")
+        try:
+            validate_client_profile_runtime_settings(["java-kafka"])
+            raise MatrixError("invalid client SASL mechanism was accepted")
+        except MatrixError as exc:
+            if "SASL_MECHANISM" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
+
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "placeholder"
+        apply_profile("apache_3_7")
+        try:
+            validate_client_profile_runtime_settings(["java-kafka"])
+            raise MatrixError("placeholder client bootstrap was accepted")
+        except MatrixError as exc:
+            if "BOOTSTRAP" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092"
+        apply_profile("apache_3_7")
+
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "<host>:9092"
+        apply_profile("apache_3_7")
+        try:
+            validate_client_profile_runtime_settings(["java-kafka"])
+            raise MatrixError("angle-bracket placeholder client bootstrap was accepted")
+        except MatrixError as exc:
+            if "BOOTSTRAP" not in str(exc) or "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092"
+        apply_profile("apache_3_7")
+
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:notaport"
+        apply_profile("apache_3_7")
+        try:
+            validate_client_profile_runtime_settings(["java-kafka"])
+            raise MatrixError("non-numeric client bootstrap port was accepted")
+        except MatrixError as exc:
+            if "BOOTSTRAP" not in str(exc) or "port" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:0"
+        apply_profile("apache_3_7")
+        try:
+            validate_client_profile_runtime_settings(["java-kafka"])
+            raise MatrixError("zero client bootstrap port was accepted")
+        except MatrixError as exc:
+            if "BOOTSTRAP" not in str(exc) or "between 1 and 65535" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092,backup-bootstrap:19092"
+        apply_profile("apache_3_7")
+        validate_client_profile_runtime_settings(["java-kafka"])
+        os.environ["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = "global-bootstrap:9092"
+        apply_profile("apache_3_7")
+
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "OAUTHBEARER"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTH_JAAS_CONFIG"] = (
             'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
@@ -2394,6 +3393,16 @@ def self_test():
         java_env = active_security_env()
         if "unsecuredLoginStringClaim_sub" not in java_env.get("ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG", ""):
             raise MatrixError("Java OAuth environment self-test failed")
+        expected_detail = (
+            "ok: client security detail profile apache_3_7 "
+            "tool=java-kafka protocol=SASL_PLAINTEXT "
+            "mechanism=OAUTHBEARER oauth=true positive=true "
+            "security_negative=true oauth_negative=true "
+            "sasl_negative=false tls_negative=false acl_negative=true "
+            "source=command"
+        )
+        if client_security_detail_line("java-kafka") != expected_detail:
+            raise MatrixError("client security detail marker self-test failed")
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTH_JAAS_CONFIG"] = (
             'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
             'unsecuredLoginStringClaim_sub="matrix-user" unsecuredLoginNumberClaim_exp="9999999999";'
@@ -2455,6 +3464,26 @@ def self_test():
             "principal=matrix-user lifeSeconds=3600"
         )
         validate_required_profiles(names)
+        saved_required_semantics = os.environ.get("ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS")
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS"] = (
+            "admin,groups,rebalance,transactions,security-negative"
+        )
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = (
+            "admin,rebalance,transactions,security-negative"
+        )
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("OAuth profile without security semantic was accepted")
+        except MatrixError as exc:
+            if "required OAuth profiles" not in str(exc) or "security semantics" not in str(exc):
+                raise
+        if saved_required_semantics is None:
+            os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS", None)
+        else:
+            os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS"] = saved_required_semantics
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = (
+            "admin,rebalance,transactions,security,security-negative"
+        )
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"] = "apache_3_7"
         try:
             validate_required_profiles(names)
@@ -2496,8 +3525,52 @@ def self_test():
         apply_profile("go_1_21")
         if TOOLS != "go-kafka" or GO_MODULE != "github.com/segmentio/kafka-go@v0.4.47":
             raise MatrixError("go profile override failed")
+        if BOOTSTRAP != "go-bootstrap:19092":
+            raise MatrixError("go profile bootstrap override failed")
         if semantics_csv() != "basic,admin,groups":
             raise MatrixError(f"go semantics override failed: {semantics_csv()}")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_ENABLE_GO"] = "placeholder"
+        try:
+            apply_profile("go_1_21")
+            raise MatrixError("placeholder client matrix profile enable-go flag was accepted")
+        except MatrixError as exc:
+            if "ENABLE_GO" not in str(exc) or "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_ENABLE_GO"] = "maybe"
+        try:
+            apply_profile("go_1_21")
+            raise MatrixError("invalid client matrix profile enable-go flag was accepted")
+        except MatrixError as exc:
+            if "ENABLE_GO" not in str(exc) or "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_ENABLE_GO"] = "on"
+        apply_profile("go_1_21")
+        if not ENABLE_GO_AUTO:
+            raise MatrixError("truthy client matrix profile enable-go flag was not accepted")
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_ENABLE_GO", None)
+        apply_profile("go_1_21")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@latest"
+        apply_profile("go_1_21")
+        try:
+            validate_client_profile_runtime_settings(["go-kafka"])
+            raise MatrixError("floating go-kafka module was accepted")
+        except MatrixError as exc:
+            if "GO_MODULE" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
+        apply_profile("go_1_21")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "kafka-python"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_PYTHON"] = "placeholder"
+        apply_profile("go_1_21")
+        try:
+            validate_client_profile_runtime_settings(["kafka-python"])
+            raise MatrixError("placeholder client Python executable was accepted")
+        except MatrixError as exc:
+            if "PYTHON" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_PYTHON", None)
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
+        apply_profile("go_1_21")
 
         if parse_semantics("all") != set(SEMANTIC_ORDER):
             raise MatrixError("semantic all parsing failed")
@@ -2517,6 +3590,8 @@ def self_test():
         except MatrixError as exc:
             if "security interop probes" not in str(exc):
                 raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SASL_MECHANISM"] = "PLAIN"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES"] = "go_1_21"
         try:
             validate_required_profiles(names)
@@ -2557,6 +3632,37 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN"] = (
             "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6OTk5OTk5OTk5OX0."
         )
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6MTAwMH0."
+        )
+        nonstandard_payload = base64.urlsafe_b64encode(
+            b'{"sub":NaN,"exp":9999999999}'
+        ).decode("ascii").rstrip("=")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            f"eyJhbGciOiJub25lIn0.{nonstandard_payload}."
+        )
+        apply_profile("go_1_21")
+        try:
+            decode_jwt_payload(BAD_OAUTH_TOKEN)
+            raise MatrixError("non-standard JSON OAuth token was accepted")
+        except MatrixError as exc:
+            message = str(exc)
+            if "strict JSON" not in message or "non-standard JSON constant" not in message:
+                raise
+        duplicate_payload = base64.urlsafe_b64encode(
+            b'{"sub":"matrix-user","sub":"shadowed","exp":9999999999}'
+        ).decode("ascii").rstrip("=")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            f"eyJhbGciOiJub25lIn0.{duplicate_payload}."
+        )
+        apply_profile("go_1_21")
+        try:
+            decode_jwt_payload(BAD_OAUTH_TOKEN)
+            raise MatrixError("duplicate-key OAuth token was accepted")
+        except MatrixError as exc:
+            message = str(exc)
+            if "strict JSON" not in message or "duplicate JSON object key" not in message:
+                raise
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
             "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6MTAwMH0."
         )

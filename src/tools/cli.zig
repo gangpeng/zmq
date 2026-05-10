@@ -19,14 +19,24 @@ const TopicAdmin = @import("client.zig").TopicAdmin;
 ///   zmq-cli produce --topic test --bootstrap-server localhost:9092
 ///   zmq-cli consume --topic test --group g1 --bootstrap-server localhost:9092
 
-/// Parse "host:port" string.
-fn parseBootstrapServer(server: []const u8) struct { host: []const u8, port: u16 } {
-    if (std.mem.indexOf(u8, server, ":")) |colon| {
-        const port_str = server[colon + 1 ..];
-        const port = std.fmt.parseInt(u16, port_str, 10) catch 9092;
-        return .{ .host = server[0..colon], .port = port };
+const BootstrapServer = struct {
+    host: []const u8,
+    port: u16,
+};
+
+/// Parse "host[:port]" string.
+fn parseBootstrapServer(server: []const u8) !BootstrapServer {
+    const trimmed = std.mem.trim(u8, server, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidBootstrapServer;
+    if (std.mem.lastIndexOfScalar(u8, trimmed, ':')) |colon| {
+        const host = std.mem.trim(u8, trimmed[0..colon], " \t\r\n");
+        const port_str = std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r\n");
+        if (host.len == 0 or port_str.len == 0) return error.InvalidBootstrapServer;
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidBootstrapServerPort;
+        if (port == 0) return error.InvalidBootstrapServerPort;
+        return .{ .host = host, .port = port };
     }
-    return .{ .host = server, .port = 9092 };
+    return .{ .host = trimmed, .port = 9092 };
 }
 
 /// List all topics from the broker.
@@ -277,13 +287,33 @@ pub fn apiVersions(alloc: Allocator, host: []const u8, port: u16) !void {
 const testing = std.testing;
 
 test "parseBootstrapServer with port" {
-    const result = parseBootstrapServer("localhost:9093");
+    const result = try parseBootstrapServer("localhost:9093");
     try testing.expectEqualStrings("localhost", result.host);
     try testing.expectEqual(@as(u16, 9093), result.port);
 }
 
 test "parseBootstrapServer without port" {
-    const result = parseBootstrapServer("localhost");
+    const result = try parseBootstrapServer("localhost");
     try testing.expectEqualStrings("localhost", result.host);
     try testing.expectEqual(@as(u16, 9092), result.port);
+}
+
+test "parseBootstrapServer rejects malformed ports instead of defaulting" {
+    const invalid_servers = [_][]const u8{
+        "",
+        ":9092",
+        "localhost:",
+    };
+    for (invalid_servers) |server| {
+        try testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer(server));
+    }
+
+    const invalid_ports = [_][]const u8{
+        "localhost:not-a-port",
+        "localhost:0",
+        "localhost:70000",
+    };
+    for (invalid_ports) |server| {
+        try testing.expectError(error.InvalidBootstrapServerPort, parseBootstrapServer(server));
+    }
 }

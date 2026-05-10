@@ -1117,6 +1117,26 @@ pub const ObjectManager = struct {
         return self.stream_objects.count();
     }
 
+    pub fn getPreparedObjectCount(self: *const ObjectManager) usize {
+        return self.prepared_registry.count();
+    }
+
+    pub fn getMarkDestroyedObjectCount(self: *const ObjectManager) usize {
+        var count: usize = 0;
+
+        var so_it = self.stream_objects.iterator();
+        while (so_it.next()) |entry| {
+            if (entry.value_ptr.state == .mark_destroyed) count += 1;
+        }
+
+        var sso_it = self.stream_set_objects.iterator();
+        while (sso_it.next()) |entry| {
+            if (entry.value_ptr.state == .mark_destroyed) count += 1;
+        }
+
+        return count;
+    }
+
     pub fn streamCount(self: *const ObjectManager) usize {
         return self.streams.count();
     }
@@ -3343,6 +3363,34 @@ test "ObjectManager prepareObject allocates unique IDs" {
 
     try testing.expect(id1 < id2);
     try testing.expect(id2 < id3);
+}
+
+test "ObjectManager metric count helpers track prepared and destroyed objects" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    const stream = try om.createStreamWithId(100, 1);
+    const prepared_id = try om.prepareObjectWithTtlFallible(60_000);
+    try testing.expectEqual(@as(usize, 1), om.streamCount());
+    try testing.expectEqual(@as(usize, 1), om.getPreparedObjectCount());
+    try testing.expectEqual(@as(usize, 0), om.getMarkDestroyedObjectCount());
+
+    try om.commitStreamObject(200, stream.stream_id, 0, 10, "so/metrics/0-10", 128);
+    const ranges = [_]StreamOffsetRange{.{
+        .stream_id = stream.stream_id,
+        .start_offset = 10,
+        .end_offset = 20,
+    }};
+    try om.commitStreamSetObject(201, 1, 1, &ranges, "sso/metrics/10-20", 256);
+
+    try testing.expect(om.prepared_registry.contains(prepared_id));
+    try testing.expectEqual(@as(usize, 1), om.getPreparedObjectCount());
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    try testing.expectEqual(@as(usize, 1), om.getStreamSetObjectCount());
+
+    om.markDestroyedAt(200, 10_000);
+    om.markDestroyedAt(201, 10_000);
+    try testing.expectEqual(@as(usize, 2), om.getMarkDestroyedObjectCount());
 }
 
 test "ObjectManager expires registry-only prepared IDs by object TTL" {

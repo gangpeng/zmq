@@ -52,20 +52,42 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-fn parseBoolFlag(text: []const u8, default: bool) bool {
+fn parseBoolFlag(text: []const u8) !bool {
     if (std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true") or std.ascii.eqlIgnoreCase(text, "yes")) {
         return true;
     }
     if (std.mem.eql(u8, text, "0") or std.ascii.eqlIgnoreCase(text, "false") or std.ascii.eqlIgnoreCase(text, "no")) {
         return false;
     }
-    return default;
+    return error.InvalidBoolFlag;
 }
 
-fn parseS3Scheme(text: []const u8, default: storage.S3Client.Scheme) storage.S3Client.Scheme {
+fn parseS3Scheme(text: []const u8) !storage.S3Client.Scheme {
     if (std.ascii.eqlIgnoreCase(text, "https")) return .https;
     if (std.ascii.eqlIgnoreCase(text, "http")) return .http;
-    return default;
+    return error.InvalidS3Scheme;
+}
+
+fn parseWalFlushMode(text: []const u8) !handler.Broker.WalFlushMode {
+    if (std.mem.eql(u8, text, "sync")) return .sync;
+    if (std.mem.eql(u8, text, "async")) return .async_flush;
+    if (std.mem.eql(u8, text, "group_commit")) return .group_commit;
+    return error.InvalidWalFlushMode;
+}
+
+fn parseSecurityProtocol(text: []const u8) !TlsConfig.SecurityProtocol {
+    if (std.ascii.eqlIgnoreCase(text, "plaintext")) return .plaintext;
+    if (std.ascii.eqlIgnoreCase(text, "ssl")) return .ssl;
+    if (std.ascii.eqlIgnoreCase(text, "sasl_plaintext")) return .sasl_plaintext;
+    if (std.ascii.eqlIgnoreCase(text, "sasl_ssl")) return .sasl_ssl;
+    return error.InvalidSecurityProtocol;
+}
+
+fn parseTlsClientAuth(text: []const u8) !TlsConfig.ClientAuth {
+    if (std.ascii.eqlIgnoreCase(text, "none")) return .none;
+    if (std.ascii.eqlIgnoreCase(text, "requested")) return .requested;
+    if (std.ascii.eqlIgnoreCase(text, "required")) return .required;
+    return error.InvalidTlsClientAuth;
 }
 
 fn nextRequiredArg(stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {
@@ -73,6 +95,15 @@ fn nextRequiredArg(stdout: *Stdout, args: *std.process.Args.Iterator, flag: []co
         try stdout.print("  ERROR: missing value for {s}\n", .{flag});
         return error.InvalidConfiguration;
     };
+}
+
+fn nextRequiredNonBlankArg(stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {
+    const text = try nextRequiredArg(stdout, args, flag);
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        try stdout.print("  ERROR: {s} must not be blank\n", .{flag});
+        return error.InvalidConfiguration;
+    }
+    return text;
 }
 
 fn parseRequiredIntArg(comptime T: type, stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) !T {
@@ -123,7 +154,7 @@ fn applyConfigPortStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u
     }
 }
 
-fn applyConfigNodeIdStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, target: *i32) !void {
+fn configNodeIdStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8) !?i32 {
     const value = cfg.getIntStrict(i32, key) catch {
         try stdout.print("  ERROR: invalid node id for config '{s}'\n", .{key});
         return error.InvalidConfiguration;
@@ -133,18 +164,180 @@ fn applyConfigNodeIdStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const
             try stdout.print("  ERROR: config '{s}' must be non-negative\n", .{key});
             return error.InvalidConfiguration;
         }
-        target.* = v;
+        return v;
+    }
+    return null;
+}
+
+fn applyConfigNodeIdStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, target: *i32) !void {
+    if (try configNodeIdStrict(stdout, cfg, key)) |v| target.* = v;
+}
+
+fn applyConfigNodeIdAliasesStrict(stdout: *Stdout, cfg: *const ConfigFile, target: *i32) !void {
+    const broker_id = try configNodeIdStrict(stdout, cfg, "broker.id");
+    const kraft_node_id = try configNodeIdStrict(stdout, cfg, "node.id");
+
+    if (broker_id) |b| {
+        if (kraft_node_id) |n| {
+            if (b != n) {
+                try stdout.print("  ERROR: config 'broker.id' and 'node.id' must match when both are set ({d} != {d})\n", .{ b, n });
+                return error.InvalidConfiguration;
+            }
+        }
+    }
+
+    if (kraft_node_id) |n| {
+        target.* = n;
+    } else if (broker_id) |b| {
+        target.* = b;
     }
 }
 
-fn firstLogDir(log_dirs: ?[]const u8) ?[]const u8 {
+fn applyConfigBoolStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, target: *bool) !void {
+    const value = cfg.getBoolStrict(key) catch {
+        try stdout.print("  ERROR: config '{s}' must be true or false\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    if (value) |v| target.* = v;
+}
+
+fn configStringStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8) !?[]const u8 {
+    return cfg.getNonBlankStringStrict(key) catch {
+        try stdout.print("  ERROR: config '{s}' must not be blank\n", .{key});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configStringOrStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, default: []const u8) ![]const u8 {
+    return (try configStringStrict(stdout, cfg, key)) orelse default;
+}
+
+fn configSaslUsersOrStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, default: []const u8) ![]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return default;
+    config_mod.validateSaslUsersStrict(value) catch {
+        try stdout.print("  ERROR: config '{s}' must contain comma-separated user:password pairs with nonblank fields\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configSuperUsersOrStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, default: []const u8) ![]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return default;
+    config_mod.validateSuperUsersStrict(value) catch {
+        try stdout.print("  ERROR: config '{s}' must contain semicolon-separated nonblank principals\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configSaslMechanismsOrStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, default: []const u8) ![]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return default;
+    config_mod.validateSaslMechanismsStrict(value) catch {
+        try stdout.print("  ERROR: config '{s}' must list supported SASL mechanisms without blank entries\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configListenerEndpointStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, allow_blank_host: bool) !?config_mod.ListenerEndpoint {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return null;
+    return config_mod.firstListenerEndpointStrict(value, allow_blank_host) catch {
+        try stdout.print("  ERROR: config '{s}' must contain comma-separated NAME://host:port listener endpoints\n", .{key});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configListenerNamesStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8) !?[]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return null;
+    config_mod.validateListenerNamesStrict(value) catch {
+        try stdout.print("  ERROR: config '{s}' must contain comma-separated listener names without blank entries\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configListenerNameStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8) !?[]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return null;
+    config_mod.validateListenerNameStrict(value) catch {
+        try stdout.print("  ERROR: config '{s}' must contain one listener name\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configSecurityProtocolStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8) !?[]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return null;
+    _ = parseSecurityProtocol(value) catch {
+        try stdout.print("  ERROR: config '{s}' must be plaintext, ssl, sasl_plaintext, or sasl_ssl, got '{s}'\n", .{ key, value });
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configListenerSecurityProtocolMapStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8) !?[]const u8 {
+    const value = (try configStringStrict(stdout, cfg, key)) orelse return null;
+    config_mod.validateListenerSecurityProtocolMapStrict(value) catch {
+        try stdout.print("  ERROR: config '{s}' must contain comma-separated listener:security-protocol entries\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    return value;
+}
+
+fn configListenerSecurityProtocolMapCoversListenersStrict(stdout: *Stdout, map: []const u8, listeners: []const u8) !void {
+    config_mod.validateListenerSecurityProtocolMapForListenersStrict(map, listeners) catch {
+        try stdout.print("  ERROR: config 'listener.security.protocol.map' must include every listener from config 'listeners'\n", .{});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configListenerSecurityProtocolForNameStrict(stdout: *Stdout, map: []const u8, listener_name: []const u8) ![]const u8 {
+    return config_mod.listenerSecurityProtocolTextForNameStrict(map, listener_name) catch {
+        try stdout.print("  ERROR: config 'listener.security.protocol.map' must define listener '{s}' with a valid security protocol\n", .{listener_name});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configAdvertisedListenersMatchListenersStrict(stdout: *Stdout, advertised: []const u8, listeners: []const u8) !void {
+    config_mod.validateAdvertisedListenersMatchListenersStrict(advertised, listeners) catch {
+        try stdout.print("  ERROR: config 'advertised.listeners' must use listener names from config 'listeners'\n", .{});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn parseConfigListenerEndpointTextStrict(stdout: *Stdout, key: []const u8, value: []const u8, allow_blank_host: bool) !config_mod.ListenerEndpoint {
+    return config_mod.firstListenerEndpointStrict(value, allow_blank_host) catch {
+        try stdout.print("  ERROR: config '{s}' must contain comma-separated NAME://host:port listener endpoints\n", .{key});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configListenerEndpointForNameTextStrict(stdout: *Stdout, listeners: []const u8, listener_name: []const u8, allow_blank_host: bool) !config_mod.ListenerEndpoint {
+    return config_mod.listenerEndpointForNameStrict(listeners, listener_name, allow_blank_host) catch {
+        try stdout.print("  ERROR: config 'listeners' does not contain listener '{s}'\n", .{listener_name});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configControllerListenerEndpointTextStrict(stdout: *Stdout, listeners: []const u8, listener_names: []const u8, allow_blank_host: bool) !config_mod.ListenerEndpoint {
+    return config_mod.firstListenerEndpointMatchingNamesStrict(listeners, listener_names, allow_blank_host) catch {
+        try stdout.print("  ERROR: config 'listeners' does not contain a controller listener from controller.listener.names\n", .{});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn configNonControllerListenerEndpointTextStrict(stdout: *Stdout, listeners: []const u8, listener_names: []const u8, allow_blank_host: bool) !config_mod.ListenerEndpoint {
+    return config_mod.firstListenerEndpointExcludingNamesStrict(listeners, listener_names, allow_blank_host) catch {
+        try stdout.print("  ERROR: config 'listeners' must include a broker listener outside controller.listener.names\n", .{});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn firstLogDirStrict(stdout: *Stdout, log_dirs: ?[]const u8) !?[]const u8 {
     const raw = log_dirs orelse return null;
-    var parts = std.mem.splitScalar(u8, raw, ',');
-    while (parts.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
-    return null;
+    return config_mod.firstCommaSeparatedValueStrict(raw) catch {
+        try stdout.print("  ERROR: log.dirs/--data-dir must contain comma-separated nonblank directories\n", .{});
+        return error.InvalidConfiguration;
+    };
 }
 
 /// Global pointers for signal handler access.
@@ -277,9 +470,13 @@ pub fn main(init: std.process.Init) !void {
     var cli_controller_port_set = false;
     var cli_s3_wal_batch_size_set = false;
     var cli_s3_wal_flush_interval_set = false;
+    var cli_s3_wal_flush_mode_set = false;
     var cli_cache_max_size_set = false;
     var cli_s3_block_cache_size_set = false;
     var cli_compaction_interval_set = false;
+    var cli_security_protocol_set = false;
+    var cli_tls_client_auth_set = false;
+    var cli_advertised_host_set = false;
     // Configurable S3 WAL and performance parameters
     var s3_wal_batch_size: usize = 4 * 1024 * 1024;
     var s3_wal_flush_interval: i64 = 250;
@@ -293,7 +490,15 @@ pub fn main(init: std.process.Init) !void {
     var tls_key_file: ?[]const u8 = null;
     var tls_ca_file: ?[]const u8 = null;
     var tls_client_auth_str: []const u8 = "none";
+    var tls_principal_mapping_rules: ?[]const u8 = null;
     var client_telemetry_export_path: ?[]const u8 = null;
+    var sasl_enabled: bool = false;
+    var sasl_users: []const u8 = "";
+    var super_users: []const u8 = "";
+    var allow_everyone_if_no_acl: bool = true;
+    var sasl_enabled_mechanisms: []const u8 = "PLAIN";
+    var oauth_issuer: []const u8 = "";
+    var oauth_audience: []const u8 = "";
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
@@ -304,26 +509,34 @@ pub fn main(init: std.process.Init) !void {
             port = try parseRequiredPortArg(&stdout, &args, "--port");
             cli_port_set = true;
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
-            data_dir = try nextRequiredArg(&stdout, &args, "--data-dir");
+            data_dir = try nextRequiredNonBlankArg(&stdout, &args, "--data-dir");
         } else if (std.mem.eql(u8, arg, "--s3-endpoint")) {
-            s3_host = try nextRequiredArg(&stdout, &args, "--s3-endpoint");
+            s3_host = try nextRequiredNonBlankArg(&stdout, &args, "--s3-endpoint");
         } else if (std.mem.eql(u8, arg, "--s3-port")) {
             s3_port = try parseRequiredPortArg(&stdout, &args, "--s3-port");
             cli_s3_port_set = true;
         } else if (std.mem.eql(u8, arg, "--s3-bucket")) {
-            s3_bucket = try nextRequiredArg(&stdout, &args, "--s3-bucket");
+            s3_bucket = try nextRequiredNonBlankArg(&stdout, &args, "--s3-bucket");
         } else if (std.mem.eql(u8, arg, "--s3-access-key")) {
-            s3_access_key = try nextRequiredArg(&stdout, &args, "--s3-access-key");
+            s3_access_key = try nextRequiredNonBlankArg(&stdout, &args, "--s3-access-key");
         } else if (std.mem.eql(u8, arg, "--s3-secret-key")) {
-            s3_secret_key = try nextRequiredArg(&stdout, &args, "--s3-secret-key");
+            s3_secret_key = try nextRequiredNonBlankArg(&stdout, &args, "--s3-secret-key");
         } else if (std.mem.eql(u8, arg, "--s3-scheme")) {
-            s3_scheme = parseS3Scheme(try nextRequiredArg(&stdout, &args, "--s3-scheme"), s3_scheme);
+            const value = try nextRequiredNonBlankArg(&stdout, &args, "--s3-scheme");
+            s3_scheme = parseS3Scheme(value) catch {
+                try stdout.print("  ERROR: --s3-scheme must be http or https, got '{s}'\n", .{value});
+                return error.InvalidConfiguration;
+            };
         } else if (std.mem.eql(u8, arg, "--s3-region")) {
-            s3_region = try nextRequiredArg(&stdout, &args, "--s3-region");
+            s3_region = try nextRequiredNonBlankArg(&stdout, &args, "--s3-region");
         } else if (std.mem.eql(u8, arg, "--s3-path-style")) {
-            s3_path_style = parseBoolFlag(try nextRequiredArg(&stdout, &args, "--s3-path-style"), s3_path_style);
+            const value = try nextRequiredNonBlankArg(&stdout, &args, "--s3-path-style");
+            s3_path_style = parseBoolFlag(value) catch {
+                try stdout.print("  ERROR: --s3-path-style must be true or false, got '{s}'\n", .{value});
+                return error.InvalidConfiguration;
+            };
         } else if (std.mem.eql(u8, arg, "--s3-ca-file")) {
-            s3_tls_ca_file = try nextRequiredArg(&stdout, &args, "--s3-ca-file");
+            s3_tls_ca_file = try nextRequiredNonBlankArg(&stdout, &args, "--s3-ca-file");
         } else if (std.mem.eql(u8, arg, "--metrics-port")) {
             metrics_port = try parseRequiredPortArg(&stdout, &args, "--metrics-port");
             cli_metrics_port_set = true;
@@ -331,17 +544,18 @@ pub fn main(init: std.process.Init) !void {
             node_id = try parseRequiredNodeIdArg(&stdout, &args, "--node-id");
             cli_node_id_set = true;
         } else if (std.mem.eql(u8, arg, "--advertised-host")) {
-            advertised_host = try nextRequiredArg(&stdout, &args, "--advertised-host");
+            advertised_host = try nextRequiredNonBlankArg(&stdout, &args, "--advertised-host");
+            cli_advertised_host_set = true;
         } else if (std.mem.eql(u8, arg, "--config")) {
-            config_path = try nextRequiredArg(&stdout, &args, "--config");
+            config_path = try nextRequiredNonBlankArg(&stdout, &args, "--config");
         } else if (std.mem.eql(u8, arg, "--cluster-id")) {
-            cluster_id = try nextRequiredArg(&stdout, &args, "--cluster-id");
+            cluster_id = try nextRequiredNonBlankArg(&stdout, &args, "--cluster-id");
         } else if (std.mem.eql(u8, arg, "--voters")) {
-            voters_str = try nextRequiredArg(&stdout, &args, "--voters");
+            voters_str = try nextRequiredNonBlankArg(&stdout, &args, "--voters");
         } else if (std.mem.eql(u8, arg, "--workers")) {
             num_workers = try parseRequiredIntArg(usize, &stdout, &args, "--workers");
         } else if (std.mem.eql(u8, arg, "--process-roles")) {
-            const role_text = try nextRequiredArg(&stdout, &args, "--process-roles");
+            const role_text = try nextRequiredNonBlankArg(&stdout, &args, "--process-roles");
             process_roles = ProcessRoles.parse(role_text) catch {
                 try stdout.print("  ERROR: invalid --process-roles '{s}'\n", .{role_text});
                 return error.InvalidConfiguration;
@@ -358,7 +572,8 @@ pub fn main(init: std.process.Init) !void {
             s3_wal_flush_interval = try parseRequiredIntArg(i64, &stdout, &args, "--s3-wal-flush-interval");
             cli_s3_wal_flush_interval_set = true;
         } else if (std.mem.eql(u8, arg, "--s3-wal-flush-mode")) {
-            s3_wal_flush_mode = try nextRequiredArg(&stdout, &args, "--s3-wal-flush-mode");
+            s3_wal_flush_mode = try nextRequiredNonBlankArg(&stdout, &args, "--s3-wal-flush-mode");
+            cli_s3_wal_flush_mode_set = true;
         } else if (std.mem.eql(u8, arg, "--cache-max-size")) {
             cache_max_size = try parseRequiredIntArg(u64, &stdout, &args, "--cache-max-size");
             cli_cache_max_size_set = true;
@@ -369,17 +584,21 @@ pub fn main(init: std.process.Init) !void {
             compaction_interval = try parseRequiredIntArg(i64, &stdout, &args, "--compaction-interval");
             cli_compaction_interval_set = true;
         } else if (std.mem.eql(u8, arg, "--security-protocol")) {
-            security_protocol = try nextRequiredArg(&stdout, &args, "--security-protocol");
+            security_protocol = try nextRequiredNonBlankArg(&stdout, &args, "--security-protocol");
+            cli_security_protocol_set = true;
         } else if (std.mem.eql(u8, arg, "--tls-cert-file")) {
-            tls_cert_file = try nextRequiredArg(&stdout, &args, "--tls-cert-file");
+            tls_cert_file = try nextRequiredNonBlankArg(&stdout, &args, "--tls-cert-file");
         } else if (std.mem.eql(u8, arg, "--tls-key-file")) {
-            tls_key_file = try nextRequiredArg(&stdout, &args, "--tls-key-file");
+            tls_key_file = try nextRequiredNonBlankArg(&stdout, &args, "--tls-key-file");
         } else if (std.mem.eql(u8, arg, "--tls-ca-file")) {
-            tls_ca_file = try nextRequiredArg(&stdout, &args, "--tls-ca-file");
+            tls_ca_file = try nextRequiredNonBlankArg(&stdout, &args, "--tls-ca-file");
         } else if (std.mem.eql(u8, arg, "--tls-client-auth")) {
-            tls_client_auth_str = try nextRequiredArg(&stdout, &args, "--tls-client-auth");
+            tls_client_auth_str = try nextRequiredNonBlankArg(&stdout, &args, "--tls-client-auth");
+            cli_tls_client_auth_set = true;
+        } else if (std.mem.eql(u8, arg, "--tls-principal-mapping-rules")) {
+            tls_principal_mapping_rules = try nextRequiredNonBlankArg(&stdout, &args, "--tls-principal-mapping-rules");
         } else if (std.mem.eql(u8, arg, "--client-telemetry-export-file")) {
-            client_telemetry_export_path = try nextRequiredArg(&stdout, &args, "--client-telemetry-export-file");
+            client_telemetry_export_path = try nextRequiredNonBlankArg(&stdout, &args, "--client-telemetry-export-file");
         } else {
             port = std.fmt.parseInt(u16, arg, 10) catch {
                 try stdout.print("  ERROR: unknown argument '{s}'\n", .{arg});
@@ -402,21 +621,89 @@ pub fn main(init: std.process.Init) !void {
             try stdout.print("  ERROR: Failed to load config '{s}': {}\n", .{ cp, err });
             return error.InvalidConfiguration;
         };
-        if (data_dir == null) data_dir = cfg.getString("log.dirs");
-        if (s3_host == null) s3_host = cfg.getString("s3.endpoint.host");
+        if (!cli_process_roles_set) {
+            if (try configStringStrict(&stdout, &cfg, "process.roles")) |r| {
+                process_roles = ProcessRoles.parse(r) catch {
+                    try stdout.print("  ERROR: invalid process.roles '{s}'\n", .{r});
+                    return error.InvalidConfiguration;
+                };
+            }
+        }
+        const config_listeners = try configStringStrict(&stdout, &cfg, "listeners");
+        const config_advertised_listeners = try configStringStrict(&stdout, &cfg, "advertised.listeners");
+        const config_controller_listener_names = try configListenerNamesStrict(&stdout, &cfg, "controller.listener.names");
+        const config_inter_broker_listener_name = try configListenerNameStrict(&stdout, &cfg, "inter.broker.listener.name");
+        const config_security_protocol = try configSecurityProtocolStrict(&stdout, &cfg, "security.protocol");
+        const config_inter_broker_security_protocol = try configSecurityProtocolStrict(&stdout, &cfg, "security.inter.broker.protocol");
+        if (config_inter_broker_listener_name != null and config_inter_broker_security_protocol != null) {
+            try stdout.print("  ERROR: config 'inter.broker.listener.name' and 'security.inter.broker.protocol' cannot both be set\n", .{});
+            return error.InvalidConfiguration;
+        }
+        const config_listener_security_protocol_map = try configListenerSecurityProtocolMapStrict(&stdout, &cfg, "listener.security.protocol.map");
+        var config_broker_listener: ?config_mod.ListenerEndpoint = null;
+        if (config_listeners) |listeners| {
+            _ = try parseConfigListenerEndpointTextStrict(&stdout, "listeners", listeners, true);
+            if (config_listener_security_protocol_map) |map| {
+                try configListenerSecurityProtocolMapCoversListenersStrict(&stdout, map, listeners);
+            }
+            if (config_advertised_listeners) |advertised| {
+                try configAdvertisedListenersMatchListenersStrict(&stdout, advertised, listeners);
+            }
+            if (config_inter_broker_listener_name) |listener_name| {
+                _ = try configListenerEndpointForNameTextStrict(&stdout, listeners, listener_name, true);
+            }
+            if (process_roles.is_broker) {
+                config_broker_listener = if (config_inter_broker_listener_name) |listener_name|
+                    try configListenerEndpointForNameTextStrict(&stdout, listeners, listener_name, true)
+                else if (config_controller_listener_names) |listener_names|
+                    try configNonControllerListenerEndpointTextStrict(&stdout, listeners, listener_names, true)
+                else
+                    try parseConfigListenerEndpointTextStrict(&stdout, "listeners", listeners, true);
+            }
+            if (process_roles.is_controller) {
+                if (config_controller_listener_names) |listener_names| {
+                    _ = try configControllerListenerEndpointTextStrict(&stdout, listeners, listener_names, true);
+                }
+            }
+        }
+        if (data_dir == null) data_dir = try configStringStrict(&stdout, &cfg, "log.dirs");
+        if (s3_host == null) s3_host = try configStringStrict(&stdout, &cfg, "s3.endpoint.host");
         if (!cli_s3_port_set) try applyConfigPortStrict(&stdout, &cfg, "s3.endpoint.port", &s3_port);
-        s3_bucket = cfg.getStringOr("s3.bucket", s3_bucket);
-        s3_access_key = cfg.getStringOr("s3.access.key", s3_access_key);
-        s3_secret_key = cfg.getStringOr("s3.secret.key", s3_secret_key);
-        if (cfg.getString("s3.scheme")) |s| s3_scheme = parseS3Scheme(s, s3_scheme);
-        s3_region = cfg.getStringOr("s3.region", s3_region);
-        s3_path_style = cfg.getBool("s3.path.style", s3_path_style);
-        if (s3_tls_ca_file == null) s3_tls_ca_file = cfg.getString("s3.tls.ca.file");
-        if (!cli_port_set) try applyConfigPortStrict(&stdout, &cfg, "listeners.port", &port);
+        s3_bucket = try configStringOrStrict(&stdout, &cfg, "s3.bucket", s3_bucket);
+        s3_access_key = try configStringOrStrict(&stdout, &cfg, "s3.access.key", s3_access_key);
+        s3_secret_key = try configStringOrStrict(&stdout, &cfg, "s3.secret.key", s3_secret_key);
+        if (cfg.getString("s3.scheme")) |s| {
+            s3_scheme = parseS3Scheme(s) catch {
+                try stdout.print("  ERROR: config 's3.scheme' must be http or https, got '{s}'\n", .{s});
+                return error.InvalidConfiguration;
+            };
+        }
+        s3_region = try configStringOrStrict(&stdout, &cfg, "s3.region", s3_region);
+        const config_s3_path_style = cfg.getBoolStrict("s3.path.style") catch {
+            try stdout.print("  ERROR: config 's3.path.style' must be true or false\n", .{});
+            return error.InvalidConfiguration;
+        };
+        if (config_s3_path_style) |value| s3_path_style = value;
+        if (s3_tls_ca_file == null) s3_tls_ca_file = try configStringStrict(&stdout, &cfg, "s3.tls.ca.file");
+        if (!cli_port_set and process_roles.is_broker) {
+            if (config_broker_listener) |listener| {
+                port = listener.port;
+            }
+            try applyConfigPortStrict(&stdout, &cfg, "listeners.port", &port);
+        }
         if (!cli_metrics_port_set) try applyConfigPortStrict(&stdout, &cfg, "metrics.port", &metrics_port);
-        if (!cli_node_id_set) try applyConfigNodeIdStrict(&stdout, &cfg, "broker.id", &node_id);
-        cluster_id = cfg.getStringOr("cluster.id", cluster_id);
-        if (voters_str == null) voters_str = cfg.getString("controller.quorum.voters");
+        if (!cli_node_id_set) {
+            try applyConfigNodeIdAliasesStrict(&stdout, &cfg, &node_id);
+        }
+        cluster_id = try configStringOrStrict(&stdout, &cfg, "cluster.id", cluster_id);
+        if (!cli_advertised_host_set) {
+            if (try configStringStrict(&stdout, &cfg, "advertised.host.name")) |h| advertised_host = h;
+            if (config_advertised_listeners) |advertised| {
+                const listener = try parseConfigListenerEndpointTextStrict(&stdout, "advertised.listeners", advertised, false);
+                advertised_host = listener.host;
+            }
+        }
+        if (voters_str == null) voters_str = try configStringStrict(&stdout, &cfg, "controller.quorum.voters");
         // Load S3 WAL and cache config from config file
         if (!cli_s3_wal_batch_size_set) {
             var s3_wal_batch_size_cfg: u64 = @intCast(s3_wal_batch_size);
@@ -424,26 +711,48 @@ pub fn main(init: std.process.Init) !void {
             s3_wal_batch_size = @intCast(s3_wal_batch_size_cfg);
         }
         if (!cli_s3_wal_flush_interval_set) try applyConfigIntStrict(i64, &stdout, &cfg, "s3.wal.flush.interval.ms", &s3_wal_flush_interval);
-        if (cfg.getString("s3.wal.flush.mode")) |m| s3_wal_flush_mode = m;
+        if (!cli_s3_wal_flush_mode_set) {
+            if (try configStringStrict(&stdout, &cfg, "s3.wal.flush.mode")) |m| s3_wal_flush_mode = m;
+        }
         if (!cli_s3_block_cache_size_set) try applyConfigIntStrict(u64, &stdout, &cfg, "s3.block.cache.size", &s3_block_cache_size);
         if (!cli_cache_max_size_set) try applyConfigIntStrict(u64, &stdout, &cfg, "log.cache.max.size", &cache_max_size);
         if (!cli_compaction_interval_set) try applyConfigIntStrict(i64, &stdout, &cfg, "s3.compaction.interval.ms", &compaction_interval);
-        // Process role and controller port from config file (CLI takes precedence)
-        if (!cli_process_roles_set and cfg.getString("process.roles") != null) {
-            const r = cfg.getString("process.roles").?;
-            process_roles = ProcessRoles.parse(r) catch {
-                try stdout.print("  ERROR: invalid process.roles '{s}'\n", .{r});
-                return error.InvalidConfiguration;
-            };
+        if (!cli_controller_port_set) {
+            if (process_roles.is_controller) {
+                if (config_listeners) |listeners| {
+                    if (config_controller_listener_names) |listener_names| {
+                        const listener = try configControllerListenerEndpointTextStrict(&stdout, listeners, listener_names, true);
+                        controller_port = listener.port;
+                    }
+                }
+            }
+            try applyConfigPortStrict(&stdout, &cfg, "controller.listener.port", &controller_port);
         }
-        if (!cli_controller_port_set) try applyConfigPortStrict(&stdout, &cfg, "controller.listener.port", &controller_port);
         // TLS configuration from config file (CLI flags take precedence)
-        if (cfg.getString("security.protocol")) |p| security_protocol = p;
-        if (cfg.getString("ssl.certfile")) |f| tls_cert_file = f;
-        if (cfg.getString("ssl.keyfile")) |f| tls_key_file = f;
-        if (cfg.getString("ssl.cafile")) |f| tls_ca_file = f;
-        if (cfg.getString("ssl.client.auth")) |a| tls_client_auth_str = a;
-        if (client_telemetry_export_path == null) client_telemetry_export_path = cfg.getString("client.telemetry.export.file");
+        if (!cli_security_protocol_set) {
+            if (config_security_protocol) |p| {
+                security_protocol = p;
+            } else if (config_inter_broker_security_protocol) |p| {
+                security_protocol = p;
+            } else if (config_listener_security_protocol_map) |map| {
+                if (config_broker_listener) |listener| {
+                    security_protocol = try configListenerSecurityProtocolForNameStrict(&stdout, map, listener.name);
+                }
+            }
+        }
+        if (tls_cert_file == null) tls_cert_file = try configStringStrict(&stdout, &cfg, "ssl.certfile");
+        if (tls_key_file == null) tls_key_file = try configStringStrict(&stdout, &cfg, "ssl.keyfile");
+        if (tls_ca_file == null) tls_ca_file = try configStringStrict(&stdout, &cfg, "ssl.cafile");
+        if (!cli_tls_client_auth_set) tls_client_auth_str = try configStringOrStrict(&stdout, &cfg, "ssl.client.auth", tls_client_auth_str);
+        if (tls_principal_mapping_rules == null) tls_principal_mapping_rules = try configStringStrict(&stdout, &cfg, "ssl.principal.mapping.rules");
+        if (client_telemetry_export_path == null) client_telemetry_export_path = try configStringStrict(&stdout, &cfg, "client.telemetry.export.file");
+        try applyConfigBoolStrict(&stdout, &cfg, "sasl.enabled", &sasl_enabled);
+        sasl_users = try configSaslUsersOrStrict(&stdout, &cfg, "sasl.users", sasl_users);
+        super_users = try configSuperUsersOrStrict(&stdout, &cfg, "super.users", super_users);
+        try applyConfigBoolStrict(&stdout, &cfg, "allow.everyone.if.no.acl.found", &allow_everyone_if_no_acl);
+        sasl_enabled_mechanisms = try configSaslMechanismsOrStrict(&stdout, &cfg, "sasl.enabled.mechanisms", sasl_enabled_mechanisms);
+        oauth_issuer = try configStringOrStrict(&stdout, &cfg, "sasl.oauthbearer.expected.issuer", oauth_issuer);
+        oauth_audience = try configStringOrStrict(&stdout, &cfg, "sasl.oauthbearer.expected.audience", oauth_audience);
     }
 
     if (num_workers == 0) {
@@ -483,14 +792,24 @@ pub fn main(init: std.process.Init) !void {
     posix.sigaction(posix.SIG.TERM, &sa, null);
 
     // Parse WAL flush mode string to enum
-    const wal_flush_mode: handler.Broker.WalFlushMode = if (std.mem.eql(u8, s3_wal_flush_mode, "async"))
-        .async_flush
-    else if (std.mem.eql(u8, s3_wal_flush_mode, "group_commit"))
-        .group_commit
-    else
-        .sync;
-    const storage_data_dir = firstLogDir(data_dir);
-    const replica_directory_ids = Broker.deriveReplicaDirectoryIds(data_dir);
+    const wal_flush_mode = parseWalFlushMode(s3_wal_flush_mode) catch {
+        try stdout.print("  ERROR: s3.wal.flush.mode/--s3-wal-flush-mode must be sync, async, or group_commit, got '{s}'\n", .{s3_wal_flush_mode});
+        return error.InvalidConfiguration;
+    };
+    const tls_protocol = parseSecurityProtocol(security_protocol) catch {
+        try stdout.print("  ERROR: security.protocol/--security-protocol must be plaintext, ssl, sasl_plaintext, or sasl_ssl, got '{s}'\n", .{security_protocol});
+        return error.InvalidConfiguration;
+    };
+    const client_auth = parseTlsClientAuth(tls_client_auth_str) catch {
+        try stdout.print("  ERROR: ssl.client.auth/--tls-client-auth must be none, requested, or required, got '{s}'\n", .{tls_client_auth_str});
+        return error.InvalidConfiguration;
+    };
+    if (tls_protocol == .sasl_plaintext or tls_protocol == .sasl_ssl) sasl_enabled = true;
+    const storage_data_dir = try firstLogDirStrict(&stdout, data_dir);
+    const replica_directory_ids = Broker.deriveReplicaDirectoryIds(data_dir) catch {
+        try stdout.print("  ERROR: log.dirs/--data-dir must contain comma-separated nonblank directories\n", .{});
+        return error.InvalidConfiguration;
+    };
 
     // ═══════════════════════════════════════════════════════════
     // CONTROLLER COMPONENTS (if controller role)
@@ -510,7 +829,7 @@ pub fn main(init: std.process.Init) !void {
             try ctrl.raft_state.addVoter(node_id);
         } else {
             raft_pool = RaftClientPool.init(alloc);
-            parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?) catch |err| {
+            parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, controller_port, &raft_pool.?) catch |err| {
                 try stdout.print("  ERROR: Invalid controller quorum voters '{s}': {}\n", .{ voters_str.?, err });
                 return error.InvalidConfiguration;
             };
@@ -539,7 +858,7 @@ pub fn main(init: std.process.Init) !void {
         if (ctrl.raft_state.quorumSize() <= 1 and ctrl.raft_state.role == .unattached) {
             _ = ctrl.raft_state.startElection() catch |err| {
                 try stdout.print("  ERROR: Failed to persist Raft epoch/vote metadata: {}\n", .{err});
-                return;
+                return error.ControllerElectionPersistenceFailed;
             };
             ctrl.raft_state.becomeLeader();
             log.info("Single-node controller elected before serving requests", .{});
@@ -583,6 +902,13 @@ pub fn main(init: std.process.Init) !void {
             .compaction_interval_ms = compaction_interval,
             .client_telemetry_export_path = client_telemetry_export_path,
             .replica_directory_ids = replica_directory_ids.slice(),
+            .sasl_enabled = sasl_enabled,
+            .sasl_users = sasl_users,
+            .super_users = super_users,
+            .allow_everyone_if_no_acl = allow_everyone_if_no_acl,
+            .sasl_enabled_mechanisms = sasl_enabled_mechanisms,
+            .oauth_issuer = oauth_issuer,
+            .oauth_audience = oauth_audience,
         });
         broker = brk;
         // Re-wire internal pointers that became stale after the struct copy
@@ -702,8 +1028,8 @@ pub fn main(init: std.process.Init) !void {
             log.info("Election loop: single-node mode (no RaftClientPool)", .{});
         }
         election_thread = std.Thread.spawn(.{}, ElectionLoop.run, .{&election_state}) catch |err| {
-            try stdout.print("  WARNING: Failed to start election loop: {}\n", .{err});
-            return;
+            try stdout.print("  ERROR: Failed to start election loop: {}\n", .{err});
+            return error.ElectionLoopStartFailed;
         };
     }
     defer if (election_thread) |t| {
@@ -715,8 +1041,8 @@ pub fn main(init: std.process.Init) !void {
     var mc_thread: ?std.Thread = null;
     if (metadata_client) |mc| {
         mc_thread = std.Thread.spawn(.{}, MetadataClient.run, .{mc}) catch |err| {
-            try stdout.print("  WARNING: Failed to start metadata client: {}\n", .{err});
-            return;
+            try stdout.print("  ERROR: Failed to start metadata client: {}\n", .{err});
+            return error.MetadataClientStartFailed;
         };
     }
     defer if (mc_thread) |t| {
@@ -768,8 +1094,8 @@ pub fn main(init: std.process.Init) !void {
             var ctrl_server = try Server.init(alloc, "0.0.0.0", controller_port, &handler_routing.controllerHandleRequest, num_workers);
             global_controller_server = &ctrl_server;
             ctrl_thread = std.Thread.spawn(.{}, Server.serve, .{&ctrl_server}) catch |err| {
-                try stdout.print("  WARNING: Failed to start controller server: {}\n", .{err});
-                return;
+                try stdout.print("  ERROR: Failed to start controller server: {}\n", .{err});
+                return error.ControllerServerStartFailed;
             };
         }
     }
@@ -781,28 +1107,13 @@ pub fn main(init: std.process.Init) !void {
     // Main server on the main thread
     if (process_roles.is_broker) {
         // Initialize TLS if configured
-        const tls_protocol: TlsConfig.SecurityProtocol = if (std.mem.eql(u8, security_protocol, "ssl"))
-            .ssl
-        else if (std.mem.eql(u8, security_protocol, "sasl_ssl"))
-            .sasl_ssl
-        else if (std.mem.eql(u8, security_protocol, "sasl_plaintext"))
-            .sasl_plaintext
-        else
-            .plaintext;
-
-        const client_auth: TlsConfig.ClientAuth = if (std.mem.eql(u8, tls_client_auth_str, "required"))
-            .required
-        else if (std.mem.eql(u8, tls_client_auth_str, "requested"))
-            .requested
-        else
-            .none;
-
         var tls_config = TlsConfig{
             .protocol = tls_protocol,
             .cert_file = tls_cert_file,
             .key_file = tls_key_file,
             .ca_file = tls_ca_file,
             .client_auth = client_auth,
+            .principal_mapping_rules = tls_principal_mapping_rules,
         };
         tls_config.enabled = tls_config.needsTls();
 
@@ -811,7 +1122,7 @@ pub fn main(init: std.process.Init) !void {
             tls_ctx = TlsContext.init(alloc, tls_config) catch |err| {
                 try stdout.print("  ERROR: Failed to initialize TLS: {s}\n", .{@errorName(err)});
                 try stdout.print("  Make sure cert and key files are valid PEM format.\n", .{});
-                return;
+                return error.TlsInitializationFailed;
             };
             try stdout.print("  TLS enabled: protocol={s}\n", .{security_protocol});
         }
@@ -922,9 +1233,11 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
     log.info("Graceful shutdown: cleanup sequence complete", .{});
 }
 
-fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClientPool) !void {
+fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, local_controller_port: u16, pool: *RaftClientPool) !void {
     // Format: "0@localhost:9092,1@host2:9093"
     try config_mod.validateControllerVoterSet(raft.allocator, voters);
+    if (!(try config_mod.controllerVoterSetContainsNodeIdStrict(voters, raft.node_id))) return error.LocalControllerVoterMissing;
+    if (!(try config_mod.controllerVoterSetLocalPortMatchesStrict(voters, raft.node_id, local_controller_port))) return error.LocalControllerVoterPortMismatch;
 
     var parsed_any = false;
     var entries = std.mem.splitScalar(u8, voters, ',');

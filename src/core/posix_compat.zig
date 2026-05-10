@@ -100,6 +100,7 @@ pub fn send(fd: posix.fd_t, bytes: []const u8, flags: u32) !usize {
         switch (linux.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
+            .ACCES => return error.AccessDenied,
             .AGAIN => return error.WouldBlock,
             .BADF => return error.Unexpected,
             .CONNRESET => return error.ConnectionResetByPeer,
@@ -112,6 +113,7 @@ pub fn send(fd: posix.fd_t, bytes: []const u8, flags: u32) !usize {
             .NOMEM => return error.SystemResources,
             .NOTCONN => return error.SocketNotConnected,
             .NOTSOCK => return error.FileDescriptorNotASocket,
+            .PERM => return error.PermissionDenied,
             .PIPE => return error.BrokenPipe,
             else => |err| return posix.unexpectedErrno(err),
         }

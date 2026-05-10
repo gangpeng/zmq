@@ -37,6 +37,27 @@ def strip_comments(text):
     return '\n'.join(lines)
 
 
+def reject_nonstandard_json_constant(value):
+    raise ValueError(f"non-standard JSON constant {value!r} is not allowed in strict JSON")
+
+
+def reject_duplicate_json_object_keys(pairs):
+    parsed = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON object key {key!r} is not allowed in strict JSON")
+        parsed[key] = value
+    return parsed
+
+
+def parse_schema_json(text):
+    return json.loads(
+        strip_comments(text),
+        parse_constant=reject_nonstandard_json_constant,
+        object_pairs_hook=reject_duplicate_json_object_keys,
+    )
+
+
 def parse_version_range(spec):
     """Parse version spec like '0+', '3-7', '0-12'."""
     if spec is None:
@@ -316,9 +337,7 @@ def main():
 
     for json_file in sorted(schema_dir.glob('*.json')):
         try:
-            text = json_file.read_text()
-            text = strip_comments(text)
-            schema = json.loads(text)
+            schema = parse_schema_json(json_file.read_text())
             schemas.append(schema)
 
             name = schema['name']
@@ -338,6 +357,8 @@ def main():
 
     print(f'Generated {generated} files, {errors} errors')
     print(f'Output directory: {output_dir}')
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

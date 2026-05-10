@@ -275,6 +275,15 @@ pub const generated_request_apis = [_]GeneratedRequestApi{
     .{ .key = 602, .name = "AutomqUpdateGroupRequest", .min = 0, .max = 0 },
 };
 
+/// ZooKeeper-era inter-broker RPCs that remain generated for protocol catalog
+/// coverage but are not advertised or dispatched in KRaft/AutoMQ mode.
+pub const legacy_inter_broker_request_api_keys = [_]i16{
+    4, // LeaderAndIsr
+    5, // StopReplica
+    6, // UpdateMetadata
+    7, // ControlledShutdown
+};
+
 /// API keys with broker handler switch cases.
 ///
 /// Version support still comes only from broker_supported_apis. This table makes
@@ -796,18 +805,17 @@ test "generated non-broker request APIs are not broker advertised or dispatched"
 }
 
 test "legacy inter-broker RPCs are generated-only in KRaft broker mode" {
-    try testing.expect(findGeneratedRequest(4) != null);
-    try testing.expect(findGeneratedRequest(5) != null);
-    try testing.expect(findGeneratedRequest(6) != null);
-    try testing.expect(findGeneratedRequest(7) != null);
-    try testing.expect(findBrokerSupport(4) == null);
-    try testing.expect(findBrokerSupport(5) == null);
-    try testing.expect(findBrokerSupport(6) == null);
-    try testing.expect(findBrokerSupport(7) == null);
-    try testing.expect(!hasBrokerHandler(4));
-    try testing.expect(!hasBrokerHandler(5));
-    try testing.expect(!hasBrokerHandler(6));
-    try testing.expect(!hasBrokerHandler(7));
+    var previous: ?i16 = null;
+    for (legacy_inter_broker_request_api_keys) |key| {
+        if (previous) |prev| try testing.expect(key > prev);
+        previous = key;
+
+        try testing.expect(findGeneratedRequest(key) != null);
+        try testing.expect(findBrokerSupport(key) == null);
+        try testing.expect(findControllerSupport(key) == null);
+        try testing.expect(!hasBrokerHandler(key));
+        try testing.expect(!hasControllerHandler(key));
+    }
 }
 
 test "canonical API support covers corrected Kafka and AutoMQ extension keys" {

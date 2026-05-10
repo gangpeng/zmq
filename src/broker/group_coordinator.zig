@@ -35,6 +35,14 @@ pub const GroupCoordinator = struct {
     /// Wired by the Broker after initialization.
     metrics: ?*MetricRegistry = null,
 
+    pub const GroupStateCounts = struct {
+        empty: usize = 0,
+        preparing_rebalance: usize = 0,
+        completing_rebalance: usize = 0,
+        stable: usize = 0,
+        dead: usize = 0,
+    };
+
     pub fn init(alloc: Allocator) GroupCoordinator {
         return .{
             .groups = std.StringHashMap(ConsumerGroup).init(alloc),
@@ -1038,8 +1046,9 @@ pub const GroupCoordinator = struct {
         try self.committed_offsets.put(key, value);
         value_inserted = true;
 
-        // Emit consumer lag metric when both metrics registry and LEO are available
+        // Emit coordinator metrics when a registry is wired by the broker.
         if (self.metrics) |m| {
+            m.incrementCounter("kafka_server_group_coordinator_metrics_offset_commit_count_total");
             var part_buf: [16]u8 = undefined;
             const part_str = std.fmt.bufPrint(&part_buf, "{d}", .{partition}) catch return;
             if (log_end_offset) |leo| {
@@ -1171,6 +1180,25 @@ pub const GroupCoordinator = struct {
 
     pub fn groupCount(self: *const GroupCoordinator) usize {
         return self.groups.count();
+    }
+
+    pub fn offsetCount(self: *const GroupCoordinator) usize {
+        return self.committed_offsets.count();
+    }
+
+    pub fn groupStateCounts(self: *const GroupCoordinator) GroupStateCounts {
+        var counts = GroupStateCounts{};
+        var it = self.groups.valueIterator();
+        while (it.next()) |group| {
+            switch (group.state) {
+                .empty => counts.empty += 1,
+                .preparing_rebalance => counts.preparing_rebalance += 1,
+                .completing_rebalance => counts.completing_rebalance += 1,
+                .stable => counts.stable += 1,
+                .dead => counts.dead += 1,
+            }
+        }
+        return counts;
     }
 
     /// Serialize group membership state for persistence.
@@ -1305,6 +1333,9 @@ test "GroupCoordinator join group" {
     try testing.expect(result.is_leader);
     try testing.expectEqual(@as(i32, 1), result.generation_id);
     try testing.expectEqual(@as(usize, 1), coord.groupCount());
+    const counts = coord.groupStateCounts();
+    try testing.expectEqual(@as(usize, 1), counts.preparing_rebalance);
+    try testing.expectEqual(@as(usize, 0), counts.stable);
 }
 
 test "GroupCoordinator joinGroupWithProtocol stores protocol metadata" {
@@ -1407,6 +1438,7 @@ test "GroupCoordinator offset commit and fetch" {
 
     try coord.commitOffset("g1", "topic-a", 0, 42);
     try coord.commitOffset("g1", "topic-a", 1, 100);
+    try testing.expectEqual(@as(usize, 2), coord.offsetCount());
 
     const offset0 = try coord.fetchOffset("g1", "topic-a", 0);
     try testing.expectEqual(@as(i64, 42), offset0.?);

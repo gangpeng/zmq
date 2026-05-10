@@ -24,6 +24,11 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerCounter("kafka_server_fetch_requests_total", "Total fetch requests");
     try registry.registerCounter("kafka_server_produce_throttle_total", "Total throttled produce requests");
     try registry.registerCounter("kafka_server_fetch_throttle_total", "Total throttled fetch requests");
+    try registry.registerGauge("kafka_server_quota_manager_metrics_client_quota_count", "Number of configured client quota overrides");
+    try registry.registerGauge("kafka_server_quota_manager_metrics_default_window_count", "Number of clients currently tracked by default quota windows");
+    try registry.registerGauge("kafka_server_quota_manager_metrics_default_produce_byte_rate", "Default produce byte-rate quota");
+    try registry.registerGauge("kafka_server_quota_manager_metrics_default_fetch_byte_rate", "Default fetch byte-rate quota");
+    try registry.registerGauge("kafka_server_quota_manager_metrics_default_request_rate", "Default request-rate quota");
     for (api_support.broker_supported_apis) |api| {
         try registerCounterIfMissing(registry, api.metric, "Total requests for a broker API");
     }
@@ -39,6 +44,11 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("Kafka_group_count", "AutoMQ-compatible consumer group count");
     try registry.registerGauge("Kafka_partition_count", "AutoMQ-compatible local partition count");
     try registry.registerGauge("Kafka_partition_total_count", "AutoMQ-compatible cluster partition count");
+    try registry.registerGauge("automq_object_manager_stream_count", "AutoMQ-compatible active stream metadata count");
+    try registry.registerGauge("automq_object_manager_stream_set_object_count", "AutoMQ-compatible stream-set object metadata count");
+    try registry.registerGauge("automq_object_manager_stream_object_count", "AutoMQ-compatible stream object metadata count");
+    try registry.registerGauge("automq_object_manager_prepared_object_count", "AutoMQ-compatible prepared object metadata count");
+    try registry.registerGauge("automq_object_manager_mark_destroyed_object_count", "AutoMQ-compatible mark-destroyed object metadata count");
     try registry.registerGauge("kafka_controller_kafkacontroller_activecontrollercount", "JMX-compatible active controller count");
     try registry.registerGauge("kafka_controller_kafkacontroller_globaltopiccount", "JMX-compatible cluster-wide topic count observed by the controller");
     try registry.registerGauge("kafka_controller_kafkacontroller_globalpartitioncount", "JMX-compatible cluster-wide partition count observed by the controller");
@@ -46,11 +56,47 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("kafka_controller_kafkacontroller_fencedbrokercount", "JMX-compatible fenced broker count observed by the controller");
     try registry.registerGauge("kafka_controller_kafkacontroller_offlinepartitionscount", "JMX-compatible offline partition count observed by the controller");
     try registry.registerGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", "JMX-compatible count of partitions whose current leader is not the preferred replica");
+    try registry.registerCounter("kafka_controller_controllerstats_leaderelectionrateandtimems_total", "JMX-compatible total leader election events");
+    try registry.registerCounter("kafka_controller_controllerstats_uncleanleaderelectionspersec_total", "JMX-compatible total unclean leader election events");
     try registry.registerGauge("kafka_log_logmanager_offlinelogdirectorycount", "JMX-compatible offline log directory count");
     try registry.registerCounter("kafka_server_replicamanager_failedisrupdatesperseccount_total", "JMX-compatible total failed ISR update events");
     try registry.registerGauge("kafka_server_kafkaserver_brokerstate", "JMX-compatible broker lifecycle state");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numgroups", "JMX-compatible consumer group count");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numoffsets", "JMX-compatible committed consumer offset count");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numgroupsempty", "JMX-compatible empty consumer group count");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numgroupspreparingrebalance", "JMX-compatible preparing-rebalance consumer group count");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numgroupscompletingrebalance", "JMX-compatible completing-rebalance consumer group count");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numgroupsstable", "JMX-compatible stable consumer group count");
+    try registry.registerGauge("kafka_server_groupmetadatamanager_numgroupsdead", "JMX-compatible dead consumer group count");
+    try registry.registerLabeledGauge(
+        "kafka_server_group_coordinator_metrics_partition_count",
+        "JMX-compatible group coordinator partition count by state",
+        &.{"state"},
+    );
+    try registry.registerLabeledGauge(
+        "kafka_server_group_coordinator_metrics_group_count",
+        "JMX-compatible group coordinator group count by protocol",
+        &.{"protocol"},
+    );
+    try registry.registerCounter("kafka_server_group_coordinator_metrics_offset_commit_count_total", "JMX-compatible committed offset write count");
+    try registry.registerGauge("kafka_server_group_coordinator_metrics_event_queue_size", "JMX-compatible group coordinator event queue depth");
+    try registry.registerGauge("kafka_server_group_coordinator_metrics_thread_idle_ratio_avg", "JMX-compatible group coordinator thread idle ratio");
+    try registry.registerLabeledGauge(
+        "kafka_server_transaction_coordinator_metrics_transaction_count",
+        "JMX-compatible transaction coordinator transaction count by state",
+        &.{"state"},
+    );
+    try registry.registerGauge("kafka_server_transaction_coordinator_metrics_transactional_id_count", "JMX-compatible active transactional ID count");
+    try registry.registerGauge("kafka_server_transaction_coordinator_metrics_registered_partition_count", "JMX-compatible registered transaction partition count");
+    try registry.registerLabeledGauge(
+        "kafka_server_transaction_coordinator_metrics_partition_count",
+        "JMX-compatible transaction coordinator partition count by state",
+        &.{"state"},
+    );
     try registry.registerGauge("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent", "JMX-compatible request handler idle fraction");
     try registry.registerGauge("kafka_network_socketserver_networkprocessoravgidlepercent", "JMX-compatible network processor idle fraction");
+    try registry.registerGauge("kafka_network_socketserver_connectioncount", "JMX-compatible active socket-server connection count");
+    try registry.registerCounter("kafka_network_socketserver_expiredconnectionskilledcount_total", "JMX-compatible idle or handshake-timeout connections killed by the socket server");
     try registry.registerGauge("kafka_server_replicamanager_partitioncount", "JMX-compatible local partition count");
     try registry.registerGauge("kafka_server_replicamanager_leadercount", "JMX-compatible local leader partition count");
     try registry.registerGauge("kafka_server_replicamanager_underreplicatedpartitions", "JMX-compatible under-replicated partition count");
@@ -232,6 +278,13 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.counters.contains("kafka_server_requests_total"));
     try testing.expect(registry.gauges.contains("kafka_server_active_connections"));
     try testing.expect(registry.histograms.contains("kafka_server_request_latency_seconds"));
+    try testing.expect(registry.counters.contains("kafka_server_produce_throttle_total"));
+    try testing.expect(registry.counters.contains("kafka_server_fetch_throttle_total"));
+    try testing.expect(registry.gauges.contains("kafka_server_quota_manager_metrics_client_quota_count"));
+    try testing.expect(registry.gauges.contains("kafka_server_quota_manager_metrics_default_window_count"));
+    try testing.expect(registry.gauges.contains("kafka_server_quota_manager_metrics_default_produce_byte_rate"));
+    try testing.expect(registry.gauges.contains("kafka_server_quota_manager_metrics_default_fetch_byte_rate"));
+    try testing.expect(registry.gauges.contains("kafka_server_quota_manager_metrics_default_request_rate"));
     // Sprint 5: per-API error counter, consumer lag, active connections
     try testing.expect(registry.labeled_counter_meta.contains("Kafka_request_count_total"));
     try testing.expect(registry.labeled_counter_meta.contains("Kafka_request_error_count_total"));
@@ -243,6 +296,11 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("Kafka_group_count"));
     try testing.expect(registry.gauges.contains("Kafka_partition_count"));
     try testing.expect(registry.gauges.contains("Kafka_partition_total_count"));
+    try testing.expect(registry.gauges.contains("automq_object_manager_stream_count"));
+    try testing.expect(registry.gauges.contains("automq_object_manager_stream_set_object_count"));
+    try testing.expect(registry.gauges.contains("automq_object_manager_stream_object_count"));
+    try testing.expect(registry.gauges.contains("automq_object_manager_prepared_object_count"));
+    try testing.expect(registry.gauges.contains("automq_object_manager_mark_destroyed_object_count"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_activecontrollercount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_globaltopiccount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_globalpartitioncount"));
@@ -250,11 +308,31 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_fencedbrokercount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_offlinepartitionscount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_preferredreplicaimbalancecount"));
+    try testing.expect(registry.counters.contains("kafka_controller_controllerstats_leaderelectionrateandtimems_total"));
+    try testing.expect(registry.counters.contains("kafka_controller_controllerstats_uncleanleaderelectionspersec_total"));
     try testing.expect(registry.gauges.contains("kafka_log_logmanager_offlinelogdirectorycount"));
     try testing.expect(registry.counters.contains("kafka_server_replicamanager_failedisrupdatesperseccount_total"));
     try testing.expect(registry.gauges.contains("kafka_server_kafkaserver_brokerstate"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numgroups"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numoffsets"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numgroupsempty"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numgroupspreparingrebalance"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numgroupscompletingrebalance"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numgroupsstable"));
+    try testing.expect(registry.gauges.contains("kafka_server_groupmetadatamanager_numgroupsdead"));
+    try testing.expect(registry.labeled_gauge_meta.contains("kafka_server_group_coordinator_metrics_partition_count"));
+    try testing.expect(registry.labeled_gauge_meta.contains("kafka_server_group_coordinator_metrics_group_count"));
+    try testing.expect(registry.counters.contains("kafka_server_group_coordinator_metrics_offset_commit_count_total"));
+    try testing.expect(registry.gauges.contains("kafka_server_group_coordinator_metrics_event_queue_size"));
+    try testing.expect(registry.gauges.contains("kafka_server_group_coordinator_metrics_thread_idle_ratio_avg"));
+    try testing.expect(registry.labeled_gauge_meta.contains("kafka_server_transaction_coordinator_metrics_transaction_count"));
+    try testing.expect(registry.gauges.contains("kafka_server_transaction_coordinator_metrics_transactional_id_count"));
+    try testing.expect(registry.gauges.contains("kafka_server_transaction_coordinator_metrics_registered_partition_count"));
+    try testing.expect(registry.labeled_gauge_meta.contains("kafka_server_transaction_coordinator_metrics_partition_count"));
     try testing.expect(registry.gauges.contains("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent"));
     try testing.expect(registry.gauges.contains("kafka_network_socketserver_networkprocessoravgidlepercent"));
+    try testing.expect(registry.gauges.contains("kafka_network_socketserver_connectioncount"));
+    try testing.expect(registry.counters.contains("kafka_network_socketserver_expiredconnectionskilledcount_total"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_partitioncount"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_leadercount"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_underreplicatedpartitions"));
@@ -320,8 +398,36 @@ test "registerBrokerMetrics new JMX gauges export with HELP and TYPE" {
     registry.setGauge("kafka_controller_kafkacontroller_fencedbrokercount", 1.0);
     registry.setGauge("kafka_controller_kafkacontroller_offlinepartitionscount", 0.0);
     registry.setGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", 0.0);
+    registry.incrementCounter("kafka_controller_controllerstats_leaderelectionrateandtimems_total");
+    registry.incrementCounter("kafka_controller_controllerstats_uncleanleaderelectionspersec_total");
     registry.setGauge("kafka_log_logmanager_offlinelogdirectorycount", 0.0);
     registry.incrementCounter("kafka_server_replicamanager_failedisrupdatesperseccount_total");
+    registry.incrementCounter("kafka_server_produce_throttle_total");
+    registry.incrementCounter("kafka_server_fetch_throttle_total");
+    registry.setGauge("kafka_server_quota_manager_metrics_client_quota_count", 2.0);
+    registry.setGauge("kafka_server_quota_manager_metrics_default_window_count", 3.0);
+    registry.setGauge("kafka_server_quota_manager_metrics_default_produce_byte_rate", 1000.0);
+    registry.setGauge("kafka_server_quota_manager_metrics_default_fetch_byte_rate", 2000.0);
+    registry.setGauge("kafka_server_quota_manager_metrics_default_request_rate", 50.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numgroups", 2.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numoffsets", 5.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numgroupsempty", 0.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numgroupspreparingrebalance", 1.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numgroupscompletingrebalance", 0.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numgroupsstable", 1.0);
+    registry.setGauge("kafka_server_groupmetadatamanager_numgroupsdead", 0.0);
+    registry.setLabeledGauge("kafka_server_group_coordinator_metrics_partition_count", &.{"active"}, 3.0);
+    registry.setLabeledGauge("kafka_server_group_coordinator_metrics_partition_count", &.{"failed"}, 0.0);
+    registry.setLabeledGauge("kafka_server_group_coordinator_metrics_group_count", &.{"classic"}, 2.0);
+    registry.incrementCounter("kafka_server_group_coordinator_metrics_offset_commit_count_total");
+    registry.setGauge("kafka_server_group_coordinator_metrics_event_queue_size", 0.0);
+    registry.setGauge("kafka_server_group_coordinator_metrics_thread_idle_ratio_avg", 1.0);
+    registry.setLabeledGauge("kafka_server_transaction_coordinator_metrics_transaction_count", &.{"empty"}, 1.0);
+    registry.setLabeledGauge("kafka_server_transaction_coordinator_metrics_transaction_count", &.{"ongoing"}, 2.0);
+    registry.setGauge("kafka_server_transaction_coordinator_metrics_transactional_id_count", 2.0);
+    registry.setGauge("kafka_server_transaction_coordinator_metrics_registered_partition_count", 4.0);
+    registry.setLabeledGauge("kafka_server_transaction_coordinator_metrics_partition_count", &.{"active"}, 1.0);
+    registry.setLabeledGauge("kafka_server_transaction_coordinator_metrics_partition_count", &.{"failed"}, 0.0);
 
     const output = try registry.exportPrometheus(testing.allocator);
     defer testing.allocator.free(output);
@@ -335,9 +441,39 @@ test "registerBrokerMetrics new JMX gauges export with HELP and TYPE" {
         "kafka_controller_kafkacontroller_fencedbrokercount 1",
         "kafka_controller_kafkacontroller_offlinepartitionscount 0",
         "kafka_controller_kafkacontroller_preferredreplicaimbalancecount 0",
+        "# TYPE kafka_controller_controllerstats_leaderelectionrateandtimems_total counter",
+        "kafka_controller_controllerstats_leaderelectionrateandtimems_total 1",
+        "# TYPE kafka_controller_controllerstats_uncleanleaderelectionspersec_total counter",
+        "kafka_controller_controllerstats_uncleanleaderelectionspersec_total 1",
         "kafka_log_logmanager_offlinelogdirectorycount 0",
         "# TYPE kafka_server_replicamanager_failedisrupdatesperseccount_total counter",
         "kafka_server_replicamanager_failedisrupdatesperseccount_total 1",
+        "kafka_server_produce_throttle_total 1",
+        "kafka_server_fetch_throttle_total 1",
+        "kafka_server_quota_manager_metrics_client_quota_count 2",
+        "kafka_server_quota_manager_metrics_default_window_count 3",
+        "kafka_server_quota_manager_metrics_default_produce_byte_rate 1000",
+        "kafka_server_quota_manager_metrics_default_fetch_byte_rate 2000",
+        "kafka_server_quota_manager_metrics_default_request_rate 50",
+        "kafka_server_groupmetadatamanager_numgroups 2",
+        "kafka_server_groupmetadatamanager_numoffsets 5",
+        "kafka_server_groupmetadatamanager_numgroupsempty 0",
+        "kafka_server_groupmetadatamanager_numgroupspreparingrebalance 1",
+        "kafka_server_groupmetadatamanager_numgroupscompletingrebalance 0",
+        "kafka_server_groupmetadatamanager_numgroupsstable 1",
+        "kafka_server_groupmetadatamanager_numgroupsdead 0",
+        "kafka_server_group_coordinator_metrics_partition_count{state=\"active\"} 3",
+        "kafka_server_group_coordinator_metrics_partition_count{state=\"failed\"} 0",
+        "kafka_server_group_coordinator_metrics_group_count{protocol=\"classic\"} 2",
+        "kafka_server_group_coordinator_metrics_offset_commit_count_total 1",
+        "kafka_server_group_coordinator_metrics_event_queue_size 0",
+        "kafka_server_group_coordinator_metrics_thread_idle_ratio_avg 1",
+        "kafka_server_transaction_coordinator_metrics_transaction_count{state=\"empty\"} 1",
+        "kafka_server_transaction_coordinator_metrics_transaction_count{state=\"ongoing\"} 2",
+        "kafka_server_transaction_coordinator_metrics_transactional_id_count 2",
+        "kafka_server_transaction_coordinator_metrics_registered_partition_count 4",
+        "kafka_server_transaction_coordinator_metrics_partition_count{state=\"active\"} 1",
+        "kafka_server_transaction_coordinator_metrics_partition_count{state=\"failed\"} 0",
     };
     for (expected) |needle| {
         try testing.expect(std.mem.indexOf(u8, output, needle) != null);

@@ -18,10 +18,14 @@ pub fn main() !void {
     try benchByteBuffer(stdout);
     try benchPartitionStoreMemory(stdout);
     try benchPartitionStoreS3Wal(stdout);
-    try benchLiveS3Provider(stdout);
+    const live_s3_ran = try benchLiveS3Provider(stdout);
     try benchPartitionStoreMemoryGrowth(stdout);
 
     try stdout.print("\n=== Benchmarks complete ===\n", .{});
+    try stdout.print("ok: local benchmark gate source=command\n", .{});
+    if (live_s3_ran) {
+        try stdout.print("ok: live-S3 benchmark gate source=command\n", .{});
+    }
 }
 
 const BenchmarkWriter = struct {
@@ -152,37 +156,115 @@ fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
     return getenv(name) orelse default;
 }
 
-fn envBool(name: [:0]const u8, default: bool) bool {
-    const value = getenv(name) orelse return default;
-    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes")) {
-        return true;
+fn settingUsesPlaceholder(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return trimmed.len == 0 or
+        std.ascii.eqlIgnoreCase(trimmed, "...") or
+        std.ascii.eqlIgnoreCase(trimmed, "placeholder") or
+        std.ascii.eqlIgnoreCase(trimmed, "required") or
+        std.ascii.eqlIgnoreCase(trimmed, "tbd") or
+        std.ascii.eqlIgnoreCase(trimmed, "todo") or
+        std.mem.startsWith(u8, trimmed, "/path/to/") or
+        hasAngleBracketPlaceholder(trimmed);
+}
+
+fn hasAngleBracketPlaceholder(value: []const u8) bool {
+    const start = std.mem.indexOfScalar(u8, value, '<') orelse return false;
+    if (start + 1 >= value.len) return false;
+    const rest = value[start + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, '>') orelse return false;
+    return end > 0;
+}
+
+fn requireLiveS3Setting(name: []const u8, value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (settingUsesPlaceholder(trimmed)) {
+        std.debug.print("live-S3 benchmark setting {s} must not be blank or placeholder\n", .{name});
+        return error.InvalidLiveS3BenchmarkConfig;
     }
-    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no")) {
-        return false;
+    return trimmed;
+}
+
+test "live-S3 benchmark settings reject blank and placeholder values" {
+    try std.testing.expectError(error.InvalidLiveS3BenchmarkConfig, requireLiveS3Setting("ZMQ_S3_ENDPOINT", ""));
+    try std.testing.expectError(error.InvalidLiveS3BenchmarkConfig, requireLiveS3Setting("ZMQ_S3_BUCKET", "placeholder"));
+    try std.testing.expectError(error.InvalidLiveS3BenchmarkConfig, requireLiveS3Setting("ZMQ_S3_ACCESS_KEY", " /path/to/access-key "));
+    try std.testing.expectError(error.InvalidLiveS3BenchmarkConfig, requireLiveS3Setting("ZMQ_S3_ENDPOINT", " <host>:9443 "));
+    try std.testing.expectEqualStrings("zmq-live-bench", try requireLiveS3Setting("ZMQ_S3_BUCKET", " zmq-live-bench "));
+}
+
+fn optionalLiveS3Setting(name: [:0]const u8) !?[]const u8 {
+    const value = getenv(name) orelse return null;
+    return try requireLiveS3Setting(name, value);
+}
+
+fn liveS3Port(name: [:0]const u8, default: u16) !u16 {
+    const value = getenv(name) orelse return default;
+    const trimmed = try requireLiveS3Setting(name, value);
+    const parsed = std.fmt.parseInt(u16, trimmed, 10) catch {
+        std.debug.print("live-S3 benchmark setting {s} must be an integer\n", .{name});
+        return error.InvalidLiveS3BenchmarkConfig;
+    };
+    if (parsed == 0) {
+        std.debug.print("live-S3 benchmark setting {s} must be positive\n", .{name});
+        return error.InvalidLiveS3BenchmarkConfig;
     }
-    return default;
+    return parsed;
 }
 
-fn envU16(name: [:0]const u8, default: u16) u16 {
-    const value = getenv(name) orelse return default;
-    return std.fmt.parseInt(u16, value, 10) catch default;
+fn benchmarkSetting(name: []const u8, value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (settingUsesPlaceholder(trimmed)) {
+        std.debug.print("benchmark setting {s} must not be blank or placeholder\n", .{name});
+        return error.InvalidBenchmarkConfig;
+    }
+    return trimmed;
 }
 
-fn envUsize(name: [:0]const u8, default: usize) usize {
+fn benchmarkUsize(name: [:0]const u8, default: usize) !usize {
     const value = getenv(name) orelse return default;
-    return std.fmt.parseInt(usize, value, 10) catch default;
+    const trimmed = try benchmarkSetting(name, value);
+    const parsed = std.fmt.parseInt(usize, trimmed, 10) catch {
+        std.debug.print("benchmark setting {s} must be a positive integer\n", .{name});
+        return error.InvalidBenchmarkConfig;
+    };
+    if (parsed == 0) {
+        std.debug.print("benchmark setting {s} must be a positive integer\n", .{name});
+        return error.InvalidBenchmarkConfig;
+    }
+    return parsed;
 }
 
-fn envF64(name: [:0]const u8, default: f64) f64 {
+fn envF64(name: [:0]const u8, default: f64) !f64 {
     const value = getenv(name) orelse return default;
-    return std.fmt.parseFloat(f64, value) catch default;
+    const trimmed = try benchmarkSetting(name, value);
+    const parsed = std.fmt.parseFloat(f64, trimmed) catch {
+        std.debug.print("benchmark setting {s} must be a finite non-negative float\n", .{name});
+        return error.InvalidBenchmarkConfig;
+    };
+    if (!std.math.isFinite(parsed) or parsed < 0) {
+        std.debug.print("benchmark setting {s} must be a finite non-negative float\n", .{name});
+        return error.InvalidBenchmarkConfig;
+    }
+    return parsed;
 }
 
-fn envScheme(name: [:0]const u8, default: storage.S3Client.Scheme) storage.S3Client.Scheme {
+fn liveS3Scheme(name: [:0]const u8, default: storage.S3Client.Scheme) !storage.S3Client.Scheme {
     const value = getenv(name) orelse return default;
-    if (std.ascii.eqlIgnoreCase(value, "https")) return .https;
-    if (std.ascii.eqlIgnoreCase(value, "http")) return .http;
-    return default;
+    const trimmed = try requireLiveS3Setting(name, value);
+    if (std.ascii.eqlIgnoreCase(trimmed, "https")) return .https;
+    if (std.ascii.eqlIgnoreCase(trimmed, "http")) return .http;
+    std.debug.print("live-S3 benchmark setting {s} must be http or https\n", .{name});
+    return error.InvalidLiveS3BenchmarkConfig;
+}
+
+fn liveS3Bool(name: [:0]const u8, default: bool) !bool {
+    const value = getenv(name) orelse return default;
+    const trimmed = try requireLiveS3Setting(name, value);
+    if (std.mem.eql(u8, trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true") or std.ascii.eqlIgnoreCase(trimmed, "yes") or std.ascii.eqlIgnoreCase(trimmed, "on")) return true;
+    if (std.mem.eql(u8, trimmed, "0") or std.ascii.eqlIgnoreCase(trimmed, "false") or std.ascii.eqlIgnoreCase(trimmed, "no") or std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
+    std.debug.print("live-S3 benchmark setting {s} must be true or false\n", .{name});
+    return error.InvalidLiveS3BenchmarkConfig;
 }
 
 fn lessThanU64(_: void, a: u64, b: u64) bool {
@@ -390,7 +472,7 @@ fn benchPartitionStoreS3Wal(writer: anytype) !void {
     try requireMaxValue(
         "S3 WAL request volume",
         requests_per_mib,
-        envF64("ZMQ_BENCH_S3_WAL_MAX_REQUESTS_PER_MIB", 1024.0),
+        try envF64("ZMQ_BENCH_S3_WAL_MAX_REQUESTS_PER_MIB", 1024.0),
         " requests/MiB",
     );
 
@@ -421,22 +503,22 @@ fn benchPartitionStoreS3Wal(writer: anytype) !void {
     try requireMaxValue(
         "S3 WAL rebuild",
         rebuild_ms,
-        envF64("ZMQ_BENCH_S3_WAL_MAX_REBUILD_MS", 10_000.0),
+        try envF64("ZMQ_BENCH_S3_WAL_MAX_REBUILD_MS", 10_000.0),
         " ms",
     );
 }
 
-fn liveS3Config() storage.S3Client.Config {
+fn liveS3Config() !storage.S3Client.Config {
     return .{
-        .host = envOr("ZMQ_S3_ENDPOINT", "127.0.0.1"),
-        .port = envU16("ZMQ_S3_PORT", 9000),
-        .bucket = envOr("ZMQ_S3_BUCKET", "zmq-bench-live"),
-        .access_key = envOr("ZMQ_S3_ACCESS_KEY", "minioadmin"),
-        .secret_key = envOr("ZMQ_S3_SECRET_KEY", "minioadmin"),
-        .scheme = envScheme("ZMQ_S3_SCHEME", .http),
-        .region = envOr("ZMQ_S3_REGION", "us-east-1"),
-        .path_style = envBool("ZMQ_S3_PATH_STYLE", true),
-        .tls_ca_file = getenv("ZMQ_S3_TLS_CA_FILE"),
+        .host = try requireLiveS3Setting("ZMQ_S3_ENDPOINT", envOr("ZMQ_S3_ENDPOINT", "127.0.0.1")),
+        .port = try liveS3Port("ZMQ_S3_PORT", 9000),
+        .bucket = try requireLiveS3Setting("ZMQ_S3_BUCKET", envOr("ZMQ_S3_BUCKET", "zmq-bench-live")),
+        .access_key = try requireLiveS3Setting("ZMQ_S3_ACCESS_KEY", envOr("ZMQ_S3_ACCESS_KEY", "minioadmin")),
+        .secret_key = try requireLiveS3Setting("ZMQ_S3_SECRET_KEY", envOr("ZMQ_S3_SECRET_KEY", "minioadmin")),
+        .scheme = try liveS3Scheme("ZMQ_S3_SCHEME", .http),
+        .region = try requireLiveS3Setting("ZMQ_S3_REGION", envOr("ZMQ_S3_REGION", "us-east-1")),
+        .path_style = try liveS3Bool("ZMQ_S3_PATH_STYLE", true),
+        .tls_ca_file = try optionalLiveS3Setting("ZMQ_S3_TLS_CA_FILE"),
     };
 }
 
@@ -460,22 +542,33 @@ fn fillPayload(payload: []u8) void {
     }
 }
 
-fn benchLiveS3Provider(writer: anytype) !void {
-    if (!envBool("ZMQ_RUN_BENCH_LIVE_S3", false)) {
+fn benchLiveS3Provider(writer: anytype) !bool {
+    if (!(try liveS3Bool("ZMQ_RUN_BENCH_LIVE_S3", false))) {
         try writer.print("Live S3 provider benchmark skipped (set ZMQ_RUN_BENCH_LIVE_S3=1)\n", .{});
-        return;
+        return false;
     }
 
     const alloc = std.heap.page_allocator;
-    var client = storage.S3Client.init(alloc, liveS3Config());
-    if (!envBool("ZMQ_S3_SKIP_ENSURE_BUCKET", false)) {
+    const s3_config = try liveS3Config();
+    var client = storage.S3Client.init(alloc, s3_config);
+    try writer.print(
+        "Live S3 provider endpoint={s}:{d} bucket={s} scheme={s} region={s} path_style={s}\n",
+        .{
+            client.host,
+            client.port,
+            client.bucket,
+            @tagName(client.scheme),
+            client.signer.region,
+            if (client.path_style) "true" else "false",
+        },
+    );
+    if (!(try liveS3Bool("ZMQ_S3_SKIP_ENSURE_BUCKET", false))) {
         try client.ensureBucket();
     }
     var s3 = storage.S3Storage.initReal(alloc, &client);
 
-    const iterations = envUsize("ZMQ_BENCH_LIVE_S3_ITERATIONS", 20);
-    const payload_len = envUsize("ZMQ_BENCH_LIVE_S3_PAYLOAD_BYTES", 64 * 1024);
-    if (iterations == 0 or payload_len == 0) return error.InvalidBenchmarkConfig;
+    const iterations = try benchmarkUsize("ZMQ_BENCH_LIVE_S3_ITERATIONS", 20);
+    const payload_len = try benchmarkUsize("ZMQ_BENCH_LIVE_S3_PAYLOAD_BYTES", 64 * 1024);
 
     const prefix = try std.fmt.allocPrint(alloc, "bench/live/{d}", .{nowNs()});
     defer alloc.free(prefix);
@@ -521,8 +614,8 @@ fn benchLiveS3Provider(writer: anytype) !void {
         "Live S3 put",
         put_mib_per_sec,
         put_result.p99_ns,
-        envF64("ZMQ_BENCH_LIVE_S3_MIN_PUT_MIB_PER_SEC", 0.05),
-        envF64("ZMQ_BENCH_LIVE_S3_MAX_PUT_P99_MS", 10_000.0),
+        try envF64("ZMQ_BENCH_LIVE_S3_MIN_PUT_MIB_PER_SEC", 0.05),
+        try envF64("ZMQ_BENCH_LIVE_S3_MAX_PUT_P99_MS", 10_000.0),
     );
 
     const get_latencies = try alloc.alloc(u64, iterations);
@@ -547,19 +640,25 @@ fn benchLiveS3Provider(writer: anytype) !void {
         @as(f64, @floatFromInt(get_result.p99_ns)) / 1e6,
         requests_per_mib,
     });
+    try writer.print("Live S3 request volume   puts={d} gets={d} requests/MiB={d:.2}\n", .{
+        client.put_count,
+        client.get_count,
+        requests_per_mib,
+    });
     try requireThroughput(
         "Live S3 get",
         get_mib_per_sec,
         get_result.p99_ns,
-        envF64("ZMQ_BENCH_LIVE_S3_MIN_GET_MIB_PER_SEC", 0.05),
-        envF64("ZMQ_BENCH_LIVE_S3_MAX_GET_P99_MS", 10_000.0),
+        try envF64("ZMQ_BENCH_LIVE_S3_MIN_GET_MIB_PER_SEC", 0.05),
+        try envF64("ZMQ_BENCH_LIVE_S3_MAX_GET_P99_MS", 10_000.0),
     );
     try requireMaxValue(
         "Live S3 request volume",
         requests_per_mib,
-        envF64("ZMQ_BENCH_LIVE_S3_MAX_REQUESTS_PER_MIB", 512.0),
+        try envF64("ZMQ_BENCH_LIVE_S3_MAX_REQUESTS_PER_MIB", 512.0),
         " requests/MiB",
     );
+    return true;
 }
 
 fn benchPartitionStoreMemoryGrowth(writer: anytype) !void {

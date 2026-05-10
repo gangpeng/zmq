@@ -12,7 +12,7 @@ x-common-variables: &common-env
 services:
   minio:
     container_name: automq-minio
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -31,7 +31,7 @@ services:
 
   mc:
     container_name: automq-mc
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy

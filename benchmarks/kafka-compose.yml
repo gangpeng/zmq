@@ -8,7 +8,7 @@
 services:
   broker1:
     container_name: kafka-broker1
-    image: apache/kafka:latest
+    image: apache/kafka:4.0.2
     ports:
       - "19092:9092"
     environment:
@@ -32,7 +32,7 @@ services:
 
   broker2:
     container_name: kafka-broker2
-    image: apache/kafka:latest
+    image: apache/kafka:4.0.2
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -54,7 +54,7 @@ services:
 
   broker3:
     container_name: kafka-broker3
-    image: apache/kafka:latest
+    image: apache/kafka:4.0.2
     environment:
       KAFKA_NODE_ID: 2
       KAFKA_PROCESS_ROLES: broker,controller

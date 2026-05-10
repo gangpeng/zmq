@@ -114,7 +114,10 @@ pub const Authorizer = struct {
 
     /// Add a super user principal that bypasses all ACL checks.
     pub fn addSuperUser(self: *Authorizer, principal: []const u8) !void {
+        if (self.super_users.contains(principal)) return;
+
         const key = try self.allocator.dupe(u8, principal);
+        errdefer self.allocator.free(key);
         try self.super_users.put(key, {});
         log.info("Super user added: {s}", .{principal});
     }
@@ -277,9 +280,6 @@ pub const SaslPlainAuthenticator = struct {
     /// Register a username/password pair.
     /// The password is hashed with PBKDF2-HMAC-SHA256 before storage.
     pub fn addUser(self: *SaslPlainAuthenticator, username: []const u8, password: []const u8) !void {
-        const user_copy = try self.allocator.dupe(u8, username);
-        errdefer self.allocator.free(user_copy);
-
         // Generate random salt
         var salt: [16]u8 = undefined;
         @import("random_compat").bytes(&salt);
@@ -288,11 +288,21 @@ pub const SaslPlainAuthenticator = struct {
         var hash: [32]u8 = undefined;
         computeSaltedPassword(password, &salt, pbkdf2_iterations, &hash);
 
-        try self.credentials.put(user_copy, .{
+        const credential = HashedCredential{
             .salt = salt,
             .hash = hash,
             .iterations = pbkdf2_iterations,
-        });
+        };
+
+        if (self.credentials.getPtr(username)) |existing| {
+            existing.* = credential;
+            return;
+        }
+
+        const user_copy = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(user_copy);
+
+        try self.credentials.put(user_copy, credential);
     }
 
     /// Authenticate a SASL/PLAIN token.
@@ -422,6 +432,20 @@ test "SaslPlainAuthenticator" {
     try testing.expect(!result3.success);
 }
 
+test "SaslPlainAuthenticator addUser replaces duplicate username" {
+    var sasl = SaslPlainAuthenticator.init(testing.allocator);
+    defer sasl.deinit();
+
+    try sasl.addUser("admin", "old-secret");
+    try sasl.addUser("admin", "new-secret");
+
+    try testing.expectEqual(@as(usize, 1), sasl.credentials.count());
+    try testing.expect(!sasl.authenticate("\x00admin\x00old-secret").success);
+    const result = sasl.authenticate("\x00admin\x00new-secret");
+    try testing.expect(result.success);
+    try testing.expectEqualStrings("admin", result.principal.?);
+}
+
 /// SCRAM-SHA-256 authenticator.
 ///
 /// Implements RFC 5802 / RFC 7677 for SASL SCRAM-SHA-256 authentication.
@@ -467,28 +491,36 @@ pub const ScramSha256Authenticator = struct {
 
     /// Add a user with a pre-computed SCRAM credential.
     pub fn addUser(self: *ScramSha256Authenticator, username: []const u8, password: []const u8) !void {
-        const user_copy = try self.allocator.dupe(u8, username);
-        errdefer self.allocator.free(user_copy);
-
         // Generate random salt
         var salt: [32]u8 = undefined;
         @import("random_compat").bytes(&salt);
 
         const iterations: u32 = 4096;
+        const credential = credentialFromPassword(password, salt, iterations);
 
-        try self.users.put(user_copy, credentialFromPassword(password, salt, iterations));
-    }
-
-    /// Upsert a user with Kafka AlterUserScramCredentials pre-computed material.
-    pub fn putCredential(self: *ScramSha256Authenticator, username: []const u8, salt: [32]u8, iterations: u32, salted_password: [32]u8) !void {
-        if (self.users.fetchRemove(username)) |old| {
-            self.allocator.free(old.key);
+        if (self.users.getPtr(username)) |existing| {
+            existing.* = credential;
+            return;
         }
 
         const user_copy = try self.allocator.dupe(u8, username);
         errdefer self.allocator.free(user_copy);
 
-        try self.users.put(user_copy, credentialFromSaltedPassword(salt, iterations, salted_password));
+        try self.users.put(user_copy, credential);
+    }
+
+    /// Upsert a user with Kafka AlterUserScramCredentials pre-computed material.
+    pub fn putCredential(self: *ScramSha256Authenticator, username: []const u8, salt: [32]u8, iterations: u32, salted_password: [32]u8) !void {
+        const credential = credentialFromSaltedPassword(salt, iterations, salted_password);
+        if (self.users.getPtr(username)) |existing| {
+            existing.* = credential;
+            return;
+        }
+
+        const user_copy = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(user_copy);
+
+        try self.users.put(user_copy, credential);
     }
 
     pub fn removeUser(self: *ScramSha256Authenticator, username: []const u8) bool {
@@ -1145,6 +1177,52 @@ test "ScramSha256 add user and get credential" {
     try testing.expect(missing == null);
 }
 
+test "ScramSha256 addUser replaces duplicate username" {
+    var scram = ScramSha256Authenticator.init(testing.allocator);
+    defer scram.deinit();
+
+    try scram.addUser("testuser", "old-pass");
+    try scram.addUser("testuser", "new-pass");
+
+    try testing.expectEqual(@as(usize, 1), scram.users.count());
+    const cred = scram.getCredential("testuser") orelse return error.ExpectedCredential;
+
+    var new_salted_password: [32]u8 = undefined;
+    computeSaltedPassword("new-pass", &cred.salt, cred.iterations, &new_salted_password);
+    const expected_new = ScramSha256Authenticator.credentialFromSaltedPassword(cred.salt, cred.iterations, new_salted_password);
+    try testing.expectEqualSlices(u8, expected_new.stored_key[0..], cred.stored_key[0..]);
+    try testing.expectEqualSlices(u8, expected_new.server_key[0..], cred.server_key[0..]);
+
+    var old_salted_password: [32]u8 = undefined;
+    computeSaltedPassword("old-pass", &cred.salt, cred.iterations, &old_salted_password);
+    const expected_old = ScramSha256Authenticator.credentialFromSaltedPassword(cred.salt, cred.iterations, old_salted_password);
+    try testing.expect(!std.mem.eql(u8, expected_old.stored_key[0..], cred.stored_key[0..]));
+}
+
+test "ScramSha256 putCredential replaces duplicate username in place" {
+    var scram = ScramSha256Authenticator.init(testing.allocator);
+    defer scram.deinit();
+
+    const old_salt = [_]u8{1} ** 32;
+    const old_salted_password = [_]u8{2} ** 32;
+    try scram.putCredential("testuser", old_salt, 4096, old_salted_password);
+
+    const new_salt = [_]u8{3} ** 32;
+    const new_salted_password = [_]u8{4} ** 32;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    scram.allocator = failing_allocator.allocator();
+    defer scram.allocator = testing.allocator;
+    try scram.putCredential("testuser", new_salt, 8192, new_salted_password);
+    try testing.expect(!failing_allocator.has_induced_failure);
+
+    try testing.expectEqual(@as(usize, 1), scram.users.count());
+    const cred = scram.getCredential("testuser") orelse return error.ExpectedCredential;
+    const expected = ScramSha256Authenticator.credentialFromSaltedPassword(new_salt, 8192, new_salted_password);
+    try testing.expectEqualSlices(u8, expected.stored_key[0..], cred.stored_key[0..]);
+    try testing.expectEqualSlices(u8, expected.server_key[0..], cred.server_key[0..]);
+    try testing.expectEqual(@as(u32, 8192), cred.iterations);
+}
+
 test "HMAC-SHA256 basic" {
     var out: [32]u8 = undefined;
     hmacSha256("key", "data", &out);
@@ -1185,6 +1263,26 @@ test "Authorizer super user bypasses deny" {
     try testing.expectEqual(Authorizer.AuthResult.allowed, auth.authorize("User:admin", .topic, "secret", .read));
     // Non-super user is denied
     try testing.expectEqual(Authorizer.AuthResult.denied, auth.authorize("User:regular", .topic, "secret", .read));
+}
+
+test "Authorizer addSuperUser cleans up on insertion failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var auth = Authorizer.init(failing_allocator.allocator());
+    defer auth.deinit();
+
+    try testing.expectError(error.OutOfMemory, auth.addSuperUser("User:admin"));
+    try testing.expectEqual(@as(usize, 0), auth.super_users.count());
+}
+
+test "Authorizer addSuperUser ignores duplicate principal" {
+    var auth = Authorizer.init(testing.allocator);
+    defer auth.deinit();
+
+    try auth.addSuperUser("User:admin");
+    try auth.addSuperUser("User:admin");
+
+    try testing.expectEqual(@as(usize, 1), auth.super_users.count());
+    try testing.expectEqual(Authorizer.AuthResult.allowed, auth.authorize("User:admin", .cluster, "cluster", .alter));
 }
 
 test "Authorizer allow_everyone_if_no_acl=false denies" {

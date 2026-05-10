@@ -94,7 +94,7 @@ def connect():
 
 passed = 0
 failed = 0
-total_start = time.time()
+total_start = time.monotonic()
 
 def test(name, fn):
     global passed, failed
@@ -422,11 +422,11 @@ def test_long_running_produce_fetch():
         topic = "long-running-test"
         total_produced = 0
         total_fetched = 0
-        start = time.time()
+        start = time.monotonic()
         duration = 30  # seconds
         corr_id = 1000
 
-        while time.time() - start < duration:
+        while time.monotonic() - start < duration:
             # Produce a batch
             timestamp = int(time.time() * 1000)
             value = f"record-{total_produced}".encode()
@@ -462,7 +462,7 @@ def test_long_running_produce_fetch():
 
             time.sleep(0.1)  # ~10 cycles per second
 
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
         print(f"    ({total_produced} produces, {total_fetched} fetches in {elapsed:.1f}s)")
         assert total_produced >= 100, f"Expected >=100 produces, got {total_produced}"
     finally:
@@ -522,7 +522,7 @@ if __name__ == "__main__":
     test("30-second produce/fetch cycle", test_long_running_produce_fetch)
 
     # Summary
-    elapsed = time.time() - total_start
+    elapsed = time.monotonic() - total_start
     print(f"\n{'='*50}")
     print(f"Results: {passed} passed, {failed} failed ({elapsed:.1f}s)")
     if failed == 0:

@@ -656,7 +656,11 @@ test "RaftClientPool broadcastHeartbeat reports failed peer RPCs" {
     try pool.addPeer(2, "localhost", 9094);
 
     const peer = pool.getClient(2) orelse return error.MissingPeer;
-    peer.fd = -1;
+    const linux = std.os.linux;
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe(&pipe_fds)));
+    peer.fd = pipe_fds[0];
+    @import("posix_compat").close(pipe_fds[1]);
 
     const failures = pool.broadcastHeartbeat(3, 1);
     try std.testing.expectEqual(@as(u32, 1), failures);

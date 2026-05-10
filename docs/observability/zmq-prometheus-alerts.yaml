@@ -19,6 +19,69 @@ groups:
           summary: ZMQ request p99 latency is above 1 second.
           description: Broker request handling latency is above the operational SLO.
 
+      - alert: ZMQHighAutoMQRequestErrorRatio
+        expr: sum(rate(Kafka_request_error_count_total{error!="NONE"}[5m])) / clamp_min(sum(rate(Kafka_request_count_total[5m])), 1) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ-compatible request error ratio is above 5 percent.
+          description: AutoMQ-compatible request result metrics are reporting sustained non-NONE errors.
+
+      - alert: ZMQHighAutoMQRequestTime
+        expr: sum(rate(Kafka_request_time_milliseconds_total[5m])) / clamp_min(sum(rate(Kafka_request_count_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ-compatible request time is above 1 second.
+          description: AutoMQ-compatible request handling time is sustained above the operational latency SLO.
+
+      - alert: ZMQHighAutoMQRequestBytesIn
+        expr: sum(rate(Kafka_request_size_bytes_total[5m])) by (type) > 104857600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ-compatible request byte rate is high.
+          description: Sustained high request-byte volume can indicate producer bursts or oversized client requests.
+
+      - alert: ZMQHighAutoMQResponseBytesOut
+        expr: sum(rate(Kafka_response_size_bytes_total[5m])) by (type) > 104857600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ-compatible response byte rate is high.
+          description: Sustained high response-byte volume can indicate fetch bursts or oversized broker responses.
+
+      - alert: ZMQAutoMQObjectMetadataFanoutHigh
+        expr: (automq_object_manager_stream_set_object_count + automq_object_manager_stream_object_count) / clamp_min(automq_object_manager_stream_count, 1) > 10000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ object metadata fanout is high.
+          description: Sustained object metadata growth per stream can indicate WAL object churn, compaction lag, or failed object cleanup.
+
+      - alert: ZMQAutoMQPreparedObjectsHigh
+        expr: automq_object_manager_prepared_object_count > 10000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ prepared object count is high.
+          description: Prepared objects should drain after stream-object commits or TTL expiry; sustained growth can indicate interrupted uploads or snapshot replay issues.
+
+      - alert: ZMQAutoMQDestroyedObjectsPending
+        expr: automq_object_manager_mark_destroyed_object_count > 10000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ AutoMQ mark-destroyed object count is high.
+          description: Objects marked for destruction should be physically deleted by compaction; sustained backlog can indicate object-store delete failures.
+
       - alert: ZMQHighProduceLatencyP99
         expr: histogram_quantile(0.99, sum(rate(kafka_server_produce_latency_seconds_bucket[5m])) by (le)) > 1
         for: 10m
@@ -37,6 +100,105 @@ groups:
           summary: ZMQ fetch p99 latency is above 1 second.
           description: Fetch responses are above the operational read-latency SLO.
 
+      - alert: ZMQGroupMetadataOffsetFanoutHigh
+        expr: kafka_server_groupmetadatamanager_numoffsets / clamp_min(kafka_server_groupmetadatamanager_numgroups, 1) > 5000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ group metadata offset fanout is high.
+          description: A high committed-offset count per group can indicate coordinator metadata growth or stale group cleanup issues.
+
+      - alert: ZMQDeadConsumerGroupsPresent
+        expr: kafka_server_groupmetadatamanager_numgroupsdead > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ group metadata manager reports dead groups.
+          description: Dead consumer groups should be cleaned up and may indicate coordinator lifecycle regressions.
+
+      - alert: ZMQGroupCoordinatorEventQueueBacklog
+        expr: kafka_server_group_coordinator_metrics_event_queue_size > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ group coordinator event queue backlog is high.
+          description: A sustained group coordinator event backlog can delay rebalance and offset-commit processing.
+
+      - alert: ZMQLowGroupCoordinatorIdle
+        expr: kafka_server_group_coordinator_metrics_thread_idle_ratio_avg < 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ group coordinator idle ratio is low.
+          description: Sustained low group coordinator idle time indicates coordinator saturation.
+
+      - alert: ZMQGroupCoordinatorPartitionFailure
+        expr: kafka_server_group_coordinator_metrics_partition_count{state="failed"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ group coordinator partitions are failing.
+          description: Failed consumer-offset partitions can prevent group membership and committed-offset metadata from loading or serving.
+
+      - alert: ZMQConsumerLagHigh
+        expr: max(kafka_consumer_lag) by (group, topic, partition) > 10000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ consumer lag is above 10,000 records.
+          description: Sustained per-partition consumer lag can indicate stalled consumers or coordinator offset regressions.
+
+      - alert: ZMQDeadTransactionsPresent
+        expr: kafka_server_transaction_coordinator_metrics_transaction_count{state="dead"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ transaction coordinator reports dead transactions.
+          description: Dead transaction coordinator entries should be cleaned up and may indicate transaction lifecycle regressions.
+
+      - alert: ZMQTransactionRegisteredPartitionFanoutHigh
+        expr: kafka_server_transaction_coordinator_metrics_registered_partition_count / clamp_min(kafka_server_transaction_coordinator_metrics_transactional_id_count, 1) > 1000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ transaction coordinator partition fanout is high.
+          description: A high registered-partition count per transactional ID can indicate long-running transaction growth or failed cleanup.
+
+      - alert: ZMQTransactionCoordinatorPartitionFailure
+        expr: kafka_server_transaction_coordinator_metrics_partition_count{state="failed"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ transaction coordinator partitions are failing.
+          description: Failed transaction-state partitions can prevent transaction metadata from being loaded or served.
+
+      - alert: ZMQProduceThrottlingActive
+        expr: rate(kafka_server_produce_throttle_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ produce requests are being throttled.
+          description: Sustained produce throttling indicates client write load is exceeding configured broker quotas.
+
+      - alert: ZMQFetchThrottlingActive
+        expr: rate(kafka_server_fetch_throttle_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ fetch requests are being throttled.
+          description: Sustained fetch throttling indicates client read load is exceeding configured broker quotas.
+
       - alert: ZMQNoActiveRaftLeader
         expr: max(raft_role) < 3
         for: 1m
@@ -45,6 +207,51 @@ groups:
         annotations:
           summary: No ZMQ Raft node is reporting leader role.
           description: A KRaft quorum without a leader cannot safely commit controller metadata.
+
+      - alert: ZMQRaftElectionChurn
+        expr: rate(raft_elections_started_total[5m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ Raft elections are starting repeatedly.
+          description: Sustained Raft election churn can indicate quorum instability or controller connectivity issues.
+
+      - alert: ZMQRaftPreVoteChurn
+        expr: rate(raft_pre_votes_started_total[5m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ Raft pre-votes are starting repeatedly.
+          description: Sustained Raft pre-vote churn can indicate quorum reachability or controller timing instability before elections begin.
+
+      - alert: ZMQRaftEpochChurn
+        expr: rate(raft_epoch_changes_total[5m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ Raft epochs are changing repeatedly.
+          description: Sustained Raft epoch churn can indicate unstable leadership or repeated voter state transitions.
+
+      - alert: ZMQRaftCommitStall
+        expr: sum(rate(raft_log_entries_appended_total[5m])) > 0 and sum(rate(raft_log_entries_committed_total[5m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ Raft log entries are appending without commits.
+          description: Appended Raft log traffic without committed entries can indicate quorum replication or controller commit stalls.
+
+      - alert: ZMQRaftVoteRejections
+        expr: rate(raft_votes_rejected_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ Raft votes are being rejected.
+          description: Sustained vote rejections can indicate stale epochs, split votes, or quorum membership drift.
 
   - name: zmq-controller
     rules:
@@ -102,6 +309,24 @@ groups:
           summary: ZMQ network processor idle ratio is low.
           description: Sustained low network-processor idle time indicates network saturation.
 
+      - alert: ZMQExpiredConnectionsKilled
+        expr: rate(kafka_network_socketserver_expiredconnectionskilledcount_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ socket server is killing expired connections.
+          description: Idle or TLS-handshake-timeout connection kills can indicate slow-client pressure or connection churn.
+
+      - alert: ZMQSocketServerConnectionCountHigh
+        expr: kafka_network_socketserver_connectioncount > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ socket server connection count is high.
+          description: Socket-server connection count is above the operational envelope and may indicate client churn or connection leaks.
+
       - alert: ZMQRequestChannelBacklog
         expr: kafka_network_requestchannel_requestqueuesize + kafka_network_requestchannel_responsequeuesize > 1000
         for: 10m
@@ -137,6 +362,15 @@ groups:
         annotations:
           summary: ZMQ replica manager reports partitions below min ISR.
           description: Produce with acks=all can fail and durability is degraded while partitions are below min ISR.
+
+      - alert: ZMQAtMinIsrPartitions
+        expr: kafka_server_replicamanager_atminisrpartitioncount > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ replica manager reports partitions at min ISR.
+          description: Partitions at min ISR have no remaining replica slack before required-acks writes are at risk.
 
       - alert: ZMQPartitionReassignmentStuck
         expr: kafka_server_replicamanager_reassigningpartitions > 0
@@ -183,6 +417,51 @@ groups:
           summary: ZMQ has partitions whose leader is not the preferred replica.
           description: Sustained preferred-replica imbalance can lead to skewed broker load and rack-affinity regressions.
 
+      - alert: ZMQUncleanLeaderElections
+        expr: rate(kafka_controller_controllerstats_uncleanleaderelectionspersec_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: ZMQ controller reports unclean leader elections.
+          description: Unclean leader election can indicate data-loss risk and must be investigated immediately.
+
+      - alert: ZMQLeaderElectionChurn
+        expr: increase(kafka_controller_controllerstats_leaderelectionrateandtimems_total[10m]) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ controller is reporting repeated leader elections.
+          description: Repeated leader elections can indicate controller instability or broker heartbeat churn.
+
+      - alert: ZMQIsrShrinks
+        expr: rate(kafka_server_replicamanager_isrshrinks_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ replica manager reports ISR shrink events.
+          description: ISR shrink events reduce replica redundancy and may precede under-replicated partitions.
+
+      - alert: ZMQIsrExpands
+        expr: rate(kafka_server_replicamanager_isrexpands_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ replica manager reports ISR expand events.
+          description: ISR expand events indicate replica membership recovery after prior shrink or broker unfence activity.
+
+      - alert: ZMQFailedIsrUpdates
+        expr: rate(kafka_server_replicamanager_failedisrupdatesperseccount_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ replica manager reports failed ISR updates.
+          description: Failed ISR updates can hide replica-state changes from clients and controllers.
+
       - alert: ZMQFailedProduceRequests
         expr: rate(kafka_server_brokertopicmetrics_failedproducerequests_total[5m]) > 0
         for: 5m
@@ -219,6 +498,69 @@ groups:
           summary: ZMQ JMX-compatible local request time is above 1 second.
           description: Broker-local request handling time is sustained above the operational latency SLO.
 
+      - alert: ZMQHighJmxRequestTotalTime
+        expr: sum(rate(kafka_network_requestmetrics_totaltimems_total[5m])) / clamp_min(sum(rate(kafka_network_requestmetrics_requests_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible total request time is above 1 second.
+          description: End-to-end broker request time is sustained above the operational latency SLO.
+
+      - alert: ZMQHighJmxRequestRemoteTime
+        expr: sum(rate(kafka_network_requestmetrics_remotetimems_total[5m])) / clamp_min(sum(rate(kafka_network_requestmetrics_requests_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible remote request time is above 1 second.
+          description: Remote request wait time is sustained above the operational latency SLO.
+
+      - alert: ZMQHighJmxRequestQueueTime
+        expr: sum(rate(kafka_network_requestmetrics_requestqueuetimems_total[5m])) / clamp_min(sum(rate(kafka_network_requestmetrics_requests_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible request queue time is above 1 second.
+          description: Request queue wait time is sustained above the operational latency SLO.
+
+      - alert: ZMQHighJmxResponseQueueTime
+        expr: sum(rate(kafka_network_requestmetrics_responsequeuetimems_total[5m])) / clamp_min(sum(rate(kafka_network_requestmetrics_requests_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible response queue time is above 1 second.
+          description: Response queue wait time is sustained above the operational latency SLO.
+
+      - alert: ZMQHighJmxResponseSendTime
+        expr: sum(rate(kafka_network_requestmetrics_responsesendtimems_total[5m])) / clamp_min(sum(rate(kafka_network_requestmetrics_requests_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible response send time is above 1 second.
+          description: Response send time is sustained above the operational latency SLO.
+
+      - alert: ZMQHighJmxRequestBytesIn
+        expr: sum(rate(kafka_network_requestmetrics_requestbytes_total[5m])) by (request) > 104857600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible request byte rate is high.
+          description: Sustained high request-byte volume can indicate producer bursts or oversized client requests.
+
+      - alert: ZMQHighJmxResponseBytesOut
+        expr: sum(rate(kafka_network_requestmetrics_responsebytes_total[5m])) by (request) > 104857600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible response byte rate is high.
+          description: Sustained high response-byte volume can indicate fetch bursts or oversized broker responses.
+
       - alert: ZMQJmxRequestErrors
         expr: sum(rate(kafka_network_requestmetrics_errors_total{error!="NONE"}[5m])) > 0
         for: 5m
@@ -248,6 +590,24 @@ groups:
           summary: ZMQ S3 request p99 latency is above 2 seconds.
           description: High object-store latency can increase produce/fetch tail latency and recovery time.
 
+      - alert: ZMQS3RequestRateHigh
+        expr: sum(rate(s3_requests_total[5m])) by (operation) > 1000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ S3 request rate is high.
+          description: Sustained high object-store request rates can indicate WAL object churn, cache misses, or inefficient recovery scans.
+
+      - alert: ZMQS3ByteRateHigh
+        expr: sum(rate(s3_bytes_total[5m])) by (direction) > 104857600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ S3 byte rate is high.
+          description: Sustained high object-store transfer volume can increase storage cost and produce/fetch tail latency.
+
       - alert: ZMQCompactionErrors
         expr: rate(compaction_errors_total[10m]) > 0
         for: 10m
@@ -256,6 +616,60 @@ groups:
         annotations:
           summary: ZMQ compaction is reporting errors.
           description: Compaction failures can leave orphaned objects or delay cleanup.
+
+      - alert: ZMQCompactionOrphanedKeysPending
+        expr: compaction_orphaned_keys > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ compaction has orphaned keys pending cleanup.
+          description: Persistent orphaned object keys indicate cleanup retries are not draining.
+
+      - alert: ZMQCompactionCycleSlowP99
+        expr: histogram_quantile(0.99, sum(rate(compaction_cycle_duration_seconds_bucket[10m])) by (le)) > 30
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ compaction cycle p99 duration is above 30 seconds.
+          description: Slow compaction cycles can delay object cleanup and increase replay or recovery work.
+
+      - alert: ZMQCacheEvictionsHigh
+        expr: sum(rate(cache_evictions_total[5m])) > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ cache eviction rate is high.
+          description: Sustained cache eviction pressure can increase object-store reads and fetch latency.
+
+      - alert: ZMQCacheMissRatioHigh
+        expr: sum(rate(cache_operations_total{result="miss"}[5m])) by (cache) / clamp_min(sum(rate(cache_operations_total[5m])) by (cache), 1) > 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ cache miss ratio is high.
+          description: Sustained cache misses can shift fetch traffic to object storage and increase read latency.
+
+      - alert: ZMQLogCacheSizeHigh
+        expr: log_cache_size_bytes > 536870912
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ log cache exceeds 512 MiB.
+          description: Sustained log-cache growth can indicate delayed flush, eviction, or fetch-cache pressure.
+
+      - alert: ZMQS3BlockCacheSizeHigh
+        expr: s3_block_cache_size_bytes > 536870912
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ S3 block cache exceeds 512 MiB.
+          description: Sustained S3 block-cache growth can indicate read amplification or cache sizing pressure.
 
   - name: zmq-client-telemetry
     rules:
@@ -267,6 +681,15 @@ groups:
         annotations:
           summary: ZMQ retained client telemetry exceeds 100 MiB.
           description: Client telemetry retention may be growing without terminating cleanup.
+
+      - alert: ZMQClientTelemetrySamplesHigh
+        expr: kafka_client_telemetry_samples > 10000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ retained client telemetry sample count is high.
+          description: A sustained high retained-sample count can indicate clients are not terminating telemetry streams or cleanup is not keeping up.
 
       - alert: ZMQClientTelemetryExportErrors
         expr: rate(kafka_client_telemetry_export_errors_total[5m]) > 0

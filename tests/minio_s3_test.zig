@@ -14,49 +14,104 @@ fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
     return getenv(name) orelse default;
 }
 
-fn envBool(name: [:0]const u8, default: bool) bool {
+fn settingUsesPlaceholder(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return trimmed.len == 0 or
+        std.ascii.eqlIgnoreCase(trimmed, "...") or
+        std.ascii.eqlIgnoreCase(trimmed, "placeholder") or
+        std.ascii.eqlIgnoreCase(trimmed, "required") or
+        std.ascii.eqlIgnoreCase(trimmed, "tbd") or
+        std.ascii.eqlIgnoreCase(trimmed, "todo") or
+        std.mem.startsWith(u8, trimmed, "/path/to/") or
+        hasAngleBracketPlaceholder(trimmed);
+}
+
+fn hasAngleBracketPlaceholder(value: []const u8) bool {
+    const start = std.mem.indexOfScalar(u8, value, '<') orelse return false;
+    if (start + 1 >= value.len) return false;
+    const rest = value[start + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, '>') orelse return false;
+    return end > 0;
+}
+
+fn requireMinioSetting(name: []const u8, value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (settingUsesPlaceholder(trimmed)) {
+        std.debug.print("{s} must not be blank or placeholder\n", .{name});
+        return error.InvalidMinioSetting;
+    }
+    return trimmed;
+}
+
+fn optionalMinioSetting(name: [:0]const u8) !?[]const u8 {
+    const value = getenv(name) orelse return null;
+    return try requireMinioSetting(name, value);
+}
+
+fn parseMinioPort(name: []const u8, value: []const u8) !u16 {
+    const trimmed = try requireMinioSetting(name, value);
+    const port = std.fmt.parseInt(u16, trimmed, 10) catch {
+        std.debug.print("{s} must be a positive TCP port\n", .{name});
+        return error.InvalidMinioPort;
+    };
+    if (port == 0) {
+        std.debug.print("{s} must be a positive TCP port\n", .{name});
+        return error.InvalidMinioPort;
+    }
+    return port;
+}
+
+fn minioPort(name: [:0]const u8, default: u16) !u16 {
     const value = getenv(name) orelse return default;
-    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes")) {
+    return try parseMinioPort(name, value);
+}
+
+fn parseEnvBool(name: []const u8, value: []const u8) !bool {
+    const trimmed = try requireMinioSetting(name, value);
+    if (std.mem.eql(u8, trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true") or std.ascii.eqlIgnoreCase(trimmed, "yes") or std.ascii.eqlIgnoreCase(trimmed, "on")) {
         return true;
     }
-    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no")) {
+    if (std.mem.eql(u8, trimmed, "0") or std.ascii.eqlIgnoreCase(trimmed, "false") or std.ascii.eqlIgnoreCase(trimmed, "no") or std.ascii.eqlIgnoreCase(trimmed, "off")) {
         return false;
     }
-    return default;
+    std.debug.print("{s} must be true or false\n", .{name});
+    return error.InvalidMinioBoolean;
+}
+
+fn envBool(name: [:0]const u8, default: bool) !bool {
+    const value = getenv(name) orelse return default;
+    return try parseEnvBool(name, value);
 }
 
 fn envScheme(name: [:0]const u8, default: storage.S3Client.Scheme) !storage.S3Client.Scheme {
     const value = getenv(name) orelse return default;
-    if (std.ascii.eqlIgnoreCase(value, "http")) return .http;
-    if (std.ascii.eqlIgnoreCase(value, "https")) return .https;
+    const trimmed = try requireMinioSetting(name, value);
+    if (std.ascii.eqlIgnoreCase(trimmed, "http")) return .http;
+    if (std.ascii.eqlIgnoreCase(trimmed, "https")) return .https;
     return error.InvalidMinioScheme;
 }
 
 fn requireMinioConfig() !storage.S3Client.Config {
-    const enabled = getenv("ZMQ_RUN_MINIO_TESTS") orelse return error.SkipZigTest;
-    if (!std.mem.eql(u8, enabled, "1") and !std.ascii.eqlIgnoreCase(enabled, "true")) {
+    if (!(try envBool("ZMQ_RUN_MINIO_TESTS", false))) {
         return error.SkipZigTest;
     }
 
-    const port_text = envOr("ZMQ_S3_PORT", "9000");
-    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidMinioPort;
-
     return .{
-        .host = envOr("ZMQ_S3_ENDPOINT", "127.0.0.1"),
-        .port = port,
-        .bucket = envOr("ZMQ_S3_BUCKET", "zmq-minio-it"),
-        .access_key = envOr("ZMQ_S3_ACCESS_KEY", "minioadmin"),
-        .secret_key = envOr("ZMQ_S3_SECRET_KEY", "minioadmin"),
+        .host = try requireMinioSetting("ZMQ_S3_ENDPOINT", envOr("ZMQ_S3_ENDPOINT", "127.0.0.1")),
+        .port = try minioPort("ZMQ_S3_PORT", 9000),
+        .bucket = try requireMinioSetting("ZMQ_S3_BUCKET", envOr("ZMQ_S3_BUCKET", "zmq-minio-it")),
+        .access_key = try requireMinioSetting("ZMQ_S3_ACCESS_KEY", envOr("ZMQ_S3_ACCESS_KEY", "minioadmin")),
+        .secret_key = try requireMinioSetting("ZMQ_S3_SECRET_KEY", envOr("ZMQ_S3_SECRET_KEY", "minioadmin")),
         .scheme = try envScheme("ZMQ_S3_SCHEME", .http),
-        .region = envOr("ZMQ_S3_REGION", "us-east-1"),
-        .path_style = envBool("ZMQ_S3_PATH_STYLE", true),
-        .tls_ca_file = getenv("ZMQ_S3_TLS_CA_FILE"),
+        .region = try requireMinioSetting("ZMQ_S3_REGION", envOr("ZMQ_S3_REGION", "us-east-1")),
+        .path_style = try envBool("ZMQ_S3_PATH_STYLE", true),
+        .tls_ca_file = try optionalMinioSetting("ZMQ_S3_TLS_CA_FILE"),
     };
 }
 
 fn initMinioClient() !storage.S3Client {
     var client = storage.S3Client.init(testing.allocator, try requireMinioConfig());
-    if (!envBool("ZMQ_S3_SKIP_ENSURE_BUCKET", false)) {
+    if (!(try envBool("ZMQ_S3_SKIP_ENSURE_BUCKET", false))) {
         try client.ensureBucket();
     }
     return client;
@@ -93,8 +148,28 @@ fn allocMultipartData(alloc: std.mem.Allocator) ![]u8 {
 }
 
 fn requireProviderGate(name: [:0]const u8) !void {
-    if (!envBool(name, false)) return error.SkipZigTest;
+    if (!(try envBool(name, false))) return error.SkipZigTest;
     _ = try requireMinioConfig();
+}
+
+test "MinIO live settings reject blank and placeholder values" {
+    try testing.expectError(error.InvalidMinioSetting, requireMinioSetting("ZMQ_S3_ENDPOINT", ""));
+    try testing.expectError(error.InvalidMinioSetting, requireMinioSetting("ZMQ_S3_BUCKET", "placeholder"));
+    try testing.expectError(error.InvalidMinioSetting, requireMinioSetting("ZMQ_S3_ACCESS_KEY", " /path/to/access-key "));
+    try testing.expectError(error.InvalidMinioSetting, requireMinioSetting("ZMQ_S3_ENDPOINT", " <host>:9000 "));
+    try testing.expectEqualStrings("zmq-minio-it", try requireMinioSetting("ZMQ_S3_BUCKET", " zmq-minio-it "));
+}
+
+test "MinIO live boolean and port settings fail closed" {
+    try testing.expectError(error.InvalidMinioSetting, parseEnvBool("ZMQ_RUN_MINIO_TESTS", "required"));
+    try testing.expectError(error.InvalidMinioBoolean, parseEnvBool("ZMQ_S3_PATH_STYLE", "maybe"));
+    try testing.expect(try parseEnvBool("ZMQ_S3_REQUIRE_MULTIPART_EDGE", "on"));
+    try testing.expect(!(try parseEnvBool("ZMQ_S3_REQUIRE_LIST_PAGINATION", "off")));
+
+    try testing.expectError(error.InvalidMinioSetting, parseMinioPort("ZMQ_S3_PORT", "todo"));
+    try testing.expectError(error.InvalidMinioPort, parseMinioPort("ZMQ_S3_PORT", "not-a-port"));
+    try testing.expectError(error.InvalidMinioPort, parseMinioPort("ZMQ_S3_PORT", "0"));
+    try testing.expectEqual(@as(u16, 9000), try parseMinioPort("ZMQ_S3_PORT", "9000"));
 }
 
 test "MinIO S3Storage object writer get range list delete round-trip" {
@@ -265,6 +340,34 @@ test "MinIO PartitionStore S3 WAL produce rebuilds and resumes" {
     defer if (merged.records.len > 0) testing.allocator.free(@constCast(merged.records));
     try testing.expectEqual(@as(i16, 0), merged.error_code);
     try testing.expectEqualStrings("live-alive-blive-c", merged.records);
+
+    var continuation_object_manager = storage.ObjectManager.init(testing.allocator, 1);
+    defer continuation_object_manager.deinit();
+
+    var continuation_store = broker.PartitionStore.init(testing.allocator);
+    defer continuation_store.deinit();
+    continuation_store.s3_wal_mode = true;
+    continuation_store.s3_storage = s3;
+    continuation_store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    continuation_store.setObjectManager(&continuation_object_manager);
+
+    try testing.expectEqual(@as(u64, 3), try continuation_store.recoverS3WalObjects());
+    try continuation_store.ensurePartition(topic, 0);
+    try testing.expect(continuation_store.repairPartitionStatesFromObjectManager());
+    try testing.expectEqual(@as(u64, 3), continuation_store.s3_wal_batcher.?.s3_object_counter);
+
+    const continued = try continuation_store.fetch(topic, 0, 0, 1024);
+    defer if (continued.records.len > 0) testing.allocator.free(@constCast(continued.records));
+    try testing.expectEqual(@as(i16, 0), continued.error_code);
+    try testing.expectEqualStrings("live-alive-blive-c", continued.records);
+
+    const fourth = try continuation_store.produce(topic, 0, "live-d");
+    try testing.expectEqual(@as(i64, 3), fourth.base_offset);
+
+    const final = try continuation_store.fetch(topic, 0, 0, 1024);
+    defer if (final.records.len > 0) testing.allocator.free(@constCast(final.records));
+    try testing.expectEqual(@as(i16, 0), final.error_code);
+    try testing.expectEqualStrings("live-alive-blive-clive-d", final.records);
 }
 
 test "MinIO/S3 provider ListObjects pagination gate" {

@@ -366,6 +366,46 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_integration.step);
     }
 
+    // Release-decision evidence manifest validation. The real validator skips
+    // unless ZMQ_RELEASE_EVIDENCE points at a manifest; the deterministic
+    // self-test runs both in the default test step and in this named gate.
+    const release_evidence_step = b.step("test-release-evidence", "Validate AutoMQ parity release evidence manifest");
+    {
+        const run_release_evidence = b.addSystemCommand(&.{ "python3", "tests/release_evidence_test.py" });
+        release_evidence_step.dependOn(&run_release_evidence.step);
+
+        const release_evidence_self_test = b.addSystemCommand(&.{ "python3", "tests/release_evidence_test.py", "--self-test" });
+        release_evidence_step.dependOn(&release_evidence_self_test.step);
+        test_step.dependOn(&release_evidence_self_test.step);
+    }
+
+    // Source-level protocol catalog drift audit. This mirrors the catalog,
+    // generated-index, and handler-switch checks that do not need Zig tests.
+    const protocol_static_audit_step = b.step("test-protocol-static-audit", "Run Python protocol catalog static audit");
+    {
+        const protocol_static_audit = b.addSystemCommand(&.{ "python3", "tests/protocol_static_audit.py", "--self-test" });
+        protocol_static_audit_step.dependOn(&protocol_static_audit.step);
+        test_step.dependOn(&protocol_static_audit.step);
+    }
+
+    // Source-level observability artifact drift audit. This mirrors the
+    // dashboard/alert metric-reference checks that do not need Zig tests.
+    const observability_static_audit_step = b.step("test-observability-static-audit", "Run Python observability artifact static audit");
+    {
+        const observability_static_audit = b.addSystemCommand(&.{ "python3", "tests/observability_static_audit.py", "--self-test" });
+        observability_static_audit_step.dependOn(&observability_static_audit.step);
+        test_step.dependOn(&observability_static_audit.step);
+    }
+
+    // Source-level build wiring audit. This pins Python self-tests to their
+    // named build steps and to the default test graph.
+    const build_static_audit_step = b.step("test-build-static-audit", "Run Python build wiring static audit");
+    {
+        const build_static_audit = b.addSystemCommand(&.{ "python3", "tests/build_static_audit.py", "--self-test" });
+        build_static_audit_step.dependOn(&build_static_audit.step);
+        test_step.dependOn(&build_static_audit.step);
+    }
+
     // MinIO/S3 integration tests are intentionally not part of the default
     // unit suite. Run with:
     //   ZMQ_RUN_MINIO_TESTS=1 zig build test-minio
@@ -410,6 +450,10 @@ pub fn build(b: *std.Build) void {
         const run_s3_process_crash = b.addSystemCommand(&.{ "python3", "tests/s3_process_crash_test.py" });
         run_s3_process_crash.step.dependOn(b.getInstallStep());
         s3_process_crash_step.dependOn(&run_s3_process_crash.step);
+
+        const s3_process_crash_self_test = b.addSystemCommand(&.{ "python3", "tests/s3_process_crash_test.py", "--self-test" });
+        s3_process_crash_step.dependOn(&s3_process_crash_self_test.step);
+        test_step.dependOn(&s3_process_crash_self_test.step);
     }
 
     // Live S3-compatible provider matrix. The Python wrapper skips unless
@@ -422,6 +466,7 @@ pub fn build(b: *std.Build) void {
         s3_provider_matrix_step.dependOn(&run_s3_provider_matrix.step);
 
         const s3_provider_matrix_self_test = b.addSystemCommand(&.{ "python3", "tests/s3_provider_matrix_test.py", "--self-test" });
+        s3_provider_matrix_step.dependOn(&s3_provider_matrix_self_test.step);
         test_step.dependOn(&s3_provider_matrix_self_test.step);
     }
 
@@ -435,6 +480,7 @@ pub fn build(b: *std.Build) void {
         client_matrix_step.dependOn(&run_client_matrix.step);
 
         const client_matrix_self_test = b.addSystemCommand(&.{ "python3", "tests/client_matrix_test.py", "--self-test" });
+        client_matrix_step.dependOn(&client_matrix_self_test.step);
         test_step.dependOn(&client_matrix_self_test.step);
     }
 
@@ -448,12 +494,13 @@ pub fn build(b: *std.Build) void {
         kraft_failover_step.dependOn(&run_kraft_failover.step);
 
         const kraft_failover_self_test = b.addSystemCommand(&.{ "python3", "tests/kraft_failover_test.py", "--self-test" });
+        kraft_failover_step.dependOn(&kraft_failover_self_test.step);
         test_step.dependOn(&kraft_failover_self_test.step);
     }
 
     // External broker chaos harness. The real process scenarios skip unless
     // ZMQ_RUN_CHAOS_TESTS=1 is set; the deterministic parser/fixture self-test
-    // is included in the default test step.
+    // runs both in the default test step and in this named gate.
     const chaos_step = b.step("test-chaos", "Run gated broker chaos harness");
     {
         const run_chaos = b.addSystemCommand(&.{ "python3", "tests/chaos_test.py" });
@@ -461,18 +508,20 @@ pub fn build(b: *std.Build) void {
         chaos_step.dependOn(&run_chaos.step);
 
         const chaos_self_test = b.addSystemCommand(&.{ "python3", "tests/chaos_test.py", "--self-test" });
+        chaos_step.dependOn(&chaos_self_test.step);
         test_step.dependOn(&chaos_self_test.step);
     }
 
     // Docker-compose multi-node E2E harness. The real cluster test skips
     // unless ZMQ_RUN_E2E_TESTS=1 is set; the deterministic configuration
-    // self-test is included in the default test step.
+    // self-test runs both in the default test step and in this named gate.
     const e2e_step = b.step("test-e2e", "Run gated Docker 3-node E2E harness");
     {
         const run_e2e = b.addSystemCommand(&.{ "python3", "tests/e2e_test.py" });
         e2e_step.dependOn(&run_e2e.step);
 
         const e2e_self_test = b.addSystemCommand(&.{ "python3", "tests/e2e_test.py", "--self-test" });
+        e2e_step.dependOn(&e2e_self_test.step);
         test_step.dependOn(&e2e_self_test.step);
     }
 
@@ -510,6 +559,13 @@ pub fn build(b: *std.Build) void {
     });
     linkNativeCompressionLibraries(bench_exe, native_compression, native_compression_libs);
 
+    const bench_unit_test = b.addTest(.{
+        .root_module = bench_mod,
+    });
+    linkNativeCompressionLibraries(bench_unit_test, native_compression, native_compression_libs);
+    const run_bench_unit_test = b.addRunArtifact(bench_unit_test);
+    test_step.dependOn(&run_bench_unit_test.step);
+
     const bench_run = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run performance benchmarks");
     bench_step.dependOn(&bench_run.step);
@@ -522,6 +578,7 @@ pub fn build(b: *std.Build) void {
         bench_compare_step.dependOn(&run_bench_compare.step);
 
         const bench_compare_self_test = b.addSystemCommand(&.{ "python3", "benchmarks/benchmark_compare.py", "--self-test" });
+        bench_compare_step.dependOn(&bench_compare_self_test.step);
         test_step.dependOn(&bench_compare_self_test.step);
     }
 }

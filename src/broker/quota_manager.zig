@@ -66,14 +66,21 @@ pub const QuotaManager = struct {
 
     /// Set quota for a specific client.
     pub fn setClientQuota(self: *QuotaManager, client_id: []const u8, produce_rate: f64, fetch_rate: f64, request_rate: f64) !void {
-        if (self.client_quotas.fetchRemove(client_id)) |old| {
-            self.allocator.free(old.value.client_id);
-            self.allocator.free(old.key);
+        if (self.client_quotas.getPtr(client_id)) |quota| {
+            quota.produce_rate_limit = produce_rate;
+            quota.fetch_rate_limit = fetch_rate;
+            quota.request_rate_limit = request_rate;
+            quota.produce_window = .{};
+            quota.fetch_window = .{};
+            quota.request_window = .{};
+            log.info("Quota set for client {s}: produce={d:.0}/s, fetch={d:.0}/s, request={d:.0}/s", .{ client_id, produce_rate, fetch_rate, request_rate });
+            return;
         }
 
         const key = try self.allocator.dupe(u8, client_id);
         errdefer self.allocator.free(key);
         const cid = try self.allocator.dupe(u8, client_id);
+        errdefer self.allocator.free(cid);
 
         try self.client_quotas.put(key, .{
             .client_id = cid,
@@ -199,6 +206,14 @@ pub const QuotaManager = struct {
         self.default_request_rate = request_rate;
         self.clearDefaultWindows();
     }
+
+    pub fn clientQuotaCount(self: *const QuotaManager) usize {
+        return self.client_quotas.count();
+    }
+
+    pub fn defaultWindowCount(self: *const QuotaManager) usize {
+        return self.default_windows.count();
+    }
 };
 
 // ---------------------------------------------------------------
@@ -240,6 +255,37 @@ test "QuotaManager different clients independent" {
     try testing.expectEqual(@as(i32, 0), t);
 }
 
+test "QuotaManager setClientQuota replaces duplicate client in place" {
+    var qm = QuotaManager.init(testing.allocator);
+    defer qm.deinit();
+
+    try qm.setClientQuota("client-1", 1000, 2000, 100);
+    _ = qm.recordProduce("client-1", 1500);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    qm.allocator = failing_allocator.allocator();
+    defer qm.allocator = testing.allocator;
+    try qm.setClientQuota("client-1", 3000, 4000, 200);
+    try testing.expect(!failing_allocator.has_induced_failure);
+
+    try testing.expectEqual(@as(usize, 1), qm.clientQuotaCount());
+    const quota = qm.client_quotas.get("client-1") orelse return error.ExpectedClientQuota;
+    try testing.expectEqual(@as(f64, 3000), quota.produce_rate_limit);
+    try testing.expectEqual(@as(f64, 4000), quota.fetch_rate_limit);
+    try testing.expectEqual(@as(f64, 200), quota.request_rate_limit);
+    try testing.expectEqual(@as(u64, 0), quota.produce_window.bytes_in_window);
+}
+
+test "QuotaManager setClientQuota cleans up copied client on insertion failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var qm = QuotaManager.init(failing_allocator.allocator());
+    defer qm.deinit();
+
+    try testing.expectError(error.OutOfMemory, qm.setClientQuota("client-fail", 1000, 2000, 100));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), qm.clientQuotaCount());
+}
+
 test "QuotaManager default quotas throttle clients independently" {
     var qm = QuotaManager.init(testing.allocator);
     defer qm.deinit();
@@ -275,4 +321,22 @@ test "QuotaManager changing defaults resets transient default windows" {
     qm.setDefaults(0, 0, 0);
     try testing.expectEqual(@as(u32, 0), qm.default_windows.count());
     try testing.expectEqual(@as(i32, 0), qm.recordProduce("reset-client", 10_000));
+}
+
+test "QuotaManager reports quota and default window counts" {
+    var qm = QuotaManager.init(testing.allocator);
+    defer qm.deinit();
+
+    try testing.expectEqual(@as(usize, 0), qm.clientQuotaCount());
+    try testing.expectEqual(@as(usize, 0), qm.defaultWindowCount());
+
+    try qm.setClientQuota("quota-count-client", 1000, 0, 0);
+    qm.setDefaults(2000, 0, 0);
+    try testing.expectEqual(@as(i32, 0), qm.recordProduce("default-count-client", 500));
+
+    try testing.expectEqual(@as(usize, 1), qm.clientQuotaCount());
+    try testing.expectEqual(@as(usize, 1), qm.defaultWindowCount());
+
+    qm.setDefaults(0, 0, 0);
+    try testing.expectEqual(@as(usize, 0), qm.defaultWindowCount());
 }

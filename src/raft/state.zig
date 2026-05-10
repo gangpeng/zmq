@@ -390,6 +390,7 @@ pub const RaftState = struct {
 
         if (self.metrics) |m| {
             m.incrementCounter("raft_leader_elections_won_total");
+            m.incrementCounter("kafka_controller_controllerstats_leaderelectionrateandtimems_total");
             m.setGauge("raft_role", 3.0); // leader
         }
 
@@ -1995,6 +1996,26 @@ test "Election Safety: at most one leader per epoch" {
     const resp2 = state1.handleVoteRequest(1, 1, 0, 0);
     // Should be rejected: already voted for 0 at epoch 1
     try testing.expect(!resp2.vote_granted);
+}
+
+test "RaftState leader promotion increments Raft and JMX election counters" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.registerCounter("raft_leader_elections_won_total", "Times this node became leader");
+    try registry.registerCounter("kafka_controller_controllerstats_leaderelectionrateandtimems_total", "JMX-compatible total leader election events");
+    try registry.registerGauge("raft_role", "Current Raft role");
+
+    var state = RaftState.init(testing.allocator, 1, "test-cluster");
+    defer state.deinit();
+    state.metrics = &registry;
+
+    try state.addVoter(1);
+    _ = try state.startElection();
+    state.becomeLeader();
+
+    try testing.expectEqual(@as(u64, 1), registry.counters.get("raft_leader_elections_won_total").?.value);
+    try testing.expectEqual(@as(u64, 1), registry.counters.get("kafka_controller_controllerstats_leaderelectionrateandtimems_total").?.value);
+    try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("raft_role").?.value);
 }
 
 test "Vote request rejects candidate with stale log" {

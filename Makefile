@@ -1,22 +1,32 @@
 # ZMQ Broker — Developer Makefile
 # Wraps zig build commands for convenience.
 
-ZIG ?= zig
+ZIG_0_16 ?= /tmp/zig-aarch64-linux-0.16.0/zig
+ZIG ?= $(if $(wildcard $(ZIG_0_16)),$(ZIG_0_16),zig)
 ZIG_FLAGS ?=
+ZIG_GLOBAL_CACHE_DIR ?= /tmp/zig-cache-zmq
+ZIG_LOCAL_CACHE_DIR ?= /tmp/zig-cache-zmq-local
+ZIG_ENV = ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR) ZIG_LOCAL_CACHE_DIR=$(ZIG_LOCAL_CACHE_DIR)
 
-.PHONY: build test run clean e2e s3-crash client-matrix kraft-failover docker bench help codegen
+.PHONY: build test static-audit run clean e2e s3-crash client-matrix kraft-failover docker bench help codegen
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
 build: ## Build the broker binary (debug)
-	$(ZIG) build $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build $(ZIG_FLAGS)
 
 release: ## Build optimized release binary
-	$(ZIG) build -Doptimize=ReleaseFast $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build -Doptimize=ReleaseFast $(ZIG_FLAGS)
 
 test: ## Run all unit tests
-	$(ZIG) build test --summary all $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build test --summary all $(ZIG_FLAGS)
+
+static-audit: ## Run Python-backed static release audits
+	$(ZIG_ENV) $(ZIG) build test-protocol-static-audit --summary all $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build test-observability-static-audit --summary all $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build test-build-static-audit --summary all $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build test-release-evidence --summary all $(ZIG_FLAGS)
 
 run: build ## Run the broker on port 9092
 	./zig-out/bin/zmq
@@ -46,7 +56,7 @@ kraft-failover: build ## Run gated KRaft controller failover test
 	ZMQ_BIN=./zig-out/bin/zmq python3 tests/kraft_failover_test.py
 
 bench: ## Run performance benchmarks
-	$(ZIG) build bench $(ZIG_FLAGS)
+	$(ZIG_ENV) $(ZIG) build bench $(ZIG_FLAGS)
 
 docker: ## Build Docker image
 	docker build -t zmq:latest .
@@ -64,7 +74,7 @@ clean: ## Clean build artifacts
 	rm -rf .zig-cache zig-out
 
 fmt: ## Format all Zig source files
-	find src -name '*.zig' -exec $(ZIG) fmt {} +
+	$(ZIG_ENV) find src -name '*.zig' -exec $(ZIG) fmt {} +
 
 loc: ## Count lines of code
 	@echo "Hand-written: $$(find src -name '*.zig' -not -path '*/generated/*' -not -path '*/schemas/*' -exec cat {} + | wc -l) LOC"

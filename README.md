@@ -23,7 +23,12 @@ ZMQ is a work-in-progress implementation of AutoMQ-style storage and Kafka proto
 
 ## Status And Gaps
 
-This repository intentionally does not claim full AutoMQ parity. Major remaining gaps include production-grade controller quorum behavior, complete Kafka protocol semantics across every API/version, full AutoMQ stream/object lifecycle compatibility, mature rebalance/failover behavior, broad S3 provider coverage, and exhaustive performance/chaos validation.
+This repository intentionally does not claim full AutoMQ parity. AutoMQ-complete
+requires every gate in `docs/RELEASE_CRITERIA.md` to pass for the target commit;
+local demos or default unit tests are not enough. Current blockers are the
+remaining broker-only stateless replacement assumptions plus release CI
+execution of the external-client, live S3 provider, scheduled chaos/load/failover,
+and comparative Kafka/AutoMQ performance profile and trend gates.
 
 Current S3 support covers HTTP and HTTPS endpoints, AWS SigV4 signing, single-part and multipart uploads, object reads, deletes, ranges, and listing. HTTPS uses runtime-loaded OpenSSL and system CA paths or an optional CA file; verify this in your target container/base image.
 
@@ -36,7 +41,7 @@ The tracked parity plan and acceptance matrix live in `docs/AUTOMQ_PARITY.md`.
                 │                   Kafka Clients                      │
                 │            (any language, any version)               │
                 └────────────────────┬─────────────────────────────────┘
-                                     │ Kafka Wire Protocol (41 APIs)
+                                     │ Kafka Wire Protocol (advertised API subset)
                 ┌────────────────────▼─────────────────────────────────┐
                 │               Network Layer                          │
                 │         io_uring / epoll + TLS                       │
@@ -89,6 +94,10 @@ Data flows through four tiers, balancing latency and cost:
 - **Zig 0.16.0** — [Install Zig](https://ziglang.org/download/)
 - **Docker & Docker Compose** — for MinIO and multi-broker clusters
 - **Python 3** — only for running E2E tests and protocol codegen (optional)
+
+If multiple Zig versions are installed, put Zig 0.16.0 first on `PATH` or use
+the Makefile shortcuts, which prefer `/tmp/zig-aarch64-linux-0.16.0/zig` when
+that local toolchain is present.
 
 ## Building
 
@@ -168,16 +177,19 @@ The included `docker-compose.yml` spins up a **3-broker cluster** with **MinIO**
 
 ```bash
 # Build the Docker image and start the cluster
-docker-compose up -d
+docker compose up -d --build
 
 # Verify all services are running
-docker-compose ps
+docker compose ps
+
+# Validate compose syntax without starting containers
+docker compose -f docker-compose.yml config --quiet
 
 # Watch broker logs
-docker-compose logs -f broker1 broker2 broker3
+docker compose logs -f node0 node1 node2
 
 # Stop and clean up
-docker-compose down -v
+docker compose down -v
 ```
 
 Or use the Makefile:
@@ -194,9 +206,9 @@ make docker-down    # stop and clean up
 |---------|-----------|-------|-------------|
 | **MinIO** | `zmq-minio` | `9000` (S3 API), `9001` (Console) | S3-compatible object storage |
 | **minio-init** | *(one-shot)* | — | Creates the `automq` bucket |
-| **Broker 1** | `zmq-broker-1` | `9092` (Kafka), `9090` (metrics) | Node 0 |
-| **Broker 2** | `zmq-broker-2` | `9093` (Kafka), `9091` (metrics) | Node 1 |
-| **Broker 3** | `zmq-broker-3` | `9094` (Kafka), `9095` (metrics) | Node 2 |
+| **Node 0** | `zmq-node-0` | `19092` (Kafka), `19093` (controller), `19090` (metrics) | Combined broker/controller |
+| **Node 1** | `zmq-node-1` | `19094` (Kafka), `19095` (controller), `19091` (metrics) | Combined broker/controller |
+| **Node 2** | `zmq-node-2` | `19096` (Kafka), `19097` (controller), `19098` (metrics) | Combined broker/controller |
 
 ### Cluster Topology
 
@@ -210,10 +222,10 @@ make docker-down    # stop and clean up
                         └───────┬──────────┬──────────┬───────┘
                                 │          │          │
                     ┌───────────▼──┐ ┌─────▼──────┐ ┌─▼───────────┐
-                    │  Broker 1    │ │  Broker 2   │ │  Broker 3   │
+                    │  Node 0      │ │  Node 1     │ │  Node 2      │
                     │  node-id: 0  │ │  node-id: 1 │ │  node-id: 2 │
-                    │  :9092       │ │  :9093      │ │  :9094      │
-                    │  :9090 (met) │ │  :9091 (met)│ │  :9095 (met)│
+                    │  :19092      │ │  :19094     │ │  :19096     │
+                    │  :19090 met  │ │  :19091 met │ │  :19098 met │
                     └──────────────┘ └─────────────┘ └─────────────┘
 ```
 
@@ -223,13 +235,13 @@ Once the cluster is up, connect with any standard Kafka client:
 
 ```bash
 # Using kcat (formerly kafkacat)
-echo "hello zmq" | kcat -P -b localhost:9092 -t test-topic
-kcat -C -b localhost:9092 -t test-topic -e
+echo "hello zmq" | kcat -P -b localhost:19092 -t test-topic
+kcat -C -b localhost:19092 -t test-topic -e
 
 # Using the official Kafka CLI tools
-kafka-topics.sh --bootstrap-server localhost:9092 --create --topic test-topic --partitions 3
-kafka-console-producer.sh --bootstrap-server localhost:9092 --topic test-topic
-kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic test-topic --from-beginning
+kafka-topics.sh --bootstrap-server localhost:19092 --create --topic test-topic --partitions 3
+kafka-console-producer.sh --bootstrap-server localhost:19092 --topic test-topic
+kafka-console-consumer.sh --bootstrap-server localhost:19092 --topic test-topic --from-beginning
 ```
 
 ### Accessing MinIO Console
@@ -245,13 +257,13 @@ Each broker exposes HTTP endpoints for monitoring:
 
 ```bash
 # Health check
-curl http://localhost:9090/health
+curl http://localhost:19090/health
 
 # Readiness probe
-curl http://localhost:9090/ready
+curl http://localhost:19090/ready
 
 # Prometheus metrics
-curl http://localhost:9090/metrics
+curl http://localhost:19090/metrics
 ```
 
 ### Running Without Docker (Manual Multi-Broker)
@@ -286,6 +298,9 @@ zig build test --summary all
 # or
 make test
 
+# Run Python-backed static release audits
+make static-audit
+
 # Run E2E integration tests against a running Docker cluster
 make e2e
 
@@ -316,7 +331,7 @@ ZMQ includes production-grade features across five dimensions. All code is AI-ge
 
 ### Security
 - **TLS**: Hostname verification (SSL_set1_host), certificate chain validation, expiry checking, 30s handshake timeout
-- **mTLS**: Client certificate principal extraction from subject DN for ACL authorization
+- **mTLS**: Client certificate principal extraction from subject DN for ACL authorization, with optional Kafka-style `ssl.principal.mapping.rules` for common multi-capture DN mapping rules
 - **SASL/PLAIN**: Password authentication with PBKDF2-hashed credential storage
 - **SCRAM-SHA-256**: Full RFC 5802 multi-round authentication exchange
 - **OAUTHBEARER**: JWT claim extraction (issuer, audience, expiry validation)
@@ -360,7 +375,7 @@ The broker supports Kafka-style `key=value` properties files. See [`config/serve
 ```
 .
 ├── build.zig               # Zig build system — 8 modules + executable
-├── Dockerfile              # Multi-stage Docker build (Zig 0.13.0 → slim runtime)
+├── Dockerfile              # Multi-stage Docker build (Zig 0.16.0 → slim runtime)
 ├── docker-compose.yml      # 3-broker cluster + MinIO
 ├── Makefile                # Developer shortcuts
 ├── config/
@@ -389,6 +404,10 @@ The broker supports Kafka-style `key=value` properties files. See [`config/serve
 ├── tests/
 │   ├── e2e_test.py         # 9-scenario E2E integration test suite
 │   ├── cluster_validation_test.py # 16-phase cluster validation (wire protocol, stress, observability)
+│   ├── protocol_static_audit.py # ApiVersions/generated-index/handler static audit
+│   ├── observability_static_audit.py # Grafana/Prometheus metric-reference static audit
+│   ├── build_static_audit.py # Build graph/toolchain wiring static audit
+│   ├── release_evidence_test.py # AutoMQ parity release evidence validator
 │   └── production_readiness_test.zig # Cross-cutting integration tests
 ├── benchmarks/
 │   ├── main.zig            # Performance benchmarks
@@ -403,6 +422,7 @@ The broker supports Kafka-style `key=value` properties files. See [`config/serve
   build           Build the broker binary (debug)
   release         Build optimized release binary
   test            Run all unit tests
+  static-audit    Run Python-backed static release audits
   run             Run the broker on port 9092
   run-s3          Run with MinIO S3 backend
   run-cluster     Run 3-node cluster (requires 3 terminals)

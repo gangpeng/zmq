@@ -218,17 +218,21 @@ pub const OpenSslLib = struct {
     /// if CN is not present. The caller owns the returned string.
     /// Returns null if no peer certificate or extraction functions unavailable.
     pub fn extractMtlsPrincipal(self: *const OpenSslLib, ssl: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+        return self.extractMtlsPrincipalWithRules(ssl, allocator, null) catch null;
+    }
+
+    /// Extract the mTLS client principal and apply Kafka-style principal mapping
+    /// rules when configured. Unsupported rule syntax fails closed so a broker
+    /// does not silently authenticate a client as the wrong principal.
+    pub fn extractMtlsPrincipalWithRules(
+        self: *const OpenSslLib,
+        ssl: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        mapping_rules: ?[]const u8,
+    ) !?[]u8 {
         var subject_buf: [1024]u8 = undefined;
         const subject_dn = self.getPeerCertSubject(ssl, &subject_buf) orelse return null;
-
-        // Extract CN from subject DN (format: "/C=US/ST=.../CN=client-name/...")
-        // Kafka convention: principal is "User:<CN value>"
-        if (extractCnFromDn(subject_dn)) |cn| {
-            return std.fmt.allocPrint(allocator, "User:{s}", .{cn}) catch null;
-        }
-
-        // Fallback: use the entire subject DN as the principal identity
-        return std.fmt.allocPrint(allocator, "User:{s}", .{subject_dn}) catch null;
+        return try formatMtlsPrincipalFromSubject(allocator, subject_dn, mapping_rules);
     }
 
     /// Parse the CN (Common Name) field from an X509 subject DN string.
@@ -246,6 +250,677 @@ pub const OpenSslLib = struct {
         const end_idx = std.mem.indexOf(u8, remaining, "/") orelse remaining.len;
         if (end_idx == 0) return null;
         return remaining[0..end_idx];
+    }
+
+    /// Format an mTLS principal from an X.500 subject DN. With no mapping rules
+    /// this preserves the historical ZMQ behavior: extract CN and return
+    /// "User:<CN>", falling back to the original subject DN. When rules are
+    /// present, this supports Kafka-style RULE:pattern/replacement/[LU] entries
+    /// and DEFAULT against a comma-separated DN normalized from OpenSSL oneline.
+    pub fn formatMtlsPrincipalFromSubject(
+        allocator: std.mem.Allocator,
+        subject_dn: []const u8,
+        mapping_rules: ?[]const u8,
+    ) ![]u8 {
+        const rules_text = mapping_rules orelse return formatDefaultMtlsPrincipal(allocator, subject_dn);
+        const trimmed_rules = std.mem.trim(u8, rules_text, " \t\r\n");
+        if (trimmed_rules.len == 0) return error.InvalidPrincipalMappingRules;
+
+        const normalized_dn = try normalizeSubjectDn(allocator, subject_dn);
+        defer allocator.free(normalized_dn);
+
+        var pos: usize = 0;
+        var saw_rule = false;
+        while (try nextPrincipalRule(trimmed_rules, &pos)) |rule| {
+            saw_rule = true;
+            switch (rule) {
+                .fallback => {
+                    return std.fmt.allocPrint(allocator, "User:{s}", .{normalized_dn});
+                },
+                .rule => |r| {
+                    const match = try matchPrincipalPattern(r.pattern, normalized_dn);
+                    if (!match.matched) continue;
+
+                    const mapped_name = try applyPrincipalReplacement(
+                        allocator,
+                        r.replacement,
+                        normalized_dn,
+                        match,
+                    );
+                    defer allocator.free(mapped_name);
+                    applyPrincipalTransform(mapped_name, r.transform);
+                    if (mapped_name.len == 0) return error.EmptyPrincipalMappingResult;
+                    return std.fmt.allocPrint(allocator, "User:{s}", .{mapped_name});
+                },
+            }
+        }
+
+        if (!saw_rule) return error.InvalidPrincipalMappingRules;
+        return error.PrincipalMappingRuleNoMatch;
+    }
+
+    pub fn validatePrincipalMappingRules(rules_text: []const u8) !void {
+        const trimmed_rules = std.mem.trim(u8, rules_text, " \t\r\n");
+        if (trimmed_rules.len == 0) return error.InvalidPrincipalMappingRules;
+
+        var pos: usize = 0;
+        var saw_rule = false;
+        while (try nextPrincipalRule(trimmed_rules, &pos)) |_| {
+            saw_rule = true;
+        }
+        if (!saw_rule) return error.InvalidPrincipalMappingRules;
+    }
+
+    const PrincipalTransform = enum {
+        none,
+        lower,
+        upper,
+    };
+
+    const PrincipalRegexRule = struct {
+        pattern: []const u8,
+        replacement: []const u8,
+        transform: PrincipalTransform,
+    };
+
+    const PrincipalRule = union(enum) {
+        fallback,
+        rule: PrincipalRegexRule,
+    };
+
+    const max_principal_captures = 9;
+
+    const PrincipalCaptures = struct {
+        count: usize = 0,
+        values: [max_principal_captures]?[]const u8 = [_]?[]const u8{null} ** max_principal_captures,
+    };
+
+    const PrincipalPatternMatch = struct {
+        matched: bool,
+        captures: PrincipalCaptures = .{},
+    };
+
+    const PrincipalMappingError = error{
+        EmptyPrincipalMappingResult,
+        InvalidPrincipalMappingRules,
+        OutOfMemory,
+        PrincipalMappingRuleNoMatch,
+        UnsupportedPrincipalMappingRule,
+    };
+
+    fn formatDefaultMtlsPrincipal(allocator: std.mem.Allocator, subject_dn: []const u8) ![]u8 {
+        if (extractCnFromDn(subject_dn)) |cn| {
+            return std.fmt.allocPrint(allocator, "User:{s}", .{cn});
+        }
+        return std.fmt.allocPrint(allocator, "User:{s}", .{subject_dn});
+    }
+
+    fn normalizeSubjectDn(allocator: std.mem.Allocator, subject_dn: []const u8) ![]u8 {
+        if (!std.mem.startsWith(u8, subject_dn, "/")) {
+            return try allocator.dupe(u8, subject_dn);
+        }
+
+        var normalized = std.array_list.Managed(u8).init(allocator);
+        errdefer normalized.deinit();
+
+        var first = true;
+        var parts = std.mem.splitScalar(u8, subject_dn, '/');
+        while (parts.next()) |part| {
+            if (part.len == 0) continue;
+            if (!first) try normalized.append(',');
+            try normalized.appendSlice(part);
+            first = false;
+        }
+        return try normalized.toOwnedSlice();
+    }
+
+    fn nextPrincipalRule(rules_text: []const u8, pos: *usize) !?PrincipalRule {
+        skipSpaces(rules_text, pos);
+        if (pos.* >= rules_text.len) return null;
+        if (rules_text[pos.*] == ',') return error.InvalidPrincipalMappingRules;
+
+        if (startsWithAt(rules_text, pos.*, "DEFAULT")) {
+            var end = pos.* + "DEFAULT".len;
+            skipSpacesAt(rules_text, &end);
+            if (end < rules_text.len and rules_text[end] != ',') {
+                return error.InvalidPrincipalMappingRules;
+            }
+            pos.* = try consumeRuleSeparator(rules_text, end);
+            return PrincipalRule{ .fallback = {} };
+        }
+
+        if (!startsWithAt(rules_text, pos.*, "RULE:")) {
+            return error.InvalidPrincipalMappingRules;
+        }
+
+        var cursor = pos.* + "RULE:".len;
+        const pattern_start = cursor;
+        const first_delim = try findRuleDelimiter(rules_text, cursor);
+        const pattern = rules_text[pattern_start..first_delim];
+        cursor = first_delim + 1;
+
+        const replacement_start = cursor;
+        const second_delim = try findRuleDelimiter(rules_text, cursor);
+        const replacement = rules_text[replacement_start..second_delim];
+        cursor = second_delim + 1;
+
+        var transform: PrincipalTransform = .none;
+        if (cursor < rules_text.len) {
+            switch (rules_text[cursor]) {
+                'L' => {
+                    transform = .lower;
+                    cursor += 1;
+                },
+                'U' => {
+                    transform = .upper;
+                    cursor += 1;
+                },
+                else => {},
+            }
+        }
+
+        skipSpacesAt(rules_text, &cursor);
+        if (cursor < rules_text.len and rules_text[cursor] != ',') {
+            return error.InvalidPrincipalMappingRules;
+        }
+
+        try validatePrincipalPattern(pattern);
+        try validatePrincipalReplacement(replacement);
+
+        pos.* = try consumeRuleSeparator(rules_text, cursor);
+        return PrincipalRule{ .rule = .{
+            .pattern = pattern,
+            .replacement = replacement,
+            .transform = transform,
+        } };
+    }
+
+    fn skipSpaces(text: []const u8, pos: *usize) void {
+        skipSpacesAt(text, pos);
+    }
+
+    fn skipSpacesAt(text: []const u8, pos: *usize) void {
+        while (pos.* < text.len) {
+            switch (text[pos.*]) {
+                ' ', '\t', '\r', '\n' => pos.* += 1,
+                else => return,
+            }
+        }
+    }
+
+    fn startsWithAt(text: []const u8, index: usize, prefix: []const u8) bool {
+        return index <= text.len and std.mem.startsWith(u8, text[index..], prefix);
+    }
+
+    fn consumeRuleSeparator(text: []const u8, index: usize) !usize {
+        var cursor = index;
+        skipSpacesAt(text, &cursor);
+        if (cursor >= text.len) return cursor;
+        if (text[cursor] != ',') return error.InvalidPrincipalMappingRules;
+        cursor += 1;
+
+        var next = cursor;
+        skipSpacesAt(text, &next);
+        if (next >= text.len) return error.InvalidPrincipalMappingRules;
+        return cursor;
+    }
+
+    fn findRuleDelimiter(text: []const u8, start: usize) !usize {
+        var i = start;
+        while (i < text.len) {
+            if (text[i] == '\\') {
+                if (i + 1 >= text.len) return error.InvalidPrincipalMappingRules;
+                i += 2;
+                continue;
+            }
+            if (text[i] == '/') return i;
+            i += 1;
+        }
+        return error.InvalidPrincipalMappingRules;
+    }
+
+    fn validatePrincipalPattern(pattern: []const u8) !void {
+        if (pattern.len == 0) return error.InvalidPrincipalMappingRules;
+
+        var i: usize = 0;
+        var captures: usize = 0;
+        while (i < pattern.len) {
+            switch (pattern[i]) {
+                '\\' => {
+                    if (i + 1 >= pattern.len) return error.InvalidPrincipalMappingRules;
+                    i += 2;
+                },
+                '^' => {
+                    if (i != 0) return error.UnsupportedPrincipalMappingRule;
+                    i += 1;
+                },
+                '$' => {
+                    if (i + 1 != pattern.len) return error.UnsupportedPrincipalMappingRule;
+                    i += 1;
+                },
+                '.' => {
+                    const wildcard_len = try wildcardTokenLen(pattern, i);
+                    i += wildcard_len;
+                },
+                '(' => {
+                    if (captures >= max_principal_captures) return error.UnsupportedPrincipalMappingRule;
+                    const end = findCaptureEnd(pattern, i + 1) orelse return error.InvalidPrincipalMappingRules;
+                    try validateCapturePattern(pattern[i + 1 .. end]);
+                    captures += 1;
+                    i = end + 1;
+                },
+                ')', '[', ']', '*', '+', '?', '|' => return error.UnsupportedPrincipalMappingRule,
+                else => i += 1,
+            }
+        }
+    }
+
+    fn validateCapturePattern(inner: []const u8) !void {
+        _ = try parseCapturePattern(inner);
+    }
+
+    fn validatePrincipalReplacement(replacement: []const u8) !void {
+        if (replacement.len == 0) return error.InvalidPrincipalMappingRules;
+
+        var i: usize = 0;
+        while (i < replacement.len) {
+            switch (replacement[i]) {
+                '\\' => {
+                    if (i + 1 >= replacement.len) return error.InvalidPrincipalMappingRules;
+                    i += 2;
+                },
+                '$' => {
+                    if (i + 1 >= replacement.len) return error.InvalidPrincipalMappingRules;
+                    if (replacement[i + 1] >= '0' and replacement[i + 1] <= '9') {
+                        i += 2;
+                    } else if (replacement[i + 1] == '{') {
+                        if (i + 3 >= replacement.len or replacement[i + 2] < '0' or replacement[i + 2] > '9' or replacement[i + 3] != '}') {
+                            return error.UnsupportedPrincipalMappingRule;
+                        }
+                        i += 4;
+                    } else {
+                        return error.UnsupportedPrincipalMappingRule;
+                    }
+                },
+                else => i += 1,
+            }
+        }
+    }
+
+    fn wildcardTokenLen(pattern: []const u8, index: usize) !usize {
+        if (index + 1 >= pattern.len) return error.UnsupportedPrincipalMappingRule;
+        if (pattern[index] != '.') return error.UnsupportedPrincipalMappingRule;
+        if (pattern[index + 1] != '*' and pattern[index + 1] != '+') {
+            return error.UnsupportedPrincipalMappingRule;
+        }
+        if (index + 2 < pattern.len and pattern[index + 2] == '?') return 3;
+        return 2;
+    }
+
+    fn findCaptureEnd(pattern: []const u8, start: usize) ?usize {
+        var i = start;
+        while (i < pattern.len) : (i += 1) {
+            if (pattern[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (pattern[i] == ')') return i;
+            if (pattern[i] == '(') return null;
+        }
+        return null;
+    }
+
+    const CaptureKind = enum {
+        any,
+        char_class,
+        not_char,
+    };
+
+    const CapturePattern = struct {
+        kind: CaptureKind,
+        class: []const u8 = "",
+        excluded: u8 = 0,
+        min_len: usize,
+        greedy: bool,
+    };
+
+    fn parseCapturePattern(inner: []const u8) !CapturePattern {
+        if (inner.len == 2 or inner.len == 3) {
+            if (inner[0] == '.' and (inner[1] == '*' or inner[1] == '+')) {
+                if (inner.len == 3 and inner[2] != '?') return error.UnsupportedPrincipalMappingRule;
+                return .{
+                    .kind = .any,
+                    .min_len = if (inner[1] == '+') 1 else 0,
+                    .greedy = inner.len != 3,
+                };
+            }
+        }
+
+        if (inner.len >= 4 and inner[0] == '[') {
+            const class_end = findCharacterClassEnd(inner, 1) orelse return error.InvalidPrincipalMappingRules;
+            if (class_end + 1 >= inner.len) return error.UnsupportedPrincipalMappingRule;
+            const quantifier = inner[class_end + 1];
+            if (quantifier != '*' and quantifier != '+') return error.UnsupportedPrincipalMappingRule;
+            if (class_end + 2 < inner.len and inner[class_end + 2] != '?') return error.UnsupportedPrincipalMappingRule;
+            if (class_end + 3 < inner.len) return error.UnsupportedPrincipalMappingRule;
+
+            const class = inner[1..class_end];
+            if (class.len == 0) return error.UnsupportedPrincipalMappingRule;
+            if (class.len == 2 and class[0] == '^') {
+                return .{
+                    .kind = .not_char,
+                    .excluded = class[1],
+                    .min_len = if (quantifier == '+') 1 else 0,
+                    .greedy = class_end + 2 >= inner.len,
+                };
+            }
+            if (class[0] == '^') return error.UnsupportedPrincipalMappingRule;
+            try validateCharacterClass(class);
+            return .{
+                .kind = .char_class,
+                .class = class,
+                .min_len = if (quantifier == '+') 1 else 0,
+                .greedy = class_end + 2 >= inner.len,
+            };
+        }
+
+        return error.UnsupportedPrincipalMappingRule;
+    }
+
+    fn findCharacterClassEnd(pattern: []const u8, start: usize) ?usize {
+        var i = start;
+        while (i < pattern.len) : (i += 1) {
+            if (pattern[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (pattern[i] == ']') return i;
+        }
+        return null;
+    }
+
+    fn validateCharacterClass(class: []const u8) !void {
+        var i: usize = 0;
+        while (i < class.len) {
+            if (class[i] == '\\') {
+                if (i + 1 >= class.len) return error.InvalidPrincipalMappingRules;
+                i += 2;
+                continue;
+            }
+            if (i + 2 < class.len and class[i + 1] == '-') {
+                if (class[i] > class[i + 2]) return error.UnsupportedPrincipalMappingRule;
+                i += 3;
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn matchPrincipalPattern(pattern: []const u8, input: []const u8) PrincipalMappingError!PrincipalPatternMatch {
+        var captures = PrincipalCaptures{};
+        const matched = try matchPrincipalPatternFrom(pattern, 0, input, 0, &captures);
+        return .{ .matched = matched, .captures = captures };
+    }
+
+    fn matchPrincipalPatternFrom(
+        pattern: []const u8,
+        pattern_index: usize,
+        input: []const u8,
+        input_index: usize,
+        captures: *PrincipalCaptures,
+    ) PrincipalMappingError!bool {
+        if (pattern_index == pattern.len) return input_index == input.len;
+
+        const c = pattern[pattern_index];
+        switch (c) {
+            '^' => {
+                if (input_index != 0) return false;
+                return try matchPrincipalPatternFrom(pattern, pattern_index + 1, input, input_index, captures);
+            },
+            '$' => return input_index == input.len and pattern_index + 1 == pattern.len,
+            '\\' => {
+                if (pattern_index + 1 >= pattern.len) return error.InvalidPrincipalMappingRules;
+                return try matchLiteralAndContinue(pattern, pattern_index + 2, input, input_index, pattern[pattern_index + 1], captures);
+            },
+            '.' => {
+                const token_len = try wildcardTokenLen(pattern, pattern_index);
+                const min_len: usize = if (pattern[pattern_index + 1] == '+') 1 else 0;
+                const greedy = !(token_len == 3 and pattern[pattern_index + 2] == '?');
+                return try matchWildcardAndContinue(
+                    pattern,
+                    pattern_index + token_len,
+                    input,
+                    input_index,
+                    min_len,
+                    greedy,
+                    captures,
+                );
+            },
+            '(' => {
+                if (captures.count >= max_principal_captures) return error.UnsupportedPrincipalMappingRule;
+                const capture_index = captures.count;
+                const capture_end = findCaptureEnd(pattern, pattern_index + 1) orelse return error.InvalidPrincipalMappingRules;
+                const capture_pattern = try parseCapturePattern(pattern[pattern_index + 1 .. capture_end]);
+                return try matchCaptureAndContinue(
+                    pattern,
+                    capture_end + 1,
+                    input,
+                    input_index,
+                    capture_pattern,
+                    capture_index,
+                    captures,
+                );
+            },
+            else => return try matchLiteralAndContinue(pattern, pattern_index + 1, input, input_index, c, captures),
+        }
+    }
+
+    fn matchLiteralAndContinue(
+        pattern: []const u8,
+        next_pattern_index: usize,
+        input: []const u8,
+        input_index: usize,
+        literal: u8,
+        captures: *PrincipalCaptures,
+    ) PrincipalMappingError!bool {
+        if (input_index >= input.len or input[input_index] != literal) return false;
+        return try matchPrincipalPatternFrom(pattern, next_pattern_index, input, input_index + 1, captures);
+    }
+
+    fn matchWildcardAndContinue(
+        pattern: []const u8,
+        next_pattern_index: usize,
+        input: []const u8,
+        input_index: usize,
+        min_len: usize,
+        greedy: bool,
+        captures: *PrincipalCaptures,
+    ) PrincipalMappingError!bool {
+        if (input_index + min_len > input.len) return false;
+
+        if (greedy) {
+            var end = input.len;
+            while (end >= input_index + min_len) {
+                var branch_captures = captures.*;
+                if (try matchPrincipalPatternFrom(pattern, next_pattern_index, input, end, &branch_captures)) {
+                    captures.* = branch_captures;
+                    return true;
+                }
+                if (end == input_index + min_len) break;
+                end -= 1;
+            }
+            return false;
+        }
+
+        var end = input_index + min_len;
+        while (end <= input.len) : (end += 1) {
+            var branch_captures = captures.*;
+            if (try matchPrincipalPatternFrom(pattern, next_pattern_index, input, end, &branch_captures)) {
+                captures.* = branch_captures;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn matchCaptureAndContinue(
+        pattern: []const u8,
+        next_pattern_index: usize,
+        input: []const u8,
+        input_index: usize,
+        capture_pattern: CapturePattern,
+        capture_index: usize,
+        captures: *PrincipalCaptures,
+    ) PrincipalMappingError!bool {
+        const max_end = captureMaxEnd(input, input_index, capture_pattern);
+        if (input_index + capture_pattern.min_len > max_end) return false;
+
+        if (capture_pattern.greedy) {
+            var end = max_end;
+            while (end >= input_index + capture_pattern.min_len) {
+                var branch_captures = captures.*;
+                branch_captures.values[capture_index] = input[input_index..end];
+                branch_captures.count = @max(branch_captures.count, capture_index + 1);
+                if (try matchPrincipalPatternFrom(pattern, next_pattern_index, input, end, &branch_captures)) {
+                    captures.* = branch_captures;
+                    return true;
+                }
+                if (end == input_index + capture_pattern.min_len) break;
+                end -= 1;
+            }
+            return false;
+        }
+
+        var end = input_index + capture_pattern.min_len;
+        while (end <= max_end) : (end += 1) {
+            var branch_captures = captures.*;
+            branch_captures.values[capture_index] = input[input_index..end];
+            branch_captures.count = @max(branch_captures.count, capture_index + 1);
+            if (try matchPrincipalPatternFrom(pattern, next_pattern_index, input, end, &branch_captures)) {
+                captures.* = branch_captures;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn captureMaxEnd(input: []const u8, input_index: usize, capture_pattern: CapturePattern) usize {
+        switch (capture_pattern.kind) {
+            .any => return input.len,
+            .char_class => {
+                var end = input_index;
+                while (end < input.len and characterClassContains(capture_pattern.class, input[end])) : (end += 1) {}
+                return end;
+            },
+            .not_char => {
+                var end = input_index;
+                while (end < input.len and input[end] != capture_pattern.excluded) : (end += 1) {}
+                return end;
+            },
+        }
+    }
+
+    fn characterClassContains(class: []const u8, value: u8) bool {
+        var i: usize = 0;
+        while (i < class.len) {
+            var first = class[i];
+            if (first == '\\') {
+                if (i + 1 >= class.len) return false;
+                first = class[i + 1];
+                if (first == value) return true;
+                i += 2;
+                continue;
+            }
+            if (i + 2 < class.len and class[i + 1] == '-') {
+                const last = class[i + 2];
+                if (first <= value and value <= last) return true;
+                i += 3;
+                continue;
+            }
+            if (first == value) return true;
+            i += 1;
+        }
+        return false;
+    }
+
+    fn applyPrincipalReplacement(
+        allocator: std.mem.Allocator,
+        replacement: []const u8,
+        input: []const u8,
+        match: PrincipalPatternMatch,
+    ) ![]u8 {
+        var output = std.array_list.Managed(u8).init(allocator);
+        errdefer output.deinit();
+
+        var i: usize = 0;
+        while (i < replacement.len) {
+            switch (replacement[i]) {
+                '\\' => {
+                    if (i + 1 >= replacement.len) return error.InvalidPrincipalMappingRules;
+                    try output.append(replacement[i + 1]);
+                    i += 2;
+                },
+                '$' => {
+                    if (i + 1 >= replacement.len) return error.InvalidPrincipalMappingRules;
+                    if (replacement[i + 1] == '0') {
+                        try output.appendSlice(input);
+                        i += 2;
+                    } else if (replacement[i + 1] >= '1' and replacement[i + 1] <= '9') {
+                        const capture_index: usize = @intCast(replacement[i + 1] - '1');
+                        try output.appendSlice(try capturedPrincipalGroup(match, capture_index));
+                        i += 2;
+                    } else if (replacement[i + 1] == '{') {
+                        if (i + 3 >= replacement.len or replacement[i + 3] != '}') {
+                            return error.InvalidPrincipalMappingRules;
+                        }
+                        switch (replacement[i + 2]) {
+                            '0' => try output.appendSlice(input),
+                            '1'...'9' => |capture_ref| {
+                                const capture_index: usize = @intCast(capture_ref - '1');
+                                try output.appendSlice(try capturedPrincipalGroup(match, capture_index));
+                            },
+                            else => return error.UnsupportedPrincipalMappingRule,
+                        }
+                        i += 4;
+                    } else {
+                        return error.UnsupportedPrincipalMappingRule;
+                    }
+                },
+                else => {
+                    try output.append(replacement[i]);
+                    i += 1;
+                },
+            }
+        }
+
+        return try output.toOwnedSlice();
+    }
+
+    fn capturedPrincipalGroup(match: PrincipalPatternMatch, capture_index: usize) PrincipalMappingError![]const u8 {
+        if (capture_index >= match.captures.count) return error.UnsupportedPrincipalMappingRule;
+        return match.captures.values[capture_index] orelse return error.UnsupportedPrincipalMappingRule;
+    }
+
+    fn applyPrincipalTransform(text: []u8, transform: PrincipalTransform) void {
+        switch (transform) {
+            .none => {},
+            .lower => {
+                for (text) |*c| c.* = asciiLower(c.*);
+            },
+            .upper => {
+                for (text) |*c| c.* = asciiUpper(c.*);
+            },
+        }
+    }
+
+    fn asciiLower(c: u8) u8 {
+        if (c >= 'A' and c <= 'Z') return c + ('a' - 'A');
+        return c;
+    }
+
+    fn asciiUpper(c: u8) u8 {
+        if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
+        return c;
     }
 
     // -- C dlopen/dlsym/dlclose --
@@ -468,6 +1143,68 @@ test "extractCnFromDn handles CN at end without trailing slash" {
     const cn = OpenSslLib.extractCnFromDn(dn);
     try testing.expect(cn != null);
     try testing.expectEqualStrings("my-service", cn.?);
+}
+
+test "formatMtlsPrincipalFromSubject preserves default CN extraction" {
+    const principal = try OpenSslLib.formatMtlsPrincipalFromSubject(
+        testing.allocator,
+        "/C=US/ST=California/O=ZMQ/CN=kafka-client-1",
+        null,
+    );
+    defer testing.allocator.free(principal);
+
+    try testing.expectEqualStrings("User:kafka-client-1", principal);
+}
+
+test "formatMtlsPrincipalFromSubject applies Kafka-style rule with lower transform" {
+    const principal = try OpenSslLib.formatMtlsPrincipalFromSubject(
+        testing.allocator,
+        "/C=US/ST=California/O=ZMQ/CN=Kafka-Client-1",
+        "RULE:.*CN=([^,]+).*/$1/L,DEFAULT",
+    );
+    defer testing.allocator.free(principal);
+
+    try testing.expectEqualStrings("User:kafka-client-1", principal);
+}
+
+test "formatMtlsPrincipalFromSubject applies multi-capture character-class rule" {
+    const principal = try OpenSslLib.formatMtlsPrincipalFromSubject(
+        testing.allocator,
+        "/C=US/O=ZMQ/OU=ServiceUsers/CN=Kafka_Client-1",
+        "RULE:.*OU=([A-Za-z]+),CN=([A-Za-z0-9._-]+).*/$2@$1/L,DEFAULT",
+    );
+    defer testing.allocator.free(principal);
+
+    try testing.expectEqualStrings("User:kafka_client-1@serviceusers", principal);
+}
+
+test "formatMtlsPrincipalFromSubject falls back to normalized DN on DEFAULT" {
+    const principal = try OpenSslLib.formatMtlsPrincipalFromSubject(
+        testing.allocator,
+        "/C=US/O=ZMQ/CN=kafka-client-1",
+        "RULE:^OU=([^,]+)$/$1/,DEFAULT",
+    );
+    defer testing.allocator.free(principal);
+
+    try testing.expectEqualStrings("User:C=US,O=ZMQ,CN=kafka-client-1", principal);
+}
+
+test "validatePrincipalMappingRules rejects unsupported regex syntax" {
+    try testing.expectError(
+        error.UnsupportedPrincipalMappingRule,
+        OpenSslLib.validatePrincipalMappingRules("RULE:.*CN=(foo|bar).*/$1/"),
+    );
+}
+
+test "formatMtlsPrincipalFromSubject rejects replacement for missing capture" {
+    try testing.expectError(
+        error.UnsupportedPrincipalMappingRule,
+        OpenSslLib.formatMtlsPrincipalFromSubject(
+            testing.allocator,
+            "/C=US/O=ZMQ/CN=kafka-client-1",
+            "RULE:.*CN=([^,]+).*/$2/",
+        ),
+    );
 }
 
 test "CertExpiryStatus isValid" {

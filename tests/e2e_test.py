@@ -42,6 +42,8 @@ Optional cross-broker chaos environment:
                                       (node0; scale-out defaults to node1)
   ZMQ_E2E_LOAD_SCALE_FIXTURE_PRODUCER_NODE
                                       node used by fixture marker produce (node1)
+  ZMQ_E2E_LOAD_SCALE_<PHASE>_FIXTURE_DRY_RUN
+                                      skip Docker and produce calls for fixture self-checks (0)
   ZMQ_E2E_LOAD_SCALE_<PHASE>_FIXTURE_PRESTOP
                                       pre-stop target before scale-out apply (1)
   ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS
@@ -66,8 +68,6 @@ import urllib.request
 import shlex
 import zlib
 
-RUN_ENABLED = sys.argv.count("--self-test") > 0 or os.environ.get("ZMQ_RUN_E2E_TESTS") == "1"
-
 # ---------------------------------------------------------------
 # Configuration — matches docker-compose.yml port mapping
 # ---------------------------------------------------------------
@@ -79,8 +79,82 @@ NODES = [
 MINIO_PORT = 9000
 
 
-def truthy(value):
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
+BOOL_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+PLACEHOLDER_ENV_VALUES = {
+    "...",
+    "placeholder",
+    "required",
+    "tbd",
+    "todo",
+}
+
+
+def placeholder_env_value(value):
+    stripped = str(value).strip()
+    lowered = stripped.lower()
+    angle_start = stripped.find("<")
+    has_angle_placeholder = (
+        angle_start >= 0
+        and stripped.find(">", angle_start + 1) > angle_start + 1
+    )
+    return (
+        lowered in PLACEHOLDER_ENV_VALUES
+        or lowered.startswith("/path/to/")
+        or has_angle_placeholder
+    )
+
+
+def validate_non_placeholder_values(values, label):
+    placeholders = [value for value in values if placeholder_env_value(value)]
+    if placeholders:
+        raise AssertionError(
+            f"{label} uses placeholder values: " + ", ".join(placeholders)
+        )
+
+
+def strict_bool_text(name, value, default=None):
+    if value is None:
+        return default
+    stripped = str(value).strip()
+    if not stripped or placeholder_env_value(stripped):
+        raise AssertionError(f"{name} must not be blank or use a placeholder value")
+    lowered = stripped.lower()
+    if lowered in BOOL_TRUE_VALUES:
+        return True
+    if lowered in BOOL_FALSE_VALUES:
+        return False
+    raise AssertionError(f"{name} must be true or false")
+
+
+def non_negative_int_setting(name, default=0):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    stripped = str(value).strip()
+    if not stripped:
+        raise AssertionError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise AssertionError(f"{name} must not use a placeholder value")
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise AssertionError(f"{name} must be an integer") from exc
+    if parsed < 0:
+        raise AssertionError(f"{name} must be non-negative")
+    return parsed
+
+
+def e2e_bool_setting(name, default=False):
+    if name not in os.environ:
+        return default
+    return strict_bool_text(name, os.environ[name], default)
+
+
+def run_gate_enabled(name):
+    return strict_bool_text(name, os.environ.get(name), False)
 
 
 # ---------------------------------------------------------------
@@ -360,9 +434,9 @@ def describe_quorum(port, corr_id):
 
 
 def wait_for_controller_leader(t, forbidden_leaders=frozenset(), timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_detail = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         for node in NODES:
             try:
                 quorum = describe_quorum(node["controller_port"], t.next())
@@ -600,9 +674,9 @@ def metadata_partition_leader(port, corr_id, topic):
 
 
 def wait_for_metadata_leader(t, port, topic, expected_leader, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_detail = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             metadata = metadata_partition_leader(port, t.next(), topic)
             if metadata["leader_id"] == expected_leader:
@@ -615,9 +689,9 @@ def wait_for_metadata_leader(t, port, topic, expected_leader, timeout=30):
 
 
 def wait_for_broker_api_versions(t, node, timeout=90):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_detail = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         sock = None
         try:
             sock = t.connect(node["broker_port"])
@@ -638,9 +712,9 @@ def wait_for_broker_api_versions(t, node, timeout=90):
 
 
 def wait_for_metadata_topics(t, node, timeout=60):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_detail = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         sock = None
         try:
             sock = t.connect(node["broker_port"])
@@ -722,10 +796,10 @@ def list_partition_reassignment(port, corr_id, topic, partition):
 
 
 def wait_for_partition_reassignment(t, port, topic, partition, expected_replicas, timeout=30):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_state = None
     last_detail = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             last_state = list_partition_reassignment(port, t.next(), topic, partition)
             if last_state is not None and last_state["replicas"] == expected_replicas:
@@ -745,9 +819,23 @@ def wait_for_partition_reassignment(t, port, topic, partition, expected_replicas
 # ---------------------------------------------------------------
 
 def split_csv(raw):
-    if not raw:
+    if raw is None:
         return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    if not str(raw).strip():
+        raise AssertionError("comma-separated value must contain at least one entry")
+    blank_item = False
+    items = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            blank_item = True
+            continue
+        items.append(value)
+    if not items:
+        raise AssertionError("comma-separated value must contain at least one entry")
+    if blank_item:
+        raise AssertionError("comma-separated value must not contain blank entries")
+    return items
 
 
 def cli_arg_value(name):
@@ -774,11 +862,33 @@ def env_phase_token(name):
     return collapsed
 
 
+def validate_phase_tokens_unique(phases, label):
+    seen = set()
+    by_token = {}
+    for phase in phases:
+        if phase in seen:
+            raise AssertionError(
+                f"{label} phase list must not contain duplicate phase {phase!r}"
+            )
+        seen.add(phase)
+        token = env_phase_token(phase)
+        previous = by_token.get(token)
+        if previous is not None and previous != phase:
+            raise AssertionError(
+                f"{label} phase names {previous!r} and {phase!r} "
+                f"map to the same environment token {token}"
+            )
+        by_token[token] = phase
+
+
 def e2e_chaos_hooks_configured():
-    return bool(
-        os.environ.get("ZMQ_E2E_CHAOS_MATRIX")
-        or os.environ.get("ZMQ_E2E_CHAOS_DOWN")
-        or os.environ.get("ZMQ_E2E_CHAOS_UP")
+    return any(
+        name in os.environ
+        for name in (
+            "ZMQ_E2E_CHAOS_MATRIX",
+            "ZMQ_E2E_CHAOS_DOWN",
+            "ZMQ_E2E_CHAOS_UP",
+        )
     )
 
 
@@ -787,15 +897,19 @@ def e2e_chaos_phase_env_name(phase, suffix):
 
 
 def e2e_chaos_phase_command(phase, suffix):
-    return os.environ.get(e2e_chaos_phase_env_name(phase, suffix)) or os.environ.get(
-        f"ZMQ_E2E_CHAOS_{suffix}"
-    )
+    specific = e2e_chaos_phase_env_name(phase, suffix)
+    if specific in os.environ:
+        return os.environ[specific]
+    return os.environ.get(f"ZMQ_E2E_CHAOS_{suffix}")
 
 
 def e2e_chaos_phase_expect(phase):
-    return os.environ.get(e2e_chaos_phase_env_name(phase, "EXPECT")) or os.environ.get(
-        "ZMQ_E2E_CHAOS_EXPECT", "fail"
-    )
+    specific = e2e_chaos_phase_env_name(phase, "EXPECT")
+    if specific in os.environ:
+        return os.environ[specific]
+    if "ZMQ_E2E_CHAOS_EXPECT" in os.environ:
+        return os.environ["ZMQ_E2E_CHAOS_EXPECT"]
+    return "fail"
 
 
 def selected_e2e_chaos_phases():
@@ -803,9 +917,11 @@ def selected_e2e_chaos_phases():
         return []
 
     raw_matrix = os.environ.get("ZMQ_E2E_CHAOS_MATRIX")
-    phase_names = split_csv(raw_matrix) if raw_matrix else ["cross-broker"]
+    phase_names = split_csv(raw_matrix) if raw_matrix is not None else ["cross-broker"]
     if not phase_names:
         raise AssertionError("ZMQ_E2E_CHAOS_MATRIX did not contain any phases")
+    validate_non_placeholder_values(phase_names, "ZMQ_E2E_CHAOS_MATRIX")
+    validate_phase_tokens_unique(phase_names, "E2E chaos")
 
     phases = []
     seen = set()
@@ -819,7 +935,13 @@ def selected_e2e_chaos_phases():
             raise AssertionError(
                 f"E2E chaos phase {phase!r} requires DOWN and UP hooks"
             )
+        hook_command_words(f"E2E chaos phase {phase!r} DOWN", down)
+        hook_command_words(f"E2E chaos phase {phase!r} UP", up)
         expect = e2e_chaos_phase_expect(phase)
+        if placeholder_env_value(expect):
+            raise AssertionError(
+                f"E2E chaos expectation for {phase!r} uses placeholder value"
+            )
         if expect not in ("fail", "survive"):
             raise AssertionError(f"invalid E2E chaos expectation for {phase!r}: {expect!r}")
         phases.append({"name": phase, "down": down, "up": up, "expect": expect})
@@ -830,6 +952,7 @@ def validate_required_e2e_chaos_phase_coverage():
     required = split_csv(os.environ.get("ZMQ_E2E_REQUIRED_CHAOS_PHASES"))
     if not required:
         return
+    validate_non_placeholder_values(required, "ZMQ_E2E_REQUIRED_CHAOS_PHASES")
 
     configured = [phase["name"] for phase in selected_e2e_chaos_phases()]
     missing = [phase for phase in required if phase not in configured]
@@ -862,25 +985,41 @@ def e2e_chaos_hook_env(phase, index, topic=None):
     return env
 
 
+def hook_command_words(label, command):
+    stripped = command or ""
+    if placeholder_env_value(stripped):
+        raise AssertionError(f"{label} command uses placeholder value")
+    try:
+        words = shlex.split(stripped)
+    except ValueError as exc:
+        raise AssertionError(f"{label} command is malformed: {exc}") from exc
+    if not words:
+        raise AssertionError(f"{label} command must contain at least one word")
+    return words
+
+
 def run_e2e_chaos_hook(label, command, env):
-    proc = subprocess.run(
-        shlex.split(command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=120,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            hook_command_words(label, command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+    except OSError as exc:
+        raise AssertionError(f"{label} command could not start: {exc}") from exc
     if proc.returncode != 0:
         raise AssertionError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
 
 
 def wait_for_cross_node_payload(t, topic, payload, timeout=20):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     produced = False
     last_detail = ""
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             if not produced:
                 sock = t.connect(NODES[1]["broker_port"])
@@ -905,6 +1044,17 @@ def wait_for_cross_node_payload(t, topic, payload, timeout=20):
     return False, last_detail
 
 
+def e2e_chaos_phase_marker(phase, probe_succeeded, healed, recovered):
+    observed = "survived" if probe_succeeded else "failed"
+    healed_text = "true" if healed else "false"
+    recovered_text = "true" if recovered else "false"
+    return (
+        f"ok: E2E chaos phase {phase['name']} down=true "
+        f"observed={observed} healed={healed_text} recovered={recovered_text} "
+        f"expect={phase['expect']} source=command"
+    )
+
+
 def run_cross_broker_chaos(t, topic):
     phases = selected_e2e_chaos_phases()
     if not phases:
@@ -919,6 +1069,7 @@ def run_cross_broker_chaos(t, topic):
         try:
             run_e2e_chaos_hook(f"{phase['name']}:down", phase["down"], env)
             ok, detail = wait_for_cross_node_payload(t, topic, during_payload, timeout=6)
+            probe_succeeded = ok
             if phase["expect"] == "survive":
                 t.check(f"Cross-broker chaos {phase['name']} survives", ok, detail)
             else:
@@ -929,9 +1080,12 @@ def run_cross_broker_chaos(t, topic):
 
         ok, detail = wait_for_cross_node_payload(t, topic, healed_payload, timeout=30)
         t.check(f"Cross-broker chaos {phase['name']} heals", ok, detail)
+        recovered = ok
 
         if not healed:
             raise AssertionError(f"E2E chaos phase {phase['name']} did not heal")
+        print(e2e_chaos_phase_marker(phase, probe_succeeded, healed, recovered))
+    print(f"ok: E2E chaos passed for {', '.join(phase['name'] for phase in phases)} phase(s) source=command")
 
 
 # ---------------------------------------------------------------
@@ -939,16 +1093,22 @@ def run_cross_broker_chaos(t, topic):
 # ---------------------------------------------------------------
 
 def e2e_load_scale_hooks_configured():
-    return bool(
-        os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
-        or os.environ.get("ZMQ_E2E_LOAD_SCALE_APPLY")
-        or os.environ.get("ZMQ_E2E_LOAD_SCALE_RESTORE")
-        or e2e_load_scale_fixture_enabled()
+    fixture_enabled = e2e_load_scale_fixture_enabled()
+    return (
+        any(
+            name in os.environ
+            for name in (
+                "ZMQ_E2E_LOAD_SCALE_MATRIX",
+                "ZMQ_E2E_LOAD_SCALE_APPLY",
+                "ZMQ_E2E_LOAD_SCALE_RESTORE",
+            )
+        )
+        or fixture_enabled
     )
 
 
 def e2e_load_scale_fixture_enabled():
-    return truthy(os.environ.get("ZMQ_E2E_LOAD_SCALE_USE_FIXTURE", "0"))
+    return e2e_bool_setting("ZMQ_E2E_LOAD_SCALE_USE_FIXTURE", False)
 
 
 def e2e_load_scale_fixture_command(kind):
@@ -963,14 +1123,20 @@ def e2e_load_scale_phase_env_name(phase, suffix):
 
 
 def e2e_load_scale_phase_command(phase, suffix):
-    configured = os.environ.get(e2e_load_scale_phase_env_name(phase, suffix)) or os.environ.get(
-        f"ZMQ_E2E_LOAD_SCALE_{suffix}"
-    )
-    if configured:
-        return configured
+    command, _source = e2e_load_scale_phase_command_source(phase, suffix)
+    return command
+
+
+def e2e_load_scale_phase_command_source(phase, suffix):
+    phase_env_name = e2e_load_scale_phase_env_name(phase, suffix)
+    if phase_env_name in os.environ:
+        return os.environ[phase_env_name], "hook"
+    global_env_name = f"ZMQ_E2E_LOAD_SCALE_{suffix}"
+    if global_env_name in os.environ:
+        return os.environ[global_env_name], "hook"
     if e2e_load_scale_fixture_enabled():
-        return e2e_load_scale_fixture_command(suffix.lower())
-    return None
+        return e2e_load_scale_fixture_command(suffix.lower()), "fixture"
+    return None, "missing"
 
 
 def selected_e2e_load_scale_phases():
@@ -979,7 +1145,7 @@ def selected_e2e_load_scale_phases():
 
     raw_matrix = os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
     raw_required = os.environ.get("ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES")
-    if raw_matrix:
+    if raw_matrix is not None:
         phase_names = split_csv(raw_matrix)
     elif e2e_load_scale_fixture_enabled() and raw_required:
         phase_names = split_csv(raw_required)
@@ -989,6 +1155,8 @@ def selected_e2e_load_scale_phases():
         phase_names = ["scale"]
     if not phase_names:
         raise AssertionError("ZMQ_E2E_LOAD_SCALE_MATRIX did not contain any phases")
+    validate_non_placeholder_values(phase_names, "ZMQ_E2E_LOAD_SCALE_MATRIX")
+    validate_phase_tokens_unique(phase_names, "E2E load/scale")
 
     phases = []
     seen = set()
@@ -996,13 +1164,34 @@ def selected_e2e_load_scale_phases():
         if phase in seen:
             continue
         seen.add(phase)
-        apply = e2e_load_scale_phase_command(phase, "APPLY")
-        restore = e2e_load_scale_phase_command(phase, "RESTORE")
+        apply, apply_source = e2e_load_scale_phase_command_source(phase, "APPLY")
+        restore, restore_source = e2e_load_scale_phase_command_source(phase, "RESTORE")
         if not apply or not restore:
             raise AssertionError(
                 f"E2E load/scale phase {phase!r} requires APPLY and RESTORE hooks"
             )
-        phases.append({"name": phase, "apply": apply, "restore": restore})
+        hook_command_words(f"E2E load/scale phase {phase!r} APPLY", apply)
+        hook_command_words(f"E2E load/scale phase {phase!r} RESTORE", restore)
+        fixture_action = None
+        fixture_load_records = None
+        if apply_source == "fixture" or restore_source == "fixture":
+            action = e2e_load_scale_fixture_action(phase)
+            if action == "load":
+                fixture_load_records = e2e_load_scale_fixture_positive_int(
+                    phase,
+                    "LOAD_RECORDS",
+                    "30",
+                )
+            fixture_action = action
+        phases.append({
+            "name": phase,
+            "apply": apply,
+            "restore": restore,
+            "apply_source": apply_source,
+            "restore_source": restore_source,
+            "fixture_action": fixture_action,
+            "fixture_load_records": fixture_load_records,
+        })
     return phases
 
 
@@ -1010,6 +1199,7 @@ def validate_required_e2e_load_scale_phase_coverage():
     required = split_csv(os.environ.get("ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"))
     if not required:
         return
+    validate_non_placeholder_values(required, "ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES")
 
     configured = [phase["name"] for phase in selected_e2e_load_scale_phases()]
     missing = [phase for phase in required if phase not in configured]
@@ -1023,6 +1213,16 @@ def e2e_load_scale_hook_env(phase, index, topic=None):
     env = os.environ.copy()
     env["ZMQ_E2E_LOAD_SCALE_PHASE"] = phase["name"]
     env["ZMQ_E2E_LOAD_SCALE_PHASE_INDEX"] = str(index)
+    env["ZMQ_E2E_LOAD_SCALE_APPLY_MARKER"] = e2e_load_scale_fixture_payload(
+        "apply",
+        phase["name"],
+        index,
+    ).decode()
+    env["ZMQ_E2E_LOAD_SCALE_RESTORE_MARKER"] = e2e_load_scale_fixture_payload(
+        "restore",
+        phase["name"],
+        index,
+    ).decode()
     if topic is not None:
         env["ZMQ_E2E_TOPIC"] = topic
     env["ZMQ_E2E_BROKER_PORTS"] = ",".join(
@@ -1042,16 +1242,76 @@ def e2e_load_scale_hook_env(phase, index, topic=None):
 
 
 def run_e2e_load_scale_hook(label, command, env):
-    proc = subprocess.run(
-        shlex.split(command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=180,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            hook_command_words(label, command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+    except OSError as exc:
+        raise AssertionError(f"{label} command could not start: {exc}") from exc
     if proc.returncode != 0:
         raise AssertionError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
+
+
+def wait_for_existing_cross_node_payload(t, topic, payload, timeout=20):
+    deadline = time.monotonic() + timeout
+    last_detail = ""
+
+    while time.monotonic() < deadline:
+        for node in NODES:
+            try:
+                sock = t.connect(node["broker_port"])
+                err, hw, rec_len, records = fetch(sock, t.next(), topic, 0, 0)
+                sock.close()
+                if err == 0 and payload in records:
+                    return True, f"{node['name']} hw={hw}, {rec_len}B"
+                last_detail = f"{node['name']} fetch err={err}, {rec_len}B"
+            except Exception as exc:
+                last_detail = f"{node['name']}: {exc}"
+        time.sleep(0.5)
+
+    return False, last_detail
+
+
+def wait_for_fixture_load_payloads(t, topic, phase_index, record_count, timeout=30):
+    expected = [
+        f"e2e-load-scale-load-{phase_index}-{index}".encode()
+        for index in range(record_count)
+    ]
+    pending = set(range(record_count))
+    deadline = time.monotonic() + timeout
+    last_detail = ""
+
+    while time.monotonic() < deadline and pending:
+        for node in NODES:
+            try:
+                sock = t.connect(node["broker_port"])
+                err, hw, rec_len, records = fetch(sock, t.next(), topic, 0, 0)
+                sock.close()
+                if err != 0:
+                    last_detail = f"{node['name']} fetch err={err}, {rec_len}B"
+                    continue
+                for index in list(pending):
+                    if expected[index] in records:
+                        pending.remove(index)
+                last_detail = (
+                    f"{node['name']} hw={hw}, {rec_len}B, "
+                    f"pending={len(pending)}"
+                )
+                if not pending:
+                    return True, last_detail
+            except Exception as exc:
+                last_detail = f"{node['name']}: {exc}"
+        time.sleep(0.5)
+
+    missing = ", ".join(str(index) for index in sorted(pending)[:5])
+    if len(pending) > 5:
+        missing += ", ..."
+    return False, f"missing load records: {missing}; {last_detail}"
 
 
 def parse_named_map(raw, var_name):
@@ -1066,6 +1326,8 @@ def parse_named_map(raw, var_name):
         value = value.strip()
         if not name or not value:
             raise AssertionError(f"{var_name} entry {item!r} must be name:value")
+        if name in result:
+            raise AssertionError(f"{var_name} must not repeat name {name!r}")
         result[name] = value
     if not result:
         raise AssertionError(f"{var_name} did not contain any entries")
@@ -1087,12 +1349,58 @@ def parse_named_ports(raw, var_name):
 
 
 def e2e_load_scale_fixture_env(phase_name, key, default=None):
+    name, value = e2e_load_scale_fixture_setting(phase_name, key, default)
+    stripped = "" if value is None else str(value).strip()
+    if not stripped:
+        raise AssertionError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise AssertionError(f"{name} must not use a placeholder value")
+    return stripped
+
+
+def e2e_load_scale_fixture_setting(phase_name, key, default=None):
     token = env_phase_token(phase_name)
-    return (
-        os.environ.get(f"ZMQ_E2E_LOAD_SCALE_{token}_FIXTURE_{key}")
-        or os.environ.get(f"ZMQ_E2E_LOAD_SCALE_FIXTURE_{key}")
-        or default
-    )
+    phase_name_key = f"ZMQ_E2E_LOAD_SCALE_{token}_FIXTURE_{key}"
+    if phase_name_key in os.environ:
+        return phase_name_key, os.environ[phase_name_key]
+    global_name = f"ZMQ_E2E_LOAD_SCALE_FIXTURE_{key}"
+    if global_name in os.environ:
+        return global_name, os.environ[global_name]
+    return global_name, default
+
+
+def e2e_load_scale_fixture_bool(phase_name, key, default):
+    name, value = e2e_load_scale_fixture_setting(phase_name, key, default)
+    return strict_bool_text(name, value, default)
+
+
+def e2e_load_scale_fixture_positive_int(phase_name, key, default):
+    name, value = e2e_load_scale_fixture_setting(phase_name, key, default)
+    stripped = str(value or "").strip()
+    if not stripped:
+        raise AssertionError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise AssertionError(f"{name} must not use a placeholder value")
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise AssertionError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise AssertionError(f"{name} must be a positive integer")
+    return parsed
+
+
+def e2e_load_scale_fixture_action(phase_name):
+    name, value = e2e_load_scale_fixture_setting(phase_name, "ACTION", phase_name)
+    stripped = str(value or "").strip()
+    if not stripped:
+        raise AssertionError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise AssertionError(f"{name} must not use a placeholder value")
+    action = stripped.lower()
+    if action not in ("scale-in", "scale-out", "load", "probe", "noop"):
+        raise AssertionError(f"{name} must be scale-in, scale-out, load, probe, or noop")
+    return action
 
 
 def e2e_load_scale_fixture_payload(kind, phase_name, phase_index):
@@ -1126,9 +1434,9 @@ def run_docker_container_command(action, container):
 
 
 def wait_for_broker_port(port, should_be_up, timeout=45):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_detail = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
                 sock.settimeout(3)
@@ -1168,22 +1476,19 @@ def run_load_scale_fixture(kind):
     phase_name = os.environ.get("ZMQ_E2E_LOAD_SCALE_PHASE")
     if not phase_name:
         raise AssertionError("ZMQ_E2E_LOAD_SCALE_PHASE is required")
-    try:
-        phase_index = int(os.environ.get("ZMQ_E2E_LOAD_SCALE_PHASE_INDEX", "0"))
-    except ValueError as exc:
-        raise AssertionError("ZMQ_E2E_LOAD_SCALE_PHASE_INDEX must be an integer") from exc
+    phase_index = non_negative_int_setting("ZMQ_E2E_LOAD_SCALE_PHASE_INDEX", 0)
     topic = os.environ.get("ZMQ_E2E_TOPIC")
     if not topic:
         raise AssertionError("ZMQ_E2E_TOPIC is required")
 
     broker_ports = parse_named_ports(os.environ.get("ZMQ_E2E_BROKER_PORTS"), "ZMQ_E2E_BROKER_PORTS")
     containers = parse_named_map(os.environ.get("ZMQ_E2E_CONTAINERS"), "ZMQ_E2E_CONTAINERS")
-    action = e2e_load_scale_fixture_env(phase_name, "ACTION", phase_name).lower()
+    action = e2e_load_scale_fixture_action(phase_name)
     default_target_node = "node1" if action == "scale-out" else "node0"
     target_node = e2e_load_scale_fixture_env(phase_name, "NODE", default_target_node)
     producer_node = e2e_load_scale_fixture_env(phase_name, "PRODUCER_NODE", "node1")
-    dry_run = e2e_load_scale_fixture_env(phase_name, "DRY_RUN", "0") == "1"
-    prestop = truthy(e2e_load_scale_fixture_env(phase_name, "PRESTOP", "1"))
+    dry_run = e2e_load_scale_fixture_bool(phase_name, "DRY_RUN", False)
+    prestop = e2e_load_scale_fixture_bool(phase_name, "PRESTOP", True)
 
     if target_node not in broker_ports or target_node not in containers:
         raise AssertionError(f"unknown fixture target node {target_node!r}")
@@ -1211,7 +1516,11 @@ def run_load_scale_fixture(kind):
                 wait_for_broker_port(broker_ports[target_node], should_be_up=True, timeout=60)
     elif action == "load":
         if kind == "apply" and not dry_run:
-            records = int(e2e_load_scale_fixture_env(phase_name, "LOAD_RECORDS", "30"))
+            records = e2e_load_scale_fixture_positive_int(
+                phase_name,
+                "LOAD_RECORDS",
+                "30",
+            )
             for index in range(records):
                 node_names = sorted(broker_ports)
                 node_name = node_names[index % len(node_names)]
@@ -1224,7 +1533,10 @@ def run_load_scale_fixture(kind):
         marker = e2e_load_scale_fixture_payload(kind, phase_name, phase_index)
         produce_fixture_payload(broker_ports[producer_node], topic, marker)
 
-    print(f"ok: load/scale fixture {kind} phase={phase_name} action={action} dry_run={dry_run}")
+    print(
+        f"ok: load/scale fixture {kind} phase={phase_name} "
+        f"action={action} dry_run={dry_run} source=command"
+    )
     return 0
 
 
@@ -1241,17 +1553,68 @@ def run_e2e_load_scale_phases(t, topic):
         restored_payload = f"e2e-load-scale-restored-{index}-{phase['name']}".encode()
         try:
             run_e2e_load_scale_hook(f"{phase['name']}:apply", phase["apply"], env)
-            ok, detail = wait_for_cross_node_payload(t, topic, applied_payload, timeout=30)
+            ok, detail = wait_for_existing_cross_node_payload(
+                t,
+                topic,
+                applied_payload,
+                timeout=30,
+            )
             t.check(f"Load/scale {phase['name']} serves after apply", ok, detail)
+            if not ok:
+                raise AssertionError(
+                    f"E2E load/scale phase {phase['name']} apply hook did not "
+                    f"publish marker payload {applied_payload!r}: {detail}"
+                )
+            if phase.get("fixture_action") == "load":
+                record_count = phase.get("fixture_load_records")
+                ok, detail = wait_for_fixture_load_payloads(
+                    t,
+                    topic,
+                    index,
+                    record_count,
+                    timeout=30,
+                )
+                t.check(
+                    f"Load/scale {phase['name']} fixture load records visible",
+                    ok,
+                    detail,
+                )
+                if not ok:
+                    raise AssertionError(
+                        f"E2E load/scale phase {phase['name']} fixture load action "
+                        f"did not publish {record_count} load records: {detail}"
+                    )
         finally:
             run_e2e_load_scale_hook(f"{phase['name']}:restore", phase["restore"], env)
             restored = True
 
-        ok, detail = wait_for_cross_node_payload(t, topic, restored_payload, timeout=30)
+        ok, detail = wait_for_existing_cross_node_payload(
+            t,
+            topic,
+            restored_payload,
+            timeout=30,
+        )
         t.check(f"Load/scale {phase['name']} serves after restore", ok, detail)
+        if not ok:
+            raise AssertionError(
+                f"E2E load/scale phase {phase['name']} restore hook did not "
+                f"publish marker payload {restored_payload!r}: {detail}"
+            )
 
         if not restored:
             raise AssertionError(f"E2E load/scale phase {phase['name']} did not restore")
+        marker = (
+            f"ok: E2E load/scale phase {phase['name']} "
+            f"applied=true restored=true marker_payloads=hook-owned "
+            f"apply_source={phase['apply_source']} "
+            f"restore_source={phase['restore_source']} source=command"
+        )
+        if phase.get("fixture_action"):
+            marker += f" action={phase['fixture_action']}"
+            if phase["fixture_action"] == "load":
+                marker += f" load_records={phase['fixture_load_records']}"
+        print(marker)
+    print(f"ok: E2E load/scale passed for {', '.join(phase['name'] for phase in phases)} phase(s) source=command")
 
 
 # ---------------------------------------------------------------
@@ -1341,6 +1704,32 @@ def self_test():
 
     old_env = os.environ.copy()
     try:
+        os.environ["ZMQ_RUN_E2E_TESTS"] = "placeholder"
+        try:
+            run_gate_enabled("ZMQ_RUN_E2E_TESTS")
+            raise AssertionError("placeholder E2E run gate was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_E2E_TESTS"] = "   "
+        try:
+            run_gate_enabled("ZMQ_RUN_E2E_TESTS")
+            raise AssertionError("blank E2E run gate was accepted")
+        except AssertionError as exc:
+            if "blank" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_E2E_TESTS"] = "maybe"
+        try:
+            run_gate_enabled("ZMQ_RUN_E2E_TESTS")
+            raise AssertionError("invalid E2E run gate was accepted")
+        except AssertionError as exc:
+            if "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_E2E_TESTS"] = "on"
+        if not run_gate_enabled("ZMQ_RUN_E2E_TESTS"):
+            raise AssertionError("truthy E2E run gate was not accepted")
+        os.environ.pop("ZMQ_RUN_E2E_TESTS", None)
+
         os.environ.pop("ZMQ_E2E_CHAOS_DOWN", None)
         os.environ.pop("ZMQ_E2E_CHAOS_UP", None)
         os.environ.pop("ZMQ_E2E_CHAOS_MATRIX", None)
@@ -1353,6 +1742,40 @@ def self_test():
             raise AssertionError("E2E chaos phases unexpectedly configured")
         if selected_e2e_load_scale_phases() != []:
             raise AssertionError("E2E load/scale phases unexpectedly configured")
+        os.environ["ZMQ_E2E_CHAOS_DOWN"] = ""
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("blank global E2E chaos hook preflight was accepted")
+        except AssertionError as exc:
+            if "DOWN and UP hooks" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_E2E_CHAOS_DOWN", None)
+        os.environ["ZMQ_E2E_LOAD_SCALE_APPLY"] = ""
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("blank global E2E load/scale hook preflight was accepted")
+        except AssertionError as exc:
+            if "APPLY and RESTORE hooks" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_APPLY", None)
+        os.environ["ZMQ_E2E_LOAD_SCALE_USE_FIXTURE"] = "placeholder"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("placeholder E2E load/scale fixture enable flag was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_USE_FIXTURE"] = "maybe"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("invalid E2E load/scale fixture enable flag was accepted")
+        except AssertionError as exc:
+            if "must be true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_USE_FIXTURE"] = "false"
+        if selected_e2e_load_scale_phases() != []:
+            raise AssertionError("false E2E load/scale fixture enable flag configured phases")
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_USE_FIXTURE", None)
 
         os.environ["ZMQ_E2E_CHAOS_DOWN"] = "true"
         os.environ["ZMQ_E2E_CHAOS_UP"] = "true"
@@ -1360,18 +1783,148 @@ def self_test():
         if len(phases) != 1 or phases[0]["name"] != "cross-broker":
             raise AssertionError(f"default E2E chaos phase selection failed: {phases}")
 
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "   "
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("blank E2E chaos phase list was accepted")
+        except AssertionError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "az-a,,broker-2"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("embedded blank E2E chaos phase list was accepted")
+        except AssertionError as exc:
+            if "blank entries" not in str(exc):
+                raise
+
         os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "az-a, broker-2,az-a"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("duplicate E2E chaos phase was accepted")
+        except AssertionError as exc:
+            if "duplicate phase" not in str(exc):
+                raise
+
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "az-a, broker-2"
         os.environ["ZMQ_E2E_CHAOS_BROKER_2_DOWN"] = "true"
         os.environ["ZMQ_E2E_CHAOS_BROKER_2_UP"] = "true"
         os.environ["ZMQ_E2E_CHAOS_BROKER_2_EXPECT"] = "survive"
         phases = selected_e2e_chaos_phases()
         if [phase["name"] for phase in phases] != ["az-a", "broker-2"]:
             raise AssertionError(f"E2E chaos matrix parsing failed: {phases}")
+        os.environ["ZMQ_E2E_CHAOS_DOWN"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_DOWN"] = ""
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("blank phase-specific E2E chaos hook preflight was accepted")
+        except AssertionError as exc:
+            if "DOWN and UP hooks" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_DOWN"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_DOWN"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "az-a,az_a"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("colliding E2E chaos phase names were accepted")
+        except AssertionError as exc:
+            if "same environment token" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "placeholder"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("placeholder E2E chaos phase was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "<phase>"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("angle-bracket placeholder E2E chaos phase was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "az-a, broker-2"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_DOWN"] = "placeholder"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("placeholder E2E chaos hook preflight was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_DOWN"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_UP"] = "'unterminated"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("malformed E2E chaos hook preflight was accepted")
+        except AssertionError as exc:
+            if "malformed" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_UP"] = "true"
+        phases = selected_e2e_chaos_phases()
         if phases[0]["expect"] != "fail" or phases[1]["expect"] != "survive":
             raise AssertionError(f"E2E chaos expectation parsing failed: {phases}")
+        if e2e_chaos_phase_marker(
+            {"name": "cross-broker", "expect": "fail"},
+            False,
+            True,
+            True,
+        ) != (
+            "ok: E2E chaos phase cross-broker down=true observed=failed "
+            "healed=true recovered=true expect=fail source=command"
+        ):
+            raise AssertionError("E2E chaos failed phase marker formatting failed")
+        if e2e_chaos_phase_marker(
+            {"name": "broker-2", "expect": "survive"},
+            True,
+            True,
+            True,
+        ) != (
+            "ok: E2E chaos phase broker-2 down=true observed=survived "
+            "healed=true recovered=true expect=survive source=command"
+        ):
+            raise AssertionError("E2E chaos survived phase marker formatting failed")
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_EXPECT"] = "todo"
+        try:
+            selected_e2e_chaos_phases()
+            raise AssertionError("placeholder E2E chaos expectation was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_EXPECT"] = "survive"
 
         os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "az-a,broker-2"
         validate_required_e2e_chaos_phase_coverage()
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = ",,,"
+        try:
+            validate_required_e2e_chaos_phase_coverage()
+            raise AssertionError("empty required E2E chaos phase list was accepted")
+        except AssertionError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "   "
+        try:
+            validate_required_e2e_chaos_phase_coverage()
+            raise AssertionError("blank required E2E chaos phase list was accepted")
+        except AssertionError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "az-a,,broker-2"
+        try:
+            validate_required_e2e_chaos_phase_coverage()
+            raise AssertionError("embedded blank required E2E chaos phase list was accepted")
+        except AssertionError as exc:
+            if "blank entries" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "required"
+        try:
+            validate_required_e2e_chaos_phase_coverage()
+            raise AssertionError("placeholder required E2E chaos phase was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "az-a,broker-2"
         os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "missing-phase"
         try:
             validate_required_e2e_chaos_phase_coverage()
@@ -1395,22 +1948,150 @@ def self_test():
             raise AssertionError("E2E chaos MinIO context failed")
         run_e2e_chaos_hook("self-test:down", phases[1]["down"], env)
         run_e2e_chaos_hook("self-test:up", phases[1]["up"], env)
+        try:
+            hook_command_words("self-test:blank", "   ")
+            raise AssertionError("blank E2E hook command was accepted")
+        except AssertionError as exc:
+            if "at least one word" not in str(exc):
+                raise
+        try:
+            hook_command_words("self-test:malformed", "'unterminated")
+            raise AssertionError("malformed E2E hook command was accepted")
+        except AssertionError as exc:
+            if "malformed" not in str(exc):
+                raise
+        try:
+            hook_command_words("self-test:placeholder", "placeholder")
+            raise AssertionError("placeholder E2E hook command was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        try:
+            run_e2e_chaos_hook(
+                "self-test:missing",
+                "__zmq_missing_hook_command__",
+                env,
+            )
+            raise AssertionError("unstartable E2E chaos hook command was accepted")
+        except AssertionError as exc:
+            if "could not start" not in str(exc):
+                raise
 
         os.environ["ZMQ_E2E_LOAD_SCALE_APPLY"] = "true"
         os.environ["ZMQ_E2E_LOAD_SCALE_RESTORE"] = "true"
         load_scale_phases = selected_e2e_load_scale_phases()
         if len(load_scale_phases) != 1 or load_scale_phases[0]["name"] != "scale":
             raise AssertionError(f"default E2E load/scale phase selection failed: {load_scale_phases}")
+        if (
+            load_scale_phases[0]["apply_source"] != "hook"
+            or load_scale_phases[0]["restore_source"] != "hook"
+        ):
+            raise AssertionError(f"default E2E load/scale hook source failed: {load_scale_phases}")
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "   "
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("blank E2E load/scale phase list was accepted")
+        except AssertionError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "scale-out,,scale-in"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("embedded blank E2E load/scale phase list was accepted")
+        except AssertionError as exc:
+            if "blank entries" not in str(exc):
+                raise
 
         os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "scale-out, scale-in,scale-out"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("duplicate E2E load/scale phase was accepted")
+        except AssertionError as exc:
+            if "duplicate phase" not in str(exc):
+                raise
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "scale-out, scale-in"
         os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY"] = "true"
         os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_RESTORE"] = "true"
         load_scale_phases = selected_e2e_load_scale_phases()
         if [phase["name"] for phase in load_scale_phases] != ["scale-out", "scale-in"]:
             raise AssertionError(f"E2E load/scale matrix parsing failed: {load_scale_phases}")
+        os.environ["ZMQ_E2E_LOAD_SCALE_APPLY"] = "true"
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY"] = ""
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("blank phase-specific E2E load/scale hook preflight was accepted")
+        except AssertionError as exc:
+            if "APPLY and RESTORE hooks" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_APPLY"] = "true"
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY"] = "true"
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "scale-out,scale_out"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("colliding E2E load/scale phase names were accepted")
+        except AssertionError as exc:
+            if "same environment token" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "todo"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("placeholder E2E load/scale phase was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "scale-out, scale-in"
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY"] = "placeholder"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("placeholder E2E load/scale hook preflight was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY"] = "true"
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_RESTORE"] = "'unterminated"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("malformed E2E load/scale hook preflight was accepted")
+        except AssertionError as exc:
+            if "malformed" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_RESTORE"] = "true"
+        load_scale_phases = selected_e2e_load_scale_phases()
 
         os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "scale-out,scale-in"
         validate_required_e2e_load_scale_phase_coverage()
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = ",,,"
+        try:
+            validate_required_e2e_load_scale_phase_coverage()
+            raise AssertionError("empty required E2E load/scale phase list was accepted")
+        except AssertionError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "   "
+        try:
+            validate_required_e2e_load_scale_phase_coverage()
+            raise AssertionError("blank required E2E load/scale phase list was accepted")
+        except AssertionError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "scale-out,,scale-in"
+        try:
+            validate_required_e2e_load_scale_phase_coverage()
+            raise AssertionError("embedded blank required E2E load/scale phase list was accepted")
+        except AssertionError as exc:
+            if "blank entries" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "required"
+        try:
+            validate_required_e2e_load_scale_phase_coverage()
+            raise AssertionError("placeholder required E2E load/scale phase was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "scale-out,scale-in"
         os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "missing-scale"
         try:
             validate_required_e2e_load_scale_phase_coverage()
@@ -1422,6 +2103,10 @@ def self_test():
         load_env = e2e_load_scale_hook_env(load_scale_phases[1], 1, "self-test-topic")
         if load_env["ZMQ_E2E_LOAD_SCALE_PHASE"] != "scale-in":
             raise AssertionError("E2E load/scale phase context failed")
+        if load_env["ZMQ_E2E_LOAD_SCALE_APPLY_MARKER"] != "e2e-load-scale-applied-1-scale-in":
+            raise AssertionError("E2E load/scale apply marker context failed")
+        if load_env["ZMQ_E2E_LOAD_SCALE_RESTORE_MARKER"] != "e2e-load-scale-restored-1-scale-in":
+            raise AssertionError("E2E load/scale restore marker context failed")
         if load_env["ZMQ_E2E_TOPIC"] != "self-test-topic":
             raise AssertionError("E2E load/scale topic context failed")
         if load_env["ZMQ_E2E_CONTROLLER_PORTS"] != "node0:19093,node1:19095,node2:19097":
@@ -1430,8 +2115,37 @@ def self_test():
             raise AssertionError("E2E load/scale metrics port context failed")
         if load_env["ZMQ_E2E_MINIO_PORT"] != "9000":
             raise AssertionError("E2E load/scale MinIO context failed")
+        try:
+            parse_named_map(
+                "node0:19092,node0:19094",
+                "ZMQ_E2E_BROKER_PORTS",
+            )
+            raise AssertionError("duplicate E2E named hook context was accepted")
+        except AssertionError as exc:
+            if "must not repeat name" not in str(exc):
+                raise
         run_e2e_load_scale_hook("self-test:apply", load_scale_phases[1]["apply"], load_env)
         run_e2e_load_scale_hook("self-test:restore", load_scale_phases[1]["restore"], load_env)
+        try:
+            run_e2e_load_scale_hook(
+                "self-test:placeholder",
+                "/path/to/load-scale-hook",
+                load_env,
+            )
+            raise AssertionError("placeholder E2E load/scale hook command was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        try:
+            run_e2e_load_scale_hook(
+                "self-test:missing",
+                "__zmq_missing_hook_command__",
+                load_env,
+            )
+            raise AssertionError("unstartable E2E load/scale hook command was accepted")
+        except AssertionError as exc:
+            if "could not start" not in str(exc):
+                raise
 
         expected_apply_payload = e2e_load_scale_fixture_payload("apply", "scale-in", 1)
         expected_restore_payload = e2e_load_scale_fixture_payload("restore", "scale-in", 1)
@@ -1452,6 +2166,57 @@ def self_test():
             f"{fixture_command_base} restore",
             load_env,
         )
+        invalid_dry_env = load_env.copy()
+        invalid_dry_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "placeholder"
+        try:
+            run_e2e_load_scale_hook(
+                "self-test:fixture-placeholder-dry-run",
+                f"{fixture_command_base} apply",
+                invalid_dry_env,
+            )
+            raise AssertionError("placeholder E2E load/scale fixture dry-run flag was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        invalid_phase_index_env = load_env.copy()
+        invalid_phase_index_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
+        invalid_phase_index_env["ZMQ_E2E_LOAD_SCALE_PHASE_INDEX"] = "placeholder"
+        try:
+            run_e2e_load_scale_hook(
+                "self-test:fixture-placeholder-phase-index",
+                f"{fixture_command_base} apply",
+                invalid_phase_index_env,
+            )
+            raise AssertionError("placeholder E2E load/scale fixture phase index was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        negative_phase_index_env = load_env.copy()
+        negative_phase_index_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
+        negative_phase_index_env["ZMQ_E2E_LOAD_SCALE_PHASE_INDEX"] = "-1"
+        try:
+            run_e2e_load_scale_hook(
+                "self-test:fixture-negative-phase-index",
+                f"{fixture_command_base} apply",
+                negative_phase_index_env,
+            )
+            raise AssertionError("negative E2E load/scale fixture phase index was accepted")
+        except AssertionError as exc:
+            if "non-negative" not in str(exc):
+                raise
+        invalid_prestop_env = load_env.copy()
+        invalid_prestop_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
+        invalid_prestop_env["ZMQ_E2E_LOAD_SCALE_SCALE_IN_FIXTURE_PRESTOP"] = "maybe"
+        try:
+            run_e2e_load_scale_hook(
+                "self-test:fixture-invalid-prestop",
+                f"{fixture_command_base} apply",
+                invalid_prestop_env,
+            )
+            raise AssertionError("invalid E2E load/scale fixture prestop flag was accepted")
+        except AssertionError as exc:
+            if "must be true or false" not in str(exc):
+                raise
 
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_APPLY", None)
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_RESTORE", None)
@@ -1467,11 +2232,78 @@ def self_test():
             raise AssertionError("E2E fixture apply command drifted")
         if fixture_phases[0]["restore"] != e2e_load_scale_fixture_command("restore"):
             raise AssertionError("E2E fixture restore command drifted")
+        if (
+            fixture_phases[0]["apply_source"] != "fixture"
+            or fixture_phases[0]["restore_source"] != "fixture"
+            or fixture_phases[0]["fixture_action"] != "load"
+        ):
+            raise AssertionError(f"E2E fixture source metadata drifted: {fixture_phases}")
+        if fixture_phases[0]["fixture_load_records"] != 30:
+            raise AssertionError(f"E2E fixture load-record metadata drifted: {fixture_phases}")
+        os.environ["ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS"] = "placeholder"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("placeholder E2E load/scale fixture load records were accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS"] = "-1"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("negative E2E load/scale fixture load records were accepted")
+        except AssertionError as exc:
+            if "positive integer" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS"] = "2"
+        fixture_phases = selected_e2e_load_scale_phases()
+        if fixture_phases[0]["fixture_load_records"] != 2:
+            raise AssertionError(
+                f"E2E fixture load-record override drifted: {fixture_phases}"
+            )
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS", None)
+        os.environ["ZMQ_E2E_LOAD_SCALE_FIXTURE_NODE"] = "node0"
+        os.environ["ZMQ_E2E_LOAD_SCALE_LOAD_FIXTURE_NODE"] = ""
+        try:
+            e2e_load_scale_fixture_env("load", "NODE", "node1")
+            raise AssertionError("blank E2E load/scale fixture node override was accepted")
+        except AssertionError as exc:
+            if "must not be blank" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_LOAD_FIXTURE_NODE", None)
+        os.environ["ZMQ_E2E_LOAD_SCALE_LOAD_FIXTURE_PRODUCER_NODE"] = "placeholder"
+        try:
+            e2e_load_scale_fixture_env("load", "PRODUCER_NODE", "node1")
+            raise AssertionError("placeholder E2E load/scale fixture producer node was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_LOAD_FIXTURE_PRODUCER_NODE", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_FIXTURE_NODE", None)
+        os.environ["ZMQ_E2E_LOAD_SCALE_FIXTURE_ACTION"] = "placeholder"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("placeholder E2E load/scale fixture action was accepted")
+        except AssertionError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_E2E_LOAD_SCALE_FIXTURE_ACTION"] = "resize"
+        try:
+            selected_e2e_load_scale_phases()
+            raise AssertionError("invalid E2E load/scale fixture action was accepted")
+        except AssertionError as exc:
+            if "scale-in, scale-out, load, probe, or noop" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_FIXTURE_ACTION", None)
 
         os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "load,scale-in,scale-out"
         fixture_phases = selected_e2e_load_scale_phases()
         if [phase["name"] for phase in fixture_phases] != ["load", "scale-in", "scale-out"]:
             raise AssertionError(f"E2E fixture required-phase inference failed: {fixture_phases}")
+        if any(
+            phase["apply_source"] != "fixture" or phase["restore_source"] != "fixture"
+            for phase in fixture_phases
+        ):
+            raise AssertionError(f"E2E fixture required-phase source inference failed: {fixture_phases}")
         validate_required_e2e_load_scale_phase_coverage()
 
         os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "load,scale-in,scale-out"
@@ -1506,7 +2338,7 @@ def main():
         return run_load_scale_fixture(load_scale_fixture_kind)
     if "--self-test" in sys.argv:
         return self_test()
-    if not RUN_ENABLED:
+    if not run_gate_enabled("ZMQ_RUN_E2E_TESTS"):
         print("skip: set ZMQ_RUN_E2E_TESTS=1 to run Docker 3-node E2E harness")
         return 0
 

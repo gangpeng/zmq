@@ -51,7 +51,6 @@ import tempfile
 import time
 
 
-RUN_ENABLED = os.environ.get("ZMQ_RUN_CHAOS_TESTS") == "1"
 ZMQ_BIN = os.environ.get("ZMQ_BIN", "./zig-out/bin/zmq")
 DEFAULT_SCENARIOS = [
     "sigkill-restart",
@@ -70,21 +69,113 @@ ALIASES = {
 }
 
 
+PLACEHOLDER_ENV_VALUES = {
+    "...",
+    "placeholder",
+    "required",
+    "tbd",
+    "todo",
+}
+BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
+BOOL_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
 class TestError(Exception):
     pass
 
 
-def env_int(name, default):
-    try:
-        return int(os.environ.get(name, str(default)))
-    except ValueError:
+def placeholder_env_value(value):
+    stripped = str(value).strip()
+    lowered = stripped.lower()
+    angle_start = stripped.find("<")
+    has_angle_placeholder = (
+        angle_start >= 0
+        and stripped.find(">", angle_start + 1) > angle_start + 1
+    )
+    return (
+        lowered in PLACEHOLDER_ENV_VALUES
+        or lowered.startswith("/path/to/")
+        or has_angle_placeholder
+    )
+
+
+def validate_non_placeholder_values(values, label):
+    placeholders = [value for value in values if placeholder_env_value(value)]
+    if placeholders:
+        raise TestError(
+            f"{label} uses placeholder values: " + ", ".join(placeholders)
+        )
+
+
+def require_non_placeholder_setting(label, value):
+    stripped = "" if value is None else str(value).strip()
+    if not stripped:
+        raise TestError(f"{label} is required")
+    if placeholder_env_value(stripped):
+        raise TestError(f"{label} uses placeholder value")
+    return stripped
+
+
+def strict_bool_text(name, value, default=False):
+    if value is None:
         return default
+    stripped = str(value).strip()
+    if not stripped:
+        raise TestError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise TestError(f"{name} must not use a placeholder value")
+    lowered = stripped.lower()
+    if lowered in BOOL_TRUE_VALUES:
+        return True
+    if lowered in BOOL_FALSE_VALUES:
+        return False
+    raise TestError(f"{name} must be true or false")
+
+
+def run_gate_enabled(name):
+    return strict_bool_text(name, os.environ.get(name), False)
+
+
+def env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    stripped = str(raw).strip()
+    if not stripped:
+        raise TestError(f"{name} must not be blank")
+    if placeholder_env_value(stripped):
+        raise TestError(f"{name} must not use a placeholder value")
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise TestError(f"{name} must be an integer") from exc
+    return parsed
 
 
 def split_csv(raw):
-    if not raw:
+    if raw is None:
         return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    if not str(raw).strip():
+        raise TestError("comma-separated value must contain at least one entry")
+    blank_item = False
+    items = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            blank_item = True
+            continue
+        items.append(value)
+    if not items:
+        raise TestError("comma-separated value must contain at least one entry")
+    if blank_item:
+        raise TestError("comma-separated value must not contain blank entries")
+    duplicates = sorted(value for value in set(items) if items.count(value) > 1)
+    if duplicates:
+        raise TestError(
+            "comma-separated value must not contain duplicate entries: "
+            + ", ".join(duplicates)
+        )
+    return items
 
 
 def env_phase_token(name):
@@ -100,6 +191,21 @@ def env_phase_token(name):
     return collapsed
 
 
+def validate_phase_tokens_unique(phases, label):
+    by_token = {}
+    for phase in phases:
+        if phase is None:
+            continue
+        token = env_phase_token(phase)
+        previous = by_token.get(token)
+        if previous is not None and previous != phase:
+            raise TestError(
+                f"{label} phase names {previous!r} and {phase!r} "
+                f"map to the same environment token {token}"
+            )
+        by_token[token] = phase
+
+
 def free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -107,9 +213,11 @@ def free_port():
 
 
 def choose_port(name):
-    configured = os.environ.get(name)
-    if configured:
-        return env_int(name, 0)
+    if name in os.environ:
+        port = env_int(name, 0)
+        if port <= 0 or port > 65535:
+            raise TestError(f"{name} must be a positive TCP port")
+        return port
     return free_port()
 
 
@@ -181,10 +289,10 @@ def create_topic(port, name, partitions=1, correlation_id=2):
 
 
 def wait_for_topic(port, name, timeout=20):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 2
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             create_topic(port, name, correlation_id=correlation_id)
             return
@@ -270,11 +378,11 @@ def fetch_records(port, topic, offset, correlation_id):
 
 
 def wait_for_payload(port, topic, payloads, timeout=20):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     correlation_id = 100
     last_records = b""
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             _, records = fetch_records(port, topic, 0, correlation_id)
             last_records = records
@@ -319,31 +427,69 @@ def current_time_ms():
 
 
 def setting_with_fallback(prefix, suffix, fallback_prefix=None, default=None):
-    value = os.environ.get(f"{prefix}{suffix}")
-    if value is not None and value != "":
-        return value
+    name = f"{prefix}{suffix}"
+    if name in os.environ:
+        return os.environ[name]
     if fallback_prefix:
-        value = os.environ.get(f"{fallback_prefix}{suffix}")
-        if value is not None and value != "":
-            return value
+        fallback_name = f"{fallback_prefix}{suffix}"
+        if fallback_name in os.environ:
+            return os.environ[fallback_name]
     return default
 
 
+def live_s3_required_setting(suffix, label):
+    return require_non_placeholder_setting(
+        label,
+        setting_with_fallback("ZMQ_CHAOS_S3_", suffix, "ZMQ_S3_", None),
+    )
+
+
 def live_s3_config_from_env():
-    endpoint = setting_with_fallback("ZMQ_CHAOS_S3_", "ENDPOINT", "ZMQ_S3_", None)
-    if not endpoint:
-        raise TestError("live-s3-outage requires ZMQ_CHAOS_S3_ENDPOINT or ZMQ_S3_ENDPOINT")
-    return {
+    endpoint = live_s3_required_setting("ENDPOINT", "live-s3-outage S3 endpoint")
+    port = live_s3_required_setting("PORT", "live-s3-outage S3 port")
+    try:
+        parsed_port = int(str(port).strip())
+    except ValueError as exc:
+        raise TestError("live-s3-outage S3 port must be an integer") from exc
+    if parsed_port <= 0 or parsed_port > 65535:
+        raise TestError("live-s3-outage S3 port must be a positive TCP port")
+
+    config = {
         "endpoint": endpoint,
-        "port": setting_with_fallback("ZMQ_CHAOS_S3_", "PORT", "ZMQ_S3_", "9000"),
-        "bucket": setting_with_fallback("ZMQ_CHAOS_S3_", "BUCKET", "ZMQ_S3_", f"zmq-chaos-{os.getpid()}"),
-        "access_key": setting_with_fallback("ZMQ_CHAOS_S3_", "ACCESS_KEY", "ZMQ_S3_", "minioadmin"),
-        "secret_key": setting_with_fallback("ZMQ_CHAOS_S3_", "SECRET_KEY", "ZMQ_S3_", "minioadmin"),
-        "scheme": setting_with_fallback("ZMQ_CHAOS_S3_", "SCHEME", "ZMQ_S3_", None),
-        "region": setting_with_fallback("ZMQ_CHAOS_S3_", "REGION", "ZMQ_S3_", None),
-        "path_style": setting_with_fallback("ZMQ_CHAOS_S3_", "PATH_STYLE", "ZMQ_S3_", None),
+        "port": str(parsed_port),
+        "bucket": live_s3_required_setting("BUCKET", "live-s3-outage S3 bucket"),
+        "access_key": live_s3_required_setting("ACCESS_KEY", "live-s3-outage S3 access key"),
+        "secret_key": live_s3_required_setting("SECRET_KEY", "live-s3-outage S3 secret key"),
+        "scheme": live_s3_required_setting("SCHEME", "live-s3-outage S3 scheme").lower(),
+        "region": live_s3_required_setting("REGION", "live-s3-outage S3 region"),
+        "path_style": live_s3_required_setting("PATH_STYLE", "live-s3-outage S3 path-style"),
         "tls_ca_file": setting_with_fallback("ZMQ_CHAOS_S3_", "TLS_CA_FILE", "ZMQ_S3_", None),
     }
+    if config["tls_ca_file"] is not None:
+        config["tls_ca_file"] = require_non_placeholder_setting(
+            "live-s3-outage S3 TLS CA file",
+            config["tls_ca_file"],
+        )
+    if config["scheme"] not in ("http", "https"):
+        raise TestError("live-s3-outage S3 scheme must be http or https")
+    path_style = strict_bool_text(
+        "live-s3-outage S3 path-style",
+        config["path_style"],
+    )
+    config["path_style"] = "true" if path_style else "false"
+    return config
+
+
+def live_s3_provider_summary(config):
+    return (
+        "ok: chaos live-s3-outage provider endpoint="
+        f"{config['endpoint']}:{config['port']} "
+        f"bucket={config['bucket']} "
+        f"scheme={config['scheme']} "
+        f"region={config['region']} "
+        f"path_style={config['path_style']} "
+        "source=command"
+    )
 
 
 def append_s3_args(args, config):
@@ -389,9 +535,9 @@ def tail(path, limit=12000):
 
 
 def wait_for_broker(proc, port, log_path, timeout=40):
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise TestError(f"broker exited early with code {proc.returncode}\n{tail(log_path)}")
         try:
@@ -499,7 +645,11 @@ def scenario_sigkill_restart(tmp):
         if second_offset <= first_offset:
             raise TestError(f"restart did not advance offsets: {second_offset} <= {first_offset}")
         wait_for_payload(port, topic, [first, second])
-        print("ok: chaos sigkill-restart")
+        print(
+            f"ok: chaos sigkill-restart killed=true restarted=true recovered_payloads=2 "
+            f"first_offset={first_offset} second_offset={second_offset} "
+            "source=command"
+        )
     finally:
         stop_broker(proc)
 
@@ -534,7 +684,10 @@ def scenario_slow_partial_client(tmp):
             raise TestError(f"broker exited after partial client frame\n{tail(log_path)}")
         if api_versions_count(port) <= 0:
             raise TestError("broker did not recover after truncated client frame")
-        print("ok: chaos slow-partial-client")
+        print(
+            "ok: chaos slow-partial-client partial_frame=true "
+            "truncated_frame=true survived=true source=command"
+        )
     finally:
         stop_broker(proc)
 
@@ -553,7 +706,10 @@ def scenario_clock_skewed_records(tmp):
         wait_for_payload(port, topic, [payload])
         if api_versions_count(port) <= 0:
             raise TestError("broker stopped serving after skewed timestamp batch")
-        print("ok: chaos clock-skewed-records")
+        print(
+            "ok: chaos clock-skewed-records future_timestamp=true "
+            "fetched=true serving=true source=command"
+        )
     finally:
         stop_broker(proc)
 
@@ -567,8 +723,8 @@ def scenario_s3_outage(tmp):
     proc = None
     try:
         proc, port = launch_broker(data_dir, log_path, s3_port=outage_port)
-        deadline = time.time() + 45
-        while time.time() < deadline and proc.poll() is None:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline and proc.poll() is None:
             try:
                 if api_versions_count(port) > 0:
                     break
@@ -581,7 +737,7 @@ def scenario_s3_outage(tmp):
                 raise TestError(f"S3 outage startup failed with success exit code\n{log_tail}")
             if "Failed to open storage" not in log_tail:
                 raise TestError(f"S3 outage startup failed without storage error\n{log_tail}")
-            print("ok: chaos s3-outage failed closed during startup")
+            print("ok: chaos s3-outage startup_fail_closed=true source=command")
             return
 
         error_code, base_offset = produce_result(port, topic, payload, 30)
@@ -589,24 +745,54 @@ def scenario_s3_outage(tmp):
             raise TestError(f"S3 outage produce was acknowledged: error={error_code} offset={base_offset}")
         if api_versions_count(port) <= 0:
             raise TestError("broker stopped serving after S3 WAL outage")
-        print(f"ok: chaos s3-outage rejected produce with error_code={error_code}")
+        print(
+            "ok: chaos s3-outage "
+            f"rejected=true error_code={error_code} "
+            "base_offset_negative=true serving=true source=command"
+        )
     finally:
         stop_broker(proc)
 
 
-def run_hook(env_name):
+def hook_command_words(env_name):
     raw = os.environ.get(env_name)
-    if not raw:
-        raise TestError(f"{env_name} is required for network-partition scenario")
-    proc = subprocess.run(
-        shlex.split(raw),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=60,
-    )
+    if raw is None:
+        raise TestError(f"{env_name} hook command is required")
+    if placeholder_env_value(raw):
+        raise TestError(f"{env_name} hook command uses placeholder value")
+    try:
+        words = shlex.split(raw)
+    except ValueError as exc:
+        raise TestError(f"{env_name} hook command is malformed: {exc}") from exc
+    if not words:
+        raise TestError(f"{env_name} hook command must contain at least one word")
+    return words
+
+
+def run_hook(env_name):
+    words = hook_command_words(env_name)
+    try:
+        proc = subprocess.run(
+            words,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+    except OSError as exc:
+        raise TestError(f"{env_name} hook command could not start: {exc}") from exc
     if proc.returncode != 0:
         raise TestError(f"{env_name} failed with exit code {proc.returncode}\n{proc.stdout}")
+
+
+def preflight_selected_live_hooks(scenarios):
+    if "network-partition" in scenarios:
+        for phase in network_partition_phases():
+            hook_command_words(network_phase_env(phase, "DOWN"))
+            hook_command_words(network_phase_env(phase, "UP"))
+    if "live-s3-outage" in scenarios:
+        hook_command_words("ZMQ_CHAOS_S3_DOWN")
+        hook_command_words("ZMQ_CHAOS_S3_UP")
 
 
 def network_partition_phases():
@@ -617,6 +803,8 @@ def network_partition_phases():
     for phase in phases:
         if phase not in seen:
             seen.append(phase)
+    validate_non_placeholder_values(seen, "ZMQ_CHAOS_NETWORK_MATRIX")
+    validate_phase_tokens_unique(seen, "chaos network")
     return seen
 
 
@@ -624,16 +812,31 @@ def network_phase_env(phase, suffix):
     if phase is None:
         return f"ZMQ_CHAOS_NETWORK_{suffix}"
     specific = f"ZMQ_CHAOS_NETWORK_{env_phase_token(phase)}_{suffix}"
-    if os.environ.get(specific):
+    if specific in os.environ:
         return specific
     return f"ZMQ_CHAOS_NETWORK_{suffix}"
 
 
 def network_phase_expect(phase):
     if phase is None:
-        return os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail")
-    specific = f"ZMQ_CHAOS_NETWORK_{env_phase_token(phase)}_EXPECT"
-    return os.environ.get(specific, os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail"))
+        expect = os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail")
+    else:
+        specific = f"ZMQ_CHAOS_NETWORK_{env_phase_token(phase)}_EXPECT"
+        expect = os.environ.get(specific, os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail"))
+    if placeholder_env_value(expect):
+        raise TestError("chaos network expectation uses placeholder value")
+    if expect not in ("fail", "survive"):
+        raise TestError(f"invalid chaos network expectation: {expect!r}")
+    return expect
+
+
+def network_partition_phase_marker(phase, expect, probe_succeeded):
+    observed = "survived" if probe_succeeded else "failed"
+    return (
+        f"ok: chaos network-partition phase {phase} down=true "
+        f"observed={observed} healed=true recovered=true expect={expect}"
+        " source=command"
+    )
 
 
 def scenario_network_partition(tmp):
@@ -671,9 +874,9 @@ def scenario_network_partition(tmp):
             wait_for_broker(proc, port, log_path)
             wait_for_payload(port, topic, [payload])
             if phase is not None:
-                print(f"ok: chaos network-partition phase {phase}")
+                print(network_partition_phase_marker(phase, expect, probe_succeeded))
 
-        print("ok: chaos network-partition")
+        print("ok: chaos network-partition source=command")
     finally:
         if not healed and os.environ.get("ZMQ_CHAOS_NETWORK_UP"):
             try:
@@ -693,6 +896,7 @@ def scenario_live_s3_outage(tmp):
     proc = None
     healed = False
     s3_config = live_s3_config_from_env()
+    print(live_s3_provider_summary(s3_config))
     try:
         proc, port = start_broker(data_dir, log_path, s3_config=s3_config)
         wait_for_topic(port, topic)
@@ -717,7 +921,10 @@ def scenario_live_s3_outage(tmp):
         wait_for_broker(proc, port, log_path)
         produce(port, topic, build_record_batch(after, current_time_ms()), 52)
         wait_for_payload(port, topic, [before, after])
-        print("ok: chaos live-s3-outage")
+        print(
+            "ok: chaos live-s3-outage down=true healed=true "
+            "fail_closed=true recovered=true source=command"
+        )
     finally:
         if not healed and os.environ.get("ZMQ_CHAOS_S3_UP"):
             try:
@@ -739,12 +946,23 @@ SCENARIO_FUNCS = {
 
 def selected_scenarios():
     raw = os.environ.get("ZMQ_CHAOS_SCENARIOS")
-    names = DEFAULT_SCENARIOS if not raw else split_csv(raw)
+    names = DEFAULT_SCENARIOS if raw is None else split_csv(raw)
+    validate_non_placeholder_values(names, "ZMQ_CHAOS_SCENARIOS")
     if len(names) == 1 and names[0] == "all":
         names = list(DEFAULT_SCENARIOS)
-        if os.environ.get("ZMQ_CHAOS_NETWORK_DOWN") or os.environ.get("ZMQ_CHAOS_NETWORK_UP") or os.environ.get("ZMQ_CHAOS_NETWORK_MATRIX"):
+        if any(
+            name in os.environ
+            for name in (
+                "ZMQ_CHAOS_NETWORK_DOWN",
+                "ZMQ_CHAOS_NETWORK_UP",
+                "ZMQ_CHAOS_NETWORK_MATRIX",
+            )
+        ):
             names.append("network-partition")
-        if os.environ.get("ZMQ_CHAOS_S3_DOWN") or os.environ.get("ZMQ_CHAOS_S3_UP"):
+        if any(
+            name in os.environ
+            for name in ("ZMQ_CHAOS_S3_DOWN", "ZMQ_CHAOS_S3_UP")
+        ):
             names.append("live-s3-outage")
 
     resolved = []
@@ -758,12 +976,21 @@ def selected_scenarios():
 
 
 def validate_required_coverage(scenarios):
-    required_scenarios = [ALIASES.get(name, name) for name in split_csv(os.environ.get("ZMQ_CHAOS_REQUIRED_SCENARIOS"))]
+    required_scenario_names = split_csv(os.environ.get("ZMQ_CHAOS_REQUIRED_SCENARIOS"))
+    validate_non_placeholder_values(
+        required_scenario_names,
+        "ZMQ_CHAOS_REQUIRED_SCENARIOS",
+    )
+    required_scenarios = [ALIASES.get(name, name) for name in required_scenario_names]
     missing_scenarios = [name for name in required_scenarios if name not in scenarios]
     if missing_scenarios:
         raise TestError(f"required chaos scenarios not selected: {', '.join(missing_scenarios)}")
 
     required_phases = split_csv(os.environ.get("ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"))
+    validate_non_placeholder_values(
+        required_phases,
+        "ZMQ_CHAOS_REQUIRED_NETWORK_PHASES",
+    )
     if required_phases:
         if "network-partition" not in scenarios:
             raise TestError("required network partition phases need network-partition scenario")
@@ -774,7 +1001,7 @@ def validate_required_coverage(scenarios):
 
 
 def main():
-    if not RUN_ENABLED:
+    if not run_gate_enabled("ZMQ_RUN_CHAOS_TESTS"):
         print("skip: set ZMQ_RUN_CHAOS_TESTS=1 to run broker chaos harness")
         return 0
     if not os.path.exists(ZMQ_BIN):
@@ -782,11 +1009,12 @@ def main():
 
     scenarios = selected_scenarios()
     validate_required_coverage(scenarios)
+    preflight_selected_live_hooks(scenarios)
     tmp = tempfile.mkdtemp(prefix="zmq-chaos-")
     try:
         for scenario in scenarios:
             SCENARIO_FUNCS[scenario](tmp)
-        print(f"ok: chaos harness passed for {', '.join(scenarios)}")
+        print(f"ok: chaos harness passed for {', '.join(scenarios)} source=command")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -795,6 +1023,32 @@ def main():
 def self_test():
     old_env = os.environ.copy()
     try:
+        os.environ["ZMQ_RUN_CHAOS_TESTS"] = "placeholder"
+        try:
+            run_gate_enabled("ZMQ_RUN_CHAOS_TESTS")
+            raise TestError("placeholder chaos run gate was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_CHAOS_TESTS"] = "   "
+        try:
+            run_gate_enabled("ZMQ_RUN_CHAOS_TESTS")
+            raise TestError("blank chaos run gate was accepted")
+        except TestError as exc:
+            if "blank" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_CHAOS_TESTS"] = "maybe"
+        try:
+            run_gate_enabled("ZMQ_RUN_CHAOS_TESTS")
+            raise TestError("invalid chaos run gate was accepted")
+        except TestError as exc:
+            if "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_RUN_CHAOS_TESTS"] = "yes"
+        if not run_gate_enabled("ZMQ_RUN_CHAOS_TESTS"):
+            raise TestError("truthy chaos run gate was not accepted")
+        os.environ.pop("ZMQ_RUN_CHAOS_TESTS", None)
+
         os.environ.pop("ZMQ_CHAOS_SCENARIOS", None)
         if selected_scenarios() != DEFAULT_SCENARIOS:
             raise TestError("default scenario selection failed")
@@ -810,7 +1064,47 @@ def self_test():
         os.environ["ZMQ_CHAOS_SCENARIOS"] = "live-s3,network"
         if selected_scenarios() != ["live-s3-outage", "network-partition"]:
             raise TestError("live S3/network scenario alias selection failed")
+        os.environ["ZMQ_CHAOS_SCENARIOS"] = "   "
+        try:
+            selected_scenarios()
+            raise TestError("blank chaos scenario selector was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_SCENARIOS"] = "sigkill,,network"
+        try:
+            selected_scenarios()
+            raise TestError("embedded blank chaos scenario selector was accepted")
+        except TestError as exc:
+            if "blank entries" not in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_SCENARIOS"] = "all"
+        os.environ["ZMQ_CHAOS_NETWORK_DOWN"] = ""
+        os.environ["ZMQ_CHAOS_NETWORK_UP"] = "true"
+        blank_global_network_hook_scenarios = selected_scenarios()
+        if "network-partition" not in blank_global_network_hook_scenarios:
+            raise TestError("blank global chaos network hook did not select all scenario")
+        try:
+            preflight_selected_live_hooks(blank_global_network_hook_scenarios)
+            raise TestError("blank global chaos network hook preflight was skipped")
+        except TestError as exc:
+            if "ZMQ_CHAOS_NETWORK_DOWN" not in str(exc) or "at least one word" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CHAOS_NETWORK_DOWN", None)
+        os.environ.pop("ZMQ_CHAOS_NETWORK_UP", None)
+        os.environ["ZMQ_CHAOS_S3_DOWN"] = ""
+        os.environ["ZMQ_CHAOS_S3_UP"] = "true"
+        blank_global_live_s3_hook_scenarios = selected_scenarios()
+        if "live-s3-outage" not in blank_global_live_s3_hook_scenarios:
+            raise TestError("blank global chaos live-S3 hook did not select all scenario")
+        try:
+            preflight_selected_live_hooks(blank_global_live_s3_hook_scenarios)
+            raise TestError("blank global chaos live-S3 hook preflight was skipped")
+        except TestError as exc:
+            if "ZMQ_CHAOS_S3_DOWN" not in str(exc) or "at least one word" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CHAOS_S3_DOWN", None)
+        os.environ.pop("ZMQ_CHAOS_S3_UP", None)
         os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "az-a,broker-2,az-a"
         os.environ["ZMQ_CHAOS_NETWORK_AZ_A_DOWN"] = "true"
         os.environ["ZMQ_CHAOS_NETWORK_AZ_A_UP"] = "true"
@@ -819,18 +1113,195 @@ def self_test():
         os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_EXPECT"] = "survive"
         os.environ["ZMQ_CHAOS_S3_DOWN"] = "true"
         os.environ["ZMQ_CHAOS_S3_UP"] = "true"
+        try:
+            network_partition_phases()
+            raise TestError("duplicate chaos network phase was accepted")
+        except TestError as exc:
+            if "duplicate entries" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "az-a,broker-2"
         all_scenarios = selected_scenarios()
         if "network-partition" not in all_scenarios or "live-s3-outage" not in all_scenarios:
             raise TestError("all scenario selection did not include hooked chaos scenarios")
+        preflight_selected_live_hooks(all_scenarios)
         if network_partition_phases() != ["az-a", "broker-2"]:
             raise TestError("network partition phase parsing failed")
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "az-a,az_a"
+        try:
+            network_partition_phases()
+            raise TestError("colliding chaos network phase names were accepted")
+        except TestError as exc:
+            if "same environment token" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "placeholder"
+        try:
+            network_partition_phases()
+            raise TestError("placeholder chaos network phase was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "   "
+        try:
+            network_partition_phases()
+            raise TestError("blank chaos network phase list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "az-a,,broker-2"
+        try:
+            network_partition_phases()
+            raise TestError("embedded blank chaos network phase list was accepted")
+        except TestError as exc:
+            if "blank entries" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "az-a,broker-2"
         if network_phase_env("broker-2", "DOWN") != "ZMQ_CHAOS_NETWORK_BROKER_2_DOWN":
             raise TestError("network phase hook selection failed")
         if network_phase_expect("broker-2") != "survive":
             raise TestError("network phase expect selection failed")
+        if network_partition_phase_marker("broker-link", "fail", False) != (
+            "ok: chaos network-partition phase broker-link down=true "
+            "observed=failed healed=true recovered=true expect=fail "
+            "source=command"
+        ):
+            raise TestError("chaos network failed phase marker formatting failed")
+        if network_partition_phase_marker("az-a", "survive", True) != (
+            "ok: chaos network-partition phase az-a down=true "
+            "observed=survived healed=true recovered=true expect=survive "
+            "source=command"
+        ):
+            raise TestError("chaos network survived phase marker formatting failed")
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_EXPECT"] = "todo"
+        try:
+            network_phase_expect("broker-2")
+            raise TestError("placeholder chaos network expectation was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_EXPECT"] = "maybe"
+        try:
+            network_phase_expect("broker-2")
+            raise TestError("invalid chaos network expectation was accepted")
+        except TestError as exc:
+            if "invalid chaos network expectation" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_EXPECT"] = "survive"
+        os.environ["ZMQ_CHAOS_NETWORK_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_DOWN"] = ""
+        try:
+            preflight_selected_live_hooks(["network-partition"])
+            raise TestError("blank phase-specific chaos network hook preflight was accepted")
+        except TestError as exc:
+            if "at least one word" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CHAOS_NETWORK_DOWN", None)
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_BLANK_DOWN"] = "   "
+        try:
+            run_hook("ZMQ_CHAOS_NETWORK_BLANK_DOWN")
+            raise TestError("blank chaos hook command was accepted")
+        except TestError as exc:
+            if "at least one word" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_MALFORMED_DOWN"] = "'unterminated"
+        try:
+            run_hook("ZMQ_CHAOS_NETWORK_MALFORMED_DOWN")
+            raise TestError("malformed chaos hook command was accepted")
+        except TestError as exc:
+            if "malformed" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_PLACEHOLDER_DOWN"] = "/path/to/network-hook"
+        try:
+            run_hook("ZMQ_CHAOS_NETWORK_PLACEHOLDER_DOWN")
+            raise TestError("placeholder chaos hook command was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_DOWN"] = "'unterminated"
+        try:
+            preflight_selected_live_hooks(["network-partition"])
+            raise TestError("malformed chaos network hook preflight was accepted")
+        except TestError as exc:
+            if "malformed" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_S3_DOWN"] = "/path/to/s3-outage-hook"
+        try:
+            preflight_selected_live_hooks(["live-s3-outage"])
+            raise TestError("placeholder chaos live S3 hook preflight was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_S3_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_MISSING_DOWN"] = "__zmq_missing_hook_command__"
+        try:
+            run_hook("ZMQ_CHAOS_NETWORK_MISSING_DOWN")
+            raise TestError("unstartable chaos hook command was accepted")
+        except TestError as exc:
+            if "could not start" not in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = "sigkill,network"
         os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "az-a,broker-2"
         validate_required_coverage(all_scenarios)
+        os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = ",,,"
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("empty required chaos scenario list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = "   "
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("blank required chaos scenario list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = "sigkill,,network"
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("embedded blank required chaos scenario list was accepted")
+        except TestError as exc:
+            if "blank entries" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = "required"
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("placeholder required chaos scenario was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = "sigkill,network"
+        os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "todo"
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("placeholder required chaos network phase was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "   "
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("blank required chaos network phase list was accepted")
+        except TestError as exc:
+            if "at least one entry" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "az-a,,broker-2"
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("embedded blank required chaos network phase list was accepted")
+        except TestError as exc:
+            if "blank entries" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "az-a,broker-2"
+        os.environ["ZMQ_CHAOS_SCENARIOS"] = "placeholder"
+        try:
+            selected_scenarios()
+            raise TestError("placeholder chaos scenario selector was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_SCENARIOS"] = "all"
         os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "missing-phase"
         try:
             validate_required_coverage(all_scenarios)
@@ -838,18 +1309,139 @@ def self_test():
         except TestError as exc:
             if "missing required network phase" in str(exc):
                 raise
+        os.environ["ZMQ_CHAOS_BROKER_PORT"] = "placeholder"
+        try:
+            choose_port("ZMQ_CHAOS_BROKER_PORT")
+            raise TestError("placeholder configured chaos broker port was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_BROKER_PORT"] = "not-a-port"
+        try:
+            choose_port("ZMQ_CHAOS_BROKER_PORT")
+            raise TestError("malformed configured chaos broker port was accepted")
+        except TestError as exc:
+            if "integer" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_BROKER_PORT"] = "0"
+        try:
+            choose_port("ZMQ_CHAOS_BROKER_PORT")
+            raise TestError("non-positive configured chaos broker port was accepted")
+        except TestError as exc:
+            if "positive TCP port" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_BROKER_PORT"] = "29192"
+        if choose_port("ZMQ_CHAOS_BROKER_PORT") != 29192:
+            raise TestError("configured chaos broker port did not parse")
+        os.environ.pop("ZMQ_CHAOS_BROKER_PORT", None)
+
+        for name in list(os.environ):
+            if name.startswith("ZMQ_CHAOS_S3_") or name.startswith("ZMQ_S3_"):
+                os.environ.pop(name, None)
+        global_live_s3_env = {
+            "ZMQ_S3_ENDPOINT": "fallback-s3.example.test",
+            "ZMQ_S3_PORT": "9443",
+            "ZMQ_S3_BUCKET": "fallback-chaos",
+            "ZMQ_S3_ACCESS_KEY": "fallback-ak",
+            "ZMQ_S3_SECRET_KEY": "fallback-sk",
+            "ZMQ_S3_SCHEME": "https",
+            "ZMQ_S3_REGION": "us-west-2",
+            "ZMQ_S3_PATH_STYLE": "false",
+        }
+        os.environ.update(global_live_s3_env)
+        os.environ["ZMQ_CHAOS_S3_ENDPOINT"] = ""
+        try:
+            live_s3_config_from_env()
+            raise TestError("blank chaos live S3 endpoint override was accepted")
+        except TestError as exc:
+            if "S3 endpoint is required" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CHAOS_S3_ENDPOINT", None)
+        os.environ["ZMQ_S3_TLS_CA_FILE"] = "/tmp/fallback-ca.pem"
+        os.environ["ZMQ_CHAOS_S3_TLS_CA_FILE"] = ""
+        try:
+            live_s3_config_from_env()
+            raise TestError("blank chaos live S3 TLS CA override was accepted")
+        except TestError as exc:
+            if "S3 TLS CA file is required" not in str(exc):
+                raise
+        for name in list(os.environ):
+            if name.startswith("ZMQ_CHAOS_S3_") or name.startswith("ZMQ_S3_"):
+                os.environ.pop(name, None)
+        os.environ["ZMQ_CHAOS_S3_ENDPOINT"] = "placeholder"
+        try:
+            live_s3_config_from_env()
+            raise TestError("placeholder live S3 endpoint was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_S3_ENDPOINT"] = "<endpoint>:9000"
+        try:
+            live_s3_config_from_env()
+            raise TestError("angle-bracket placeholder live S3 endpoint was accepted")
+        except TestError as exc:
+            if "placeholder" not in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_S3_ENDPOINT"] = "s3.example.test"
+        try:
+            live_s3_config_from_env()
+            raise TestError("missing live S3 port was accepted")
+        except TestError as exc:
+            if "S3 port is required" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_S3_PORT"] = "0"
+        try:
+            live_s3_config_from_env()
+            raise TestError("non-positive live S3 port was accepted")
+        except TestError as exc:
+            if "positive" not in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_S3_PORT"] = "443"
+        try:
+            live_s3_config_from_env()
+            raise TestError("missing live S3 bucket was accepted")
+        except TestError as exc:
+            if "S3 bucket is required" not in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_S3_BUCKET"] = "zmq-chaos"
         os.environ["ZMQ_CHAOS_S3_ACCESS_KEY"] = "ak"
         os.environ["ZMQ_CHAOS_S3_SECRET_KEY"] = "sk"
+        try:
+            live_s3_config_from_env()
+            raise TestError("missing live S3 scheme was accepted")
+        except TestError as exc:
+            if "S3 scheme is required" not in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_S3_SCHEME"] = "https"
         os.environ["ZMQ_CHAOS_S3_REGION"] = "us-west-2"
+        os.environ["ZMQ_CHAOS_S3_PATH_STYLE"] = "maybe"
+        try:
+            live_s3_config_from_env()
+            raise TestError("invalid live S3 path-style was accepted")
+        except TestError as exc:
+            if "true or false" not in str(exc):
+                raise
+        os.environ["ZMQ_CHAOS_S3_PATH_STYLE"] = "yes"
+        s3_config = live_s3_config_from_env()
+        if s3_config["path_style"] != "true":
+            raise TestError("truthy live S3 path-style flag did not parse")
+        os.environ["ZMQ_CHAOS_S3_PATH_STYLE"] = "off"
+        s3_config = live_s3_config_from_env()
+        if s3_config["path_style"] != "false":
+            raise TestError("false live S3 path-style flag did not parse")
         os.environ["ZMQ_CHAOS_S3_PATH_STYLE"] = "false"
         os.environ["ZMQ_CHAOS_S3_TLS_CA_FILE"] = "/tmp/ca.pem"
         s3_config = live_s3_config_from_env()
         if s3_config["endpoint"] != "s3.example.test" or s3_config["scheme"] != "https":
             raise TestError("live S3 config parsing failed")
+        expected_summary = (
+            "ok: chaos live-s3-outage provider "
+            "endpoint=s3.example.test:443 bucket=zmq-chaos "
+            "scheme=https region=us-west-2 path_style=false "
+            "source=command"
+        )
+        if live_s3_provider_summary(s3_config) != expected_summary:
+            raise TestError("live S3 provider summary did not match selected config")
         args = []
         append_s3_args(args, s3_config)
         for expected_arg in [

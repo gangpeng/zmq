@@ -720,8 +720,8 @@ pub const PartitionStore = struct {
         errdefer if (data_for_cache) |data| self.allocator.free(data);
 
         const data_owned = data_for_cache.?;
-        // Rewrite base_offset field (first 8 bytes of RecordBatch) to broker-assigned offset
-        if (data_owned.len >= 8) {
+        // Rewrite base_offset field only for Kafka RecordBatch payloads.
+        if (data_owned.len >= BATCH_HEADER_SIZE and data_owned[16] == 2) {
             std.mem.writeInt(i64, data_owned[0..8], @intCast(base_offset), .big);
         }
 
@@ -779,12 +779,28 @@ pub const PartitionStore = struct {
                     s3_wal_durable = true;
                 }
             } else if (self.s3_storage) |*s3| {
-                // Fallback: synchronous S3 PUT (legacy behavior)
+                // Fallback: synchronous S3 PUT using the same indexed object
+                // format recovered by replacement brokers.
+                var writer = ObjectWriter.init(self.allocator);
+                defer writer.deinit();
+
+                const record_count_u32 = std.math.cast(u32, record_count) orelse return error.RecordCountOverflow;
+                try writer.addDataBlock(
+                    stream_id,
+                    base_offset,
+                    record_count_u32,
+                    record_count_u32,
+                    data_owned,
+                );
+
+                const obj_data = try writer.build();
+                defer self.allocator.free(obj_data);
+
                 const obj_key = std.fmt.allocPrint(self.allocator, "wal/{s}/{d}/off-{d:0>10}", .{
                     topic, partition_id, base_offset,
                 }) catch return error.OutOfMemory;
                 defer self.allocator.free(obj_key);
-                s3.putObject(obj_key, data_owned) catch |err| {
+                s3.putObject(obj_key, obj_data) catch |err| {
                     log.warn("S3 WAL write-through failed: {}", .{err});
                     return err;
                 };
@@ -1756,6 +1772,125 @@ test "PartitionStore rebuilds S3 WAL data after local store replacement" {
     defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
     try testing.expectEqual(@as(i16, 0), result.error_code);
     try testing.expectEqualStrings("ab", result.records);
+}
+
+test "PartitionStore legacy S3 WAL fallback rebuilds after local store replacement" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var producer_store = PartitionStore.init(testing.allocator);
+        defer producer_store.deinit();
+        producer_store.s3_wal_mode = true;
+        producer_store.s3_storage = s3_storage;
+
+        const first = try producer_store.produce("s3-legacy-replacement-topic", 0, "a");
+        const second = try producer_store.produce("s3-legacy-replacement-topic", 0, "b");
+        try testing.expectEqual(@as(i64, 0), first.base_offset);
+        try testing.expectEqual(@as(i64, 1), second.base_offset);
+    }
+
+    try testing.expectEqual(@as(usize, 2), mock_s3.objectCount());
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var replacement_store = PartitionStore.init(testing.allocator);
+    defer replacement_store.deinit();
+    replacement_store.s3_storage = s3_storage;
+    replacement_store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 2), try replacement_store.recoverS3WalObjects());
+    try replacement_store.ensurePartition("s3-legacy-replacement-topic", 0);
+    try testing.expect(replacement_store.repairPartitionStatesFromObjectManager());
+
+    var key_buf: [256]u8 = undefined;
+    const key = try PartitionStore.partitionKeyBuf(&key_buf, "s3-legacy-replacement-topic", 0);
+    const state = replacement_store.partitions.getPtr(key).?;
+    try testing.expectEqual(@as(u64, 2), state.next_offset);
+    try testing.expectEqual(@as(u64, 2), state.high_watermark);
+    try testing.expectEqual(@as(u64, 2), state.last_stable_offset);
+
+    const result = try replacement_store.fetch("s3-legacy-replacement-topic", 0, 0, 1024);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqualStrings("ab", result.records);
+
+    replacement_store.s3_wal_mode = true;
+    replacement_store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    replacement_store.setObjectManager(&object_manager);
+
+    const third = try replacement_store.produce("s3-legacy-replacement-topic", 0, "c");
+    try testing.expectEqual(@as(i64, 2), third.base_offset);
+    try testing.expect(mock_s3.objectCount() > 2);
+
+    const merged = try replacement_store.fetch("s3-legacy-replacement-topic", 0, 0, 1024);
+    defer if (merged.records.len > 0) testing.allocator.free(@constCast(merged.records));
+    try testing.expectEqual(@as(i16, 0), merged.error_code);
+    try testing.expectEqualStrings("abc", merged.records);
+
+    var continuation_object_manager = ObjectManager.init(testing.allocator, 1);
+    defer continuation_object_manager.deinit();
+
+    var continuation_store = PartitionStore.init(testing.allocator);
+    defer continuation_store.deinit();
+    continuation_store.s3_storage = s3_storage;
+    continuation_store.object_manager = &continuation_object_manager;
+
+    try testing.expectEqual(@as(u64, 3), try continuation_store.recoverS3WalObjects());
+    try continuation_store.ensurePartition("s3-legacy-replacement-topic", 0);
+    try testing.expect(continuation_store.repairPartitionStatesFromObjectManager());
+
+    var continuation_key_buf: [256]u8 = undefined;
+    const continuation_key = try PartitionStore.partitionKeyBuf(&continuation_key_buf, "s3-legacy-replacement-topic", 0);
+    const continuation_state = continuation_store.partitions.getPtr(continuation_key).?;
+    try testing.expectEqual(@as(u64, 3), continuation_state.next_offset);
+    try testing.expectEqual(@as(u64, 3), continuation_state.high_watermark);
+    try testing.expectEqual(@as(u64, 3), continuation_state.last_stable_offset);
+
+    const continuation_result = try continuation_store.fetch("s3-legacy-replacement-topic", 0, 0, 1024);
+    defer if (continuation_result.records.len > 0) testing.allocator.free(@constCast(continuation_result.records));
+    try testing.expectEqual(@as(i16, 0), continuation_result.error_code);
+    try testing.expectEqualStrings("abc", continuation_result.records);
+}
+
+test "PartitionStore S3 WAL preserves long raw records after replacement" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var producer_store = PartitionStore.init(testing.allocator);
+        defer producer_store.deinit();
+        producer_store.s3_wal_mode = true;
+        producer_store.s3_storage = s3_storage;
+        producer_store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+
+        const first = try producer_store.produce("s3-raw-record-topic", 0, "long-record-alpha");
+        const second = try producer_store.produce("s3-raw-record-topic", 0, "long-record-beta");
+        try testing.expectEqual(@as(i64, 0), first.base_offset);
+        try testing.expectEqual(@as(i64, 1), second.base_offset);
+    }
+
+    try testing.expectEqual(@as(usize, 2), mock_s3.objectCount());
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var replacement_store = PartitionStore.init(testing.allocator);
+    defer replacement_store.deinit();
+    replacement_store.s3_storage = s3_storage;
+    replacement_store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 2), try replacement_store.recoverS3WalObjects());
+    try replacement_store.ensurePartition("s3-raw-record-topic", 0);
+    try testing.expect(replacement_store.repairPartitionStatesFromObjectManager());
+
+    const result = try replacement_store.fetch("s3-raw-record-topic", 0, 0, 1024);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqualStrings("long-record-alphalong-record-beta", result.records);
 }
 
 test "PartitionStore S3 WAL fetch includes objects beyond first hundred" {

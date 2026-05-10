@@ -42,6 +42,10 @@ pub const TlsConfig = struct {
     // Client authentication
     client_auth: ClientAuth = .none,
 
+    // Kafka-compatible principal mapping rules for mTLS subject DNs.
+    // When unset, ZMQ keeps its historical "User:<CN>" extraction.
+    principal_mapping_rules: ?[]const u8 = null,
+
     // TLS version constraints
     min_tls_version: TlsVersion = .tls_1_2,
     max_tls_version: TlsVersion = .tls_1_3,
@@ -106,6 +110,9 @@ pub const TlsConfig = struct {
         }
         if (self.client_auth != .none and self.ca_file == null) {
             return error.NoTrustAnchorsConfigured;
+        }
+        if (self.principal_mapping_rules) |rules| {
+            try OpenSslLib.validatePrincipalMappingRules(rules);
         }
     }
 
@@ -213,9 +220,10 @@ fn captureFileFingerprint(path_opt: ?[]const u8) !TlsFileFingerprint {
 /// - mTLS principal extraction (via X509_get_subject_name + X509_NAME_oneline)
 ///
 /// NOTE: AutoMQ (Java) uses SslPrincipalMapper to transform X.500 DNs into
-/// Kafka principals via configurable regex rules. ZMQ extracts the CN directly
-/// from the subject DN, which covers the common case. Full DN-to-principal
-/// mapping rules are not yet implemented.
+/// Kafka principals via configurable regex rules. ZMQ preserves direct CN
+/// extraction by default and supports a strict Kafka-style mapping subset for
+/// common DN rules; unsupported rule syntax fails closed during TLS config
+/// validation.
 pub const TlsConnection = struct {
     inner_fd: posix.fd_t,
     tls_established: bool = false,
@@ -224,6 +232,8 @@ pub const TlsConnection = struct {
     /// Extracted mTLS client principal (e.g., "User:kafka-client-1").
     /// Heap-allocated, owned by this connection. Freed on deinit.
     peer_cert_subject: ?[]const u8 = null,
+    /// Optional Kafka-style principal mapper applied to mTLS subject DNs.
+    principal_mapping_rules: ?[]const u8 = null,
     allocator: Allocator,
     /// Timestamp (ms) when the handshake was initiated. Used to enforce
     /// TLS_HANDSHAKE_TIMEOUT_MS and prevent slow-client DoS attacks.
@@ -251,6 +261,19 @@ pub const TlsConnection = struct {
             .allocator = alloc,
             .handshake_start_ms = monotonicMs(),
         };
+    }
+
+    /// Initialize with an OpenSSL SSL object and configured principal mapper.
+    pub fn initWithSslAndMapping(
+        alloc: Allocator,
+        fd: posix.fd_t,
+        ssl: *anyopaque,
+        openssl: *OpenSslLib,
+        principal_mapping_rules: ?[]const u8,
+    ) TlsConnection {
+        var conn = initWithSsl(alloc, fd, ssl, openssl);
+        conn.principal_mapping_rules = principal_mapping_rules;
+        return conn;
     }
 
     /// Perform the TLS handshake on this connection (server-side SSL_accept).
@@ -347,7 +370,7 @@ pub const TlsConnection = struct {
 
         // 3. Extract mTLS principal from client certificate subject DN.
         // Populates self.peer_cert_subject with "User:<CN>" for use in ACL checks.
-        if (ossl.extractMtlsPrincipal(ssl, self.allocator)) |principal| {
+        if (try ossl.extractMtlsPrincipalWithRules(ssl, self.allocator, self.principal_mapping_rules)) |principal| {
             self.peer_cert_subject = principal;
             log.info("mTLS principal extracted on fd={d}: {s}", .{ self.inner_fd, principal });
         }
@@ -773,6 +796,7 @@ pub fn validatePeerCertificatePostHandshake(
     ssl: *anyopaque,
     fd: posix.fd_t,
     allocator: Allocator,
+    principal_mapping_rules: ?[]const u8,
 ) !?[]u8 {
     // 1. Check certificate chain verification result
     const verify_result = ossl.getVerifyResult(ssl);
@@ -806,7 +830,7 @@ pub fn validatePeerCertificatePostHandshake(
     }
 
     // 3. Extract mTLS principal from client certificate subject DN
-    return ossl.extractMtlsPrincipal(ssl, allocator);
+    return try ossl.extractMtlsPrincipalWithRules(ssl, allocator, principal_mapping_rules);
 }
 
 /// Check whether a TLS handshake has timed out based on start time.
@@ -1063,6 +1087,24 @@ test "TlsConfig validate requires trust anchors for mTLS" {
         .client_auth = .required,
     };
     try with_ca.validate();
+}
+
+test "TlsConfig validate checks principal mapping rules" {
+    const valid = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/cert.pem",
+        .key_file = "/path/to/key.pem",
+        .principal_mapping_rules = "RULE:.*CN=([^,]+).*/$1/L,DEFAULT",
+    };
+    try valid.validate();
+
+    const invalid = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/cert.pem",
+        .key_file = "/path/to/key.pem",
+        .principal_mapping_rules = "RULE:.*CN=(foo|bar).*/$1/",
+    };
+    try testing.expectError(error.UnsupportedPrincipalMappingRule, invalid.validate());
 }
 
 test "TlsConfig validate ok for plaintext" {
@@ -1358,6 +1400,6 @@ test "validatePeerCertificatePostHandshake with no peer cert returns null princi
     const ssl = lib.SSL_new(ctx) orelse return;
     defer lib.SSL_free(ssl);
 
-    const principal = try validatePeerCertificatePostHandshake(&lib, ssl, 42, testing.allocator);
+    const principal = try validatePeerCertificatePostHandshake(&lib, ssl, 42, testing.allocator, null);
     try testing.expect(principal == null);
 }
